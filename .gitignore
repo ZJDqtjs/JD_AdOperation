@@ -1,0 +1,62 @@
+# ============================================================
+# JD_AdOperation .gitignore
+# 原则：登录态、抓包、抓取数据、报告与Excel、截图、本地真实账号配置、临时产物一律不入库
+# ============================================================
+
+# ---- 登录态与浏览器持久化 Profile（含 Cookie / localStorage，最高敏感）----
+auth/
+browser_profile*/
+*.har
+
+# ---- 抓取数据与分析产物（含账号/店铺/商品/经营数据，一律不入库）----
+data/
+
+# ---- 本地私有配置（存放真实京准通账户 ID 等）----
+jd_roi/local_config.py
+.env
+.env.*
+!.env.example
+
+# ---- 截图 / 图片（页面截图含账号昵称与账户ID，一律不入库）----
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.ico
+*.svg
+
+# ---- 临时 / 调试产物 ----
+tmp/
+.tmp/
+*.log
+
+# ---- 报告与 Excel（内联/存放经营数据：花费、成交、客单价、成本、扣点，一律不入库）----
+ad_roi_report*.html
+*.xlsx
+*.xls
+# Excel 打开时的临时锁文件
+~$*.xlsx
+~$*.xls
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.python-version
+*.egg-info/
+
+# ---- IDE / 编辑器 ----
+.trae/
+.idea/
+.vscode/
+*.swp
+
+# ---- 操作系统 ----
+Thumbs.db
+Desktop.ini
+.DS_Store
