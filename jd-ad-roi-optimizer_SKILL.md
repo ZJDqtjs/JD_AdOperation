@@ -147,7 +147,7 @@ ECharts 库缓存于 `jd_roi/assets/echarts.min.js`（首次需联网下载，�
 对每个计划/商品计算本期与同期：
 1. **定档**
    - `ROI ≥ 4` → 🟢 放大：提预算 20~30% / 提高核心词出价
-   - `3.27 ≤ ROI < 4`（保本线附近）→ 🟡 优化：抠词、砍推荐、调出价
+   - `保本ROI ≤ ROI < 4`（保本线附近）→ 🟡 优化：抠词、砍推荐、调出价
    - `ROI < 保本ROI` → 🔴 止损：降预算、否定无效词、必要时暂停
 2. **词分层**（按 plan × searchTerm 聚合，去重相加）
    - 高效词：`订单≥2 且 ROI>保本` → 提价/加词
@@ -175,7 +175,7 @@ v2 相对 v1 的四个修正，都是踩过坑之后改的：
    却把两个店铺的商智成交都算进渗透率分母，导致渗透率虚高/超过 100%。
    v2 统计「广告」时**两个账号全部相加**，商智仍按店铺分别保留。
 2. **三窗口对比**：w0 调整前 / w1 第一轮调整 / w2 最近一周，全部 7 天，互不重叠。
-3. **成本口径**：Excel 只给全店一套成本（毛利率≈30.4%、保本 ROI=3.27）。
+3. **成本口径**：Excel 只给全店一套成本（模板示例：毛利率 25%、保本 ROI=4.00；真实值以你的成本表为准）。
    曾试图「按客单价等比缩放产品成本 + 固定运费」算每个商品自己的保本线，
    结果低价商品的保本 ROI 算出 20~63 这种荒谬值 —— **该做法已弃用**。
    现在统一用 Excel 毛利率，输出「毛利/单 = 真实客单价 × 毛利率」与
@@ -215,3 +215,54 @@ v2 相对 v1 的四个修正，都是踩过坑之后改的：
 - 接口返回的商品名里含 `&amp;` 等 HTML 实体，渲染前要 `html.unescape` 再转义，否则页面出现 `&amp;amp;`
 - 沙箱下 `tempfile` 默认目录不可写会让 Playwright 报 `EPERM ... playwright-artifacts`，
   跑脚本前把 `TEMP/TMP` 指到工作区目录内
+
+## 9. v3：容器化常驻服务（按天入库 + 任意区间）
+
+v2 是「选定固定区间、跑一次出一次报表」；v3 把它变成**常驻服务**：
+
+| 能力 | 实现 |
+|---|---|
+| 每天 0 点自动抓前一天 | `jd_roi/webapp.py` 里的 APScheduler（`JD_SCHEDULE_HOUR/MINUTE`，时区 `TZ`） |
+| 按天入库 | `jd_roi/dailystore.py` → `<DATA_DIR>/daily/<账号>/<YYYY-MM-DD>/<source>.json.gz` |
+| 任意区间分析 | `analyze2.windows_for(start,end)` 生成「前两期/前一期/所选区间」三期 |
+| 网页选区间 | `/report?start=&end=&accounts=`，顶栏自带区间选择器与预设（昨天/近3天/近7天…） |
+| 扫码登录 | `/login`：无头浏览器切到 `.scan-login` 扫码模式，把二维码截图给前端轮询 |
+| 手动补数 | `POST /api/run?start=&end=&force=`（后台线程 + 全局锁） |
+
+### 关键设计取舍
+
+1. **按天存、区间算**：接口支持区间查询，但如果每次都去拉接口，任意区间就会频繁触发限流。
+   按天落盘后，任意区间都是本地聚合，秒级返回，且不受限流影响。
+2. **回刷窗口 `JD_REFRESH_DAYS`（默认 15）**：京准通是「点击后 15 天归因」，昨天的数据后面还会长。
+   所以每晚不是只抓昨天，而是重抓最近 15 天覆盖写入。商智当天结算后不再变化。
+3. **商智只能抓到「昨天」**：`endDate >= 今天` 时接口返回 `code:0` + `data:[]`（**不报错**）。
+   所以默认区间一律「到昨天为止」。
+4. **登录判定必须问服务端**：`pin` cookie 还在、但服务端会话已过期时，只看 cookie 会误判为已登录。
+   统一用 `browser.session_ok(page)`（`/common/logininfo` 返回 `code==1`）。
+5. **无头浏览器必须先访问 jzt 首页建立 SSO**，否则 jzt-api 直接返回 `-100 登录失败`。
+6. **京麦登录页（passport.shop.jd.com）默认是密码登录**，二维码要先点右上角 `.scan-login` 图标才会出现。
+
+### 命令
+
+```bash
+# 服务
+uvicorn jd_roi.webapp:app --host 0.0.0.0 --port 8000
+
+# 按天抓取（可续跑）
+python -m jd_roi.scrape_day --days 3
+python -m jd_roi.scrape_day 2026-09-27 2026-10-03 --force
+
+# 任意区间分析（等价于网页做的事）
+python -m jd_roi.analyze2 2026-10-01 2026-10-03
+python -m jd_roi.report2        # 生成 ad_roi_report_v2.html
+
+# 把历史结果导入按天库
+python -m jd_roi.migrate_daily
+```
+
+### 相关环境变量
+
+`JD_DATA_DIR` / `JD_AUTH_DIR` / `JD_CONFIG_DIR` / `JD_EXCEL_PATH` / `TZ` /
+`JD_SCHEDULE_HOUR` / `JD_SCHEDULE_MINUTE` / `JD_REFRESH_DAYS` / `JD_RUN_ON_START` /
+`JD_ENABLE_SCHEDULER` / `JD_SW_MAX_ROWS` / `JD_WEB_PORT`。
+账号：`JD_ACCOUNTS`（JSON 字符串）> `<CONFIG_DIR>/accounts.json` > 内置默认。

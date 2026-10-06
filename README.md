@@ -1,3 +1,236 @@
+# 京东广告运营分析服务（JD Ad ROI Service）
+
+把「京准通 + 商智」的抓取、按天入库、任意区间分析、可视化报表封装成一个**可 Docker 部署的常驻服务**：
+
+- **每天 0 点自动**抓取前一天的两个账号数据，**按天**存进 /data
+- 容器停机几天再起来会**自动补齐空洞**（缺口 ∪ 最近 N 天回刷，上限 `JD_MAX_BACKFILL_DAYS`）
+- 京准通是「点击后 15 天归因」，所以每晚还会**回刷最近 N 天**（默认 15 天）修正数据
+- 打开网页即可**自选任意区间**（昨天 / 近 2 天 / 近 3 天 / 近 14 天 / 任意日期）生成**聚合**分析报告
+- 报表在原有基础上升级：区间选择器、自动环比（前一等长周期）、操作日志逐条复盘、数据覆盖提示
+
+---
+
+## 1. 快速开始
+
+    git clone <this-repo> jd-ad && cd jd-ad
+    cp .env.example .env
+    docker compose up -d --build
+
+打开 http://localhost:8000 。
+
+首次启动后需要**扫码登录**（登录态是抓取的前提）：
+
+1. 打开 http://localhost:8000/login
+2. 选择账号 → 点「开始登录」
+3. 用**手机京东 App** 扫描页面上的二维码
+4. 状态变成「已登录」即成功；两个账号要**分别登录**
+5. 回到控制台，点「补近3天」或选日期「立即抓取」
+
+登录态保存在 ./docker-auth/<账号key>，容器重启后依然有效；JD 会话通常几天到两周过期，过期后再扫一次即可。
+
+---
+
+## 2. 目录与数据
+
+    docker-data/                                  # = 容器内 /data
+      daily/<账号>/<YYYY-MM-DD>/<source>.json.gz  # 按天入库的原始数据
+      state.json                                  # 运行状态（最近一次抓取等）
+    docker-auth/                                  # = 容器内 /auth  浏览器 Profile / 登录态
+    docker-config/                                # = 容器内 /config
+      accounts.json                               # 账号配置（可选）
+      costs.json                                  # 每个 SKU 的真实成本（可选，强烈建议）
+      计算roi公式.xlsx                             # 成本表（Excel「计算公式」sheet）
+
+source 取值：
+
+| source | 含义 |
+|---|---|
+| jzt_campaign | 京准通概览-计划 |
+| jst_campaign | 智能投放-计划 |
+| jst_sku | 智能投放-商品（含 skuId，用于和商智对齐） |
+| jst_searchword | 智能投放-搜索词 |
+| kw | 快车-关键词 |
+| sz_product | 商智-商品明细 |
+| sz_flow | 商智-流量概况 |
+| oplog | 京准通操作日志（调整记录） |
+
+**任意区间分析 = 把这些按天文件聚合**，所以查询很快，也不受接口限流影响。
+
+---
+
+## 3. 配置
+
+全部通过环境变量（见 .env.example / docker-compose.yml）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| TZ | Asia/Shanghai | 时区，决定「0 点」是哪里的 0 点 |
+| JD_WEB_PORT | 8000 | 宿主机映射端口 |
+| JD_SCHEDULE_HOUR / JD_SCHEDULE_MINUTE | 0 / 5 | 每日抓取时间。0:05 是为了等前一天商智结算 |
+| JD_REFRESH_DAYS | 15 | 每晚回刷最近多少天（对齐 15 天归因窗口） |
+| JD_MAX_BACKFILL_DAYS | 120 | 停机后最多补多少天，防止一次补一年 |
+| JD_RUN_ON_START | 1 | 启动时发现昨天没数据就补跑 |
+| JD_ENABLE_SCHEDULER | 1 | 关掉就只保留手动抓取 |
+| JD_SCOPE | 空 | 只处理指定账号（逗号分隔），被排除的账号既不抓取也不进报表 |
+| JD_HEADLESS | 1 | 容器内必须无头 |
+| JD_SW_MAX_ROWS | 2000 | 搜索词按花费降序截断行数（覆盖约 99.9% 花费，避免限流） |
+
+### 账号
+
+优先级：环境变量 JD_ACCOUNTS > /config/accounts.json > 内置默认。
+
+    [
+      {"key": "main", "label": "主账号", "account_id": 10000000001},
+      {"key": "b",    "label": "账号B",  "account_id": 10000000002}
+    ]
+
+account_id 是「快车-关键词报表」接口需要的 pinIds。
+
+### 成本（重要）
+
+默认从 Excel「计算公式」sheet 读**全店一套**成本；**成本表缺失时**退化为内置示例口径
+（客单价 100 / 成本 70 / 运费 5 → 毛利率 25% → 保本 ROI 4.00）。
+但生鲜各品毛利差异极大，要判断「哪个商品其实在亏」，需要每个 SKU 的真实成本：
+
+    {
+      "default": {"shipping": 5.0, "platformRate": 0.0, "returnRate": 0.05},
+      "skus": {
+        "100000000001": {"supply": 70.0, "price": 100.0, "shipping": 5.0}
+      }
+    }
+
+放进 /config/costs.json 即生效（当前作为口径说明，后续可直接接入每个 SKU 的保本线计算）。
+
+**成本表模板**：仓库提供 `config/roi-template.xlsx` —— 4 个 sheet（预算分配 / 计算公式 / 搜推词分析 /
+竞品分析表）的结构、公式与口径说明齐全，数据全部为示例值。复制成 `config/计算roi公式.xlsx` 后
+填入自己的客单价 / 成本 / 扣点 / 运费即可。真实成本表不入库。
+
+---
+
+## 4. 网页功能
+
+| 页面 | 说明 |
+|---|---|
+| / | 控制台：区间选择器、数据覆盖日历、手动抓取/补数、任务与登录状态 |
+| /report?start=&end=&accounts= | 任意区间聚合报表（顶部自带区间选择器） |
+| /login | 扫码登录 |
+| /api/docs | 自动生成的 API 文档 |
+
+报表页签：① 总结 ② 商品ROI交叉表 ③ 调整复盘 ④ 计划明细 ⑤ 搜索词诊断 ⑥ 行动清单。
+
+**区间怎么用**：以所选区间为最新一期，自动向前取两个**等长**区间做环比。
+例如选 2026-10-01 ~ 2026-10-03（3 天），会对比 9/28~9/30 和 9/25~9/27。
+
+**看绝对效率**用 7~14 天（受归因延迟影响小）；**看即时反应**用 1~3 天。
+
+---
+
+## 5. 常用 API
+
+    curl localhost:8000/api/status
+    curl localhost:8000/api/coverage
+    curl "localhost:8000/api/analysis?start=2026-10-01&end=2026-10-03"
+    curl -X POST "localhost:8000/api/run?start=2026-10-01&end=2026-10-03&force=1"
+    curl -X POST "localhost:8000/api/login/start?account=main"
+
+---
+
+## 6. 不用 Docker 也能跑
+
+    uv venv && uv pip install -r requirements.txt
+    python -m playwright install chromium
+    export JD_DATA_DIR=./data JD_AUTH_DIR=./auth JD_CONFIG_DIR=./config
+    python -m uvicorn jd_roi.webapp:app --host 0.0.0.0 --port 8000
+
+单次抓取（不启服务）：
+
+    python -m jd_roi.scrape_day --days 3
+    python -m jd_roi.scrape_day 2026-09-27 2026-10-03
+    python -m jd_roi.scrape_day --account=b --force 2026-10-03 2026-10-03
+    python -m jd_roi.migrate_daily
+
+---
+
+## 7. 排错
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 报表显示「数据不完整」 | 该区间有日期没入库。到控制台按日期「立即抓取」补齐 |
+| 抓取报「登录态已失效」 | JD 会话过期。打开 /login 重新扫码 |
+| 容器内扫码扫不了 | 无头浏览器遇到滑块/短信验证时无法完成。**替代方案**：在本地电脑跑一次 `python -m jd_roi.login --account=main`，然后把生成的 `auth/browser_profile`（或 `auth/<key>`）整个目录 + `auth/jd_state.json` 拷进 `./docker-auth/<key>/`，容器直接复用 |
+| 报表出现「口径降级」提示 | 该区间缺 jzt_campaign，账号总额退化为智能投放口径（不含全站智能推广） |
+| 商智某些天为空 | 商智**只提供到昨天**，且 endDate >= 今天 会返回空数组（不报错） |
+| 抓取报 -3010 限流 | 搜索词接口限流，脚本会自动退避重试；也可调小 JD_SW_MAX_ROWS |
+| 想改抓取时间 | 改 JD_SCHEDULE_HOUR / JD_SCHEDULE_MINUTE 后 docker compose up -d |
+
+---
+
+## 8. 架构
+
+    scrape_day.py  ──►  dailystore (/data/daily/...)  ──►  analyze2.build(start,end)
+         ▲                        ▲                                │
+         │ APScheduler 每天 0:05   │ 网页选区间                      ▼
+      webapp.py  ─────────────────┘                          report2.render()
+
+- jd_roi/settings.py   全部路径与开关（环境变量驱动）
+- jd_roi/dailystore.py 按天读写 + 区间聚合（gzip JSON）
+- jd_roi/scrape_day.py 按天抓取，可续跑、限流退避、商智签名头自动重捕
+- jd_roi/analyze2.py   任意区间分析（windows_for(start,end) 生成三期）
+- jd_roi/report2.py    自包含 HTML（内联 ECharts）
+- jd_roi/webapp.py     FastAPI + APScheduler + 扫码登录会话
+
+---
+
+## 9. 验证
+
+一条命令跑全部测试（不需要登录、不需要联网）：
+
+    python tests/run_all.py
+
+包含 4 部分、共 90+ 项断言：
+
+| 套件 | 覆盖 |
+|---|---|
+| tests/test_range_agg.py | 按天入库 → 任意区间加总：3 天 / 单天 / 含缺失天区间、操作日志按区间切片、覆盖度 |
+| tests/test_pipeline_e2e.py | 冷启动空目录不报 500、夜间抓取编排逐天写库、二次运行跳过、区间聚合、报表渲染、**真起 uvicorn 打 HTTP** |
+| tests/test_scrape_live_http.py | **真实 Chromium + 把京东域名 route 打桩**，跑真实抓取代码：分页合并、-3010 退避重试、isDaily 按天拆分、商智 capture 动态签名头、操作日志按天落盘 |
+| tests/test_scheduler.py | CronTrigger 下一次触发 = 明天 00:05 (Asia/Shanghai)、连续两天同一时刻、任务体抓「到昨天为止的 N 天」窗口 |
+| tests/test_container_layout.py | 按 Dockerfile 的 ENV 与目录约定跑一遍：目录自动创建、开关生效、成本表缺失退化、该布局下 Web 能起能出报表 |
+| tests/test_login_flow.py | 真实浏览器 + 打桩登录页：自动点 .scan-login 切扫码、二维码可截、**服务端未放行时不会误报已登录**、放行后 storage_state 落盘 |
+| tests/run_all.py 内嵌 | Dockerfile COPY 源存在、requirements 可导入、EXPOSE 与 compose 端口一致、entrypoint 指向正确、echarts 资源在镜像内 |
+
+测试用打桩替换掉浏览器与 HTTP（scrape_day.launch_profile / fetch_* / SzFetcher），
+所以能在无登录、无网络的环境下把「调度 → 抓取 → 按天入库 → 区间聚合 → 报表 → Web」整条链路跑通。
+
+测试里出现的失败都是真问题，跑测试时别放过。已经这样抓到并修掉 6 个：操作日志读错数据源、
+商智汇总行被按天聚合丢掉、没有操作的天不落盘、保本线写死值与公式值打架、
+搜索词日抓用错接口 key（会静默漏掉全部搜索词）、操作日志调用签名错误被 except 吞掉。
+
+### 容器层：本机实际执行过的验证
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 依赖层可解析 | `uv venv tmp/imgvenv && uv pip install -r requirements.txt` | 全绿；干净 venv 里 `import jd_roi.webapp` 成功，16 条路由 |
+| 入口脚本 | `bash docker/entrypoint.sh`（把 uvicorn 换成打印桩） | 目录自动创建、示例配置铺到 /config、成本表缺失给出告警、uvicorn 参数正确 |
+| 浏览器 | `playwright install --with-deps chromium` | 镜像里执行（本机已有 chromium 可复用） |
+
+**尚未验证的部分**（环境限制，不是代码问题）：
+
+- **Docker 镜像构建与容器运行**。这台机器上依次确认过：
+  1. Windows 没有 Docker Desktop，也不在 PATH
+  2. WSL 发行版（Arch）里没有 docker / podman / buildah
+  3. 尝试在 WSL 里现装 podman，但 **Docker Hub 被墙**（仅 quay.io / ghcr.io 可达），
+     且该 Arch 发行版还停留在 2020 年，装容器运行时需要先做一次完整滚动升级
+  4. 退而求其次，把镜像的**每一层**都单独验证了（见上表）
+- **对真实京东服务器的调用** —— 需要扫码登录。抓取代码本身的网络路径已被
+  test_scrape_live_http.py 用真实浏览器 + 打桩接口覆盖到；接口契约也已在本机用真实账号实测确认过
+
+---
+
+## 10. 附：原有的本地脚本用法与安全说明
+
+> 以下为升级前（v2）的本地脚本流程，仍然可用；新部署建议直接用上面的服务方式。
+
 # JD_AdOperation
 
 京东广告投放（**京准通 / 商智**）数据抓取与 **ROI 运营分析**工具。

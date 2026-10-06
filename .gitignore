@@ -10,9 +10,14 @@ browser_profile*/
 
 # ---- 抓取数据与分析产物（含账号/店铺/商品/经营数据，一律不入库）----
 data/
+docker-data/
+docker-auth/
+docker-config/
 
-# ---- 本地私有配置（存放真实京准通账户 ID 等）----
+# ---- 本地私有配置（存放真实京准通账户 ID、SKU 成本等）----
 jd_roi/local_config.py
+config/accounts.json
+config/costs.json
 .env
 .env.*
 !.env.example
@@ -34,11 +39,10 @@ tmp/
 
 # ---- 报告与 Excel（内联/存放经营数据：花费、成交、客单价、成本、扣点，一律不入库）----
 ad_roi_report*.html
-*.xlsx
-*.xls
-# Excel 打开时的临时锁文件
-~$*.xlsx
-~$*.xls
+*.xls*
+*.bak2
+# 例外：脱敏后的空模板可以入库（不含任何真实经营数据）
+!config/roi-template.xlsx
 
 # ---- Python ----
 __pycache__/

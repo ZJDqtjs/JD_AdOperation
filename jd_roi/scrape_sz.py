@@ -20,6 +20,7 @@ SZ = "https://szgateway.jd.com/api"
 URL_PRODUCT = f"{SZ}/lowcode/productDetail/table/productTable.ajax"
 URL_CORE = f"{SZ}/lowcode/flowSummary/getCoreSummary.ajax"
 URL_FLOWSRC = f"{SZ}/lowcode/flowSummary/productFlow/getFlowSrcTop.ajax"
+URL_ADVERT = f"{SZ}/lowcode/flow/payFlow/advertSummary/getSummaryData.ajax"
 
 INDICATORS = [
     "jdr_sch_trade_deal_ord_ord_amt_sz_trade_deal_snapshot",
@@ -61,8 +62,11 @@ class SzSession:
         self.cates: list = []
         self.page_url = ("https://jdsz.jd.com/szweb/view/flow/flow-summary.html"
                          if kind == "flow" else
+                         "https://jdsz.jd.com/szweb/view/market/advert-summary.html"
+                         if kind == "ad" else
                          "https://jdsz.jd.com/szweb/view/product/productDetail.html")
-        self.trigger = "getCoreSummary.ajax" if kind == "flow" else "productTable.ajax"
+        self.trigger = ("getCoreSummary.ajax" if kind == "flow" else
+                        "advertSummary" if kind == "ad" else "productTable.ajax")
 
     def capture(self, wait_ms: int = 14000) -> None:
         def on_request(req):
@@ -127,6 +131,15 @@ def main() -> int:
         if not sz.brands:
             print("[WARN] 未捕获到维度，接口可能失败")
 
+        if kind == "ad":
+            d = sz.post(URL_ADVERT, _base(start, end, cstart, cend, sz.brands, sz.cates))
+            result = {"raw": d, "rows": ((d.get("body") or {}).get("data") or {}),
+                      "dateStart": start, "dateEnd": end}
+            name = f"sz_ad_{tag}"
+            store.save(name, result, account)
+            print(f"[OK] ad {start}~{end} -> {store._path(name, account)}")
+            print(json.dumps(result["rows"], ensure_ascii=False)[:1500])
+            return 0
         if kind == "flow":
             core = sz.post(URL_CORE, _base(start, end, cstart, cend, sz.brands, sz.cates))
             src = sz.post(URL_FLOWSRC, _base(start, end, cstart, cend, sz.brands, sz.cates, {

@@ -254,7 +254,7 @@ def _spark(vals, be) -> str:
 
 
 def _sku_advice(s) -> str:
-    be = _n(s.get("breakeven"), 3.27)
+    be = _n(s.get("breakeven"), 4.00)
     cur = _latest(s)
     roi, cost = _n(cur["roi"]), _n(cur["cost"])
     tier = s["verdict"]["tier"]
@@ -270,7 +270,7 @@ def _sku_advice(s) -> str:
 
 
 def _plan_advice(p) -> str:
-    be = _n(p.get("breakeven"), 3.27)
+    be = _n(p.get("breakeven"), 4.00)
     w0, w1, w2 = p["wins"]["w0"], p["wins"]["w1"], p["wins"]["w2"]
     cur = w2 if _n(w2["cost"]) > 0 else w1
     roi, cost = _n(cur["roi"]), _n(cur["cost"])
@@ -462,16 +462,18 @@ def page_overview(d) -> str:
     dr, drcls = _delta(c["roi"], comb[pre]["roi"])
 
     kpis = "".join([
-        _kpi("两账号广告花费（" + d["meta"]["windows"][-1]["label"][:6] + "）",
+        _kpi("两账号广告花费（所选区间 " +
+             f'{_e((d["meta"].get("range") or {}).get("start",""))[5:]}~{_e((d["meta"].get("range") or {}).get("end",""))[5:]}）',
              "¥" + _money(c["cost"]),
-             f'<span class="{dccls}">{dc}</span> vs 调整前 ¥{_money(comb[pre]["cost"])}'),
+             f'<span class="{dccls}">{dc}</span> vs 前一期 ¥{_money(comb[pre]["cost"])}'),
         _kpi("广告成交额", "¥" + _money(c["amt"]),
-             f'<span class="{dacls}">{da}</span> vs 调整前 ¥{_money(comb[pre]["amt"])}'),
+             f'<span class="{dacls}">{da}</span> vs 前一期 ¥{_money(comb[pre]["amt"])}'),
         _kpi("整体投产比 ROI", f'{_n(c["roi"]):.2f}',
              f'<span class="{drcls}">{dr}</span> ｜ 全店保本线 {_n(d["meta"]["breakevenFlat"]):.2f}',
              drcls),
         _kpi("店铺总成交（商智）", "¥" + _money(c.get("szAmt")),
-             f'广告贡献 {_pct(c.get("adShare"))} ｜ 自然成交 ¥{_money(max(_n(c.get("szAmt")) - _n(c["amt"]), 0))}'),
+             (f'广告贡献 {_pct(c.get("adShare"))} ｜ 自然成交 ¥{_money(max(_n(c.get("szAmt")) - _n(c["amt"]), 0))}'
+              if _n(c.get("szAmt")) else '<span class="down">商智数据缺失</span>')),
         _kpi("广告订单 / CPA", f'{int(_n(c["ord"])):,} 单',
              f'单均获客成本 ¥{_n(c["cpa"]):.2f} ｜ 点击 {int(_n(c["clk"])):,} ｜ CPC ¥{_n(c["cpc"]):.2f}'),
         _kpi("人工调整 / 系统自动改预算",
@@ -513,7 +515,7 @@ def page_overview(d) -> str:
 <div class="grid g3">{kpis}</div>
 
 <div class="card" style="margin-top:16px">
-  <h2>三窗口趋势 <span class="tagline">调整前 / 调整后一周 / 最近一周</span></h2>
+  <h2>三期趋势 <span class="tagline">前两期 / 前一期 / 所选区间</span></h2>
   <p class="hint">金额单位：元。ROI 走右轴。{"；".join(_e(x) for x in sz_notes)}</p>
   {_chart_html("chTrend")}
 </div>
@@ -539,6 +541,7 @@ def page_overview(d) -> str:
     <b>数据口径</b>：广告=京准通概览（点击15天/成交订单）；智能投放=智能投放报表；商智=各店铺成交口径。
     搜索词报表按「花费」降序取前 2000 行，覆盖约 99.9% 花费。
   </div>
+  {_source_note(d)}
   <div class="warnbox">
     <b>成本假设</b>：Excel「计算公式」只给了<b>全店一套</b>成本 —— 客单价 ¥{_n(d["meta"]["costModel"]["refPrice"])}、
     产品成本 ¥{_n(d["meta"]["costModel"]["product"])}、京东扣点 ¥{_n(d["meta"]["costModel"]["platform"])}、
@@ -720,7 +723,7 @@ def page_adj(d) -> str:
   </p>
   <div class="warnbox">
     <b>最重要的发现</b>：账号B 的「自动提升预算」一直在自动加预算
-    （如 入仓拇指玉米 反复 300→450→675、入仓品 200→300→450），
+    （示例：某计划预算被反复上调 300→450→675），
     人工几乎没在管预算上限。系统加预算是「因为花得出去」，不等于「因为赚得回来」——
     必须用 ROI 反过来约束它，否则预算会被低效流量吃掉。
   </div>
@@ -846,7 +849,7 @@ def page_word(d) -> str:
   <h2>{_e(a["label"])} · 搜索词诊断 <span class="tagline">{_e(wk)} 窗口，按花费排序前 14 个计划</span></h2>
   <p class="hint">
     高效词 {len(agg["good"])} 个 · 0单废词 {len(agg["waste"])} 个（浪费 ¥{_money(wa_cost)}）· 低效词 {len(agg["low"])} 个。
-    判定标准：高效=订单≥2 且 ROI&gt;3.27；废词=花费≥3 且 0 单；低效=花费≥10 且 ROI&lt;3.27。
+    判定标准：高效=订单≥2 且 ROI&gt;4.00；废词=花费≥3 且 0 单；低效=花费≥10 且 ROI&lt;4.00。
   </p>
   <div class="dangerbox"><b>最该否定的词</b>：{'、'.join(f'{_e(w["word"])}(¥{_money(w["cost"])})' for w in wa_top) or '无'}</div>
   {''.join(blocks) or '<p class="hint">该账号本窗口没有搜索词数据。</p>'}
@@ -887,9 +890,9 @@ def page_action(d) -> str:
 
     return f"""
 <div class="card">
-  <h2>第一步 · 止血 <span class="tagline">最近一周 ROI 低于保本线 {_n(d["meta"]["breakevenFlat"]):.2f} 的 SKU</span></h2>
+  <h2>第一步 · 止血 <span class="tagline">所选区间 ROI 低于保本线 {_n(d["meta"]["breakevenFlat"]):.2f} 的 SKU</span></h2>
   <p class="hint">
-    合计花费 <b>¥{_money(up["stopCost"])}</b>，占最近一周总花费
+    合计花费 <b>¥{_money(up["stopCost"])}</b>，占所选区间总花费
     {_pct(_n(up["stopCost"]) / max(_n(up["lastCost"]), 1) * 100)}。逐个处理，不要一刀切关闭。
   </p>
   <div class="tblwrap short"><table><thead><tr>
@@ -937,18 +940,74 @@ def page_action(d) -> str:
 """
 
 
+UI_CSS = """
+.rangebar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;
+  background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.18);border-radius:10px;padding:10px 12px}
+.rangebar label{font-size:12.5px;color:#e0e7ff;display:flex;align-items:center;gap:5px}
+.rangebar input[type=date]{background:#fff;border:none;border-radius:7px;padding:6px 8px;font-size:13px;color:#111827}
+.rangebar input[type=checkbox]{accent-color:#a5b4fc}
+.rangebar button[type=submit]{background:#22c55e;color:#052e16;border:none;border-radius:8px;padding:7px 16px;
+  font-weight:700;cursor:pointer;font-size:13px}
+.rangebar button[type=submit]:hover{background:#16a34a;color:#fff}
+.rangebar .pre{padding:5px 11px;border-radius:20px;border:1px solid rgba(255,255,255,.35);
+  background:transparent;color:#e0e7ff;cursor:pointer;font-size:12px}
+.rangebar .pre:hover{background:rgba(255,255,255,.18)}
+.rangebar a{color:#c7d2fe;font-size:12.5px;text-decoration:none;margin-left:6px}
+.rangebar a:hover{text-decoration:underline}
+.covbox{background:#fffbeb;border-left:3px solid #d97706;padding:10px 14px;border-radius:0 8px 8px 0;
+  font-size:12.5px;color:#92400e;margin-bottom:14px}
+"""
+
+
+def _source_note(d) -> str:
+    """当某些窗口的账号总额退化为智能投放口径时提醒一下。"""
+    bad = []
+    for a in d.get("accounts", []):
+        srcs = {a["totals"][k].get("source") for k in a["totals"] if a["totals"][k].get("source")}
+        if srcs and srcs != {"概览"}:
+            bad.append(f'{a["label"]}：{"/".join(sorted(srcs))}')
+    if not bad:
+        return ""
+    return ('<div class="warnbox"><b>口径降级</b>：' + "；".join(_e(x) for x in bad) +
+            '。缺「概览」数据时会退化为智能投放口径（不含全站智能推广），账号总额会偏小。</div>')
+
+
+def _coverage_notice(d) -> str:
+    cov = (d.get("meta") or {}).get("coverage") or {}
+    bad = []
+    for a in d.get("accounts", []):
+        per = cov.get(a["key"]) or {}
+        wk = per.get("w2") or {}
+        if wk and not wk.get("complete"):
+            bad.append(f'{a["label"]} 所选区间仅 {wk.get("got")}/{wk.get("want")} 天有数据')
+    if not bad:
+        return ""
+    return ('<div class="covbox"><b>数据不完整</b>：' + "；".join(_e(x) for x in bad) +
+            '。未覆盖的日期按 0 计入，可能低估区间表现 —— 可在控制台补抓这些日期。</div>')
+
+
 # ---------------------------------------------------------------- 组装
 TABS = [("p-ov", "① 总结"), ("p-sku", "② 商品ROI"), ("p-adj", "③ 调整复盘"),
         ("p-plan", "④ 计划明细"), ("p-word", "⑤ 搜索词诊断"), ("p-act", "⑥ 行动清单")]
 
 
-def render(d) -> str:
+_ECHARTS_CACHE: dict = {"src": None}
+
+
+def _echarts_src() -> str:
+    if _ECHARTS_CACHE["src"] is None:
+        src = ""
+        if ASSETS.exists():
+            ec = ASSETS.read_text(encoding="utf-8").replace("</script", "<\\/script")
+            src = "<script>" + ec + "</script>"
+        _ECHARTS_CACHE["src"] = src
+    return _ECHARTS_CACHE["src"]
+
+
+def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 × 按商品 × 调整复盘") -> str:
     charts = build_charts(d)
     chart_json = json.dumps(charts, ensure_ascii=False).replace("</", "<\\/")
-    echarts_src = ""
-    if ASSETS.exists():
-        ec = ASSETS.read_text(encoding="utf-8").replace("</script", "<\\/script")
-        echarts_src = "<script>" + ec + "</script>"
+    echarts_src = _echarts_src()
     tabs = "".join(
         f'<div class="tab{" active" if i == 0 else ""}" onclick="showTab(\'{cid}\',this)">{_e(label)}</div>'
         for i, (cid, label) in enumerate(TABS))
@@ -967,23 +1026,26 @@ def render(d) -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>京东广告运营分析 · 两账号按SKU交叉 + 调整复盘</title>
-<style>{CSS}</style>{echarts_src}</head>
+<title>{_e(title)}</title>
+<style>{CSS}{UI_CSS}</style>{echarts_src}</head>
 <body>
 <header class="top"><div class="wrap">
-  <h1>京东广告运营分析 · 跨账号 × 按商品 × 调整复盘</h1>
+  <h1>{_e(title)}</h1>
   <div class="metaline">
     账号：{' / '.join(_e(a["label"]) for a in meta["accounts"])}
-    ｜ 窗口：{_e(meta["windows"][0]["label"])} → {_e(meta["windows"][1]["label"])} → {_e(meta["windows"][2]["label"])}
+    ｜ 区间：{_e((meta.get("range") or {}).get("start") or meta["windows"][2]["start"])}
+    ~ {_e((meta.get("range") or {}).get("end") or meta["windows"][2]["end"])}
+    ｜ 对比基准：{_e(meta["windows"][1]["label"])}
     ｜ 生成 {_e(meta["generatedAt"])}
   </div>
+  {ui}
   <div class="tabs">{tabs}</div>
 </div></header>
-<div class="wrap">{body}
+<div class="wrap">{_coverage_notice(d)}{body}
   <div class="foot">
     数据来源：京准通（概览 / 智能投放 / 快车关键词 / 操作日志）+ 商智（商品明细 / 流量概况）。<br>
     「保本ROI」「预估净利」为按 Excel 成本结构推算，非真实财务数据；其余指标均为接口真实返回值。<br>
-    操作日志覆盖 2026-08-15 ~ 2026-10-05，按 7 天分段抓取合并（接口对超长区间会静默截断）。
+    本页为按天入库后的<b>区间聚合</b>结果，区间由上方选择器决定。
   </div>
 </div>
 <script>{JS}</script>

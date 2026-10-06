@@ -1,0 +1,4 @@
+[
+  {"key": "main", "label": "主账号", "account_id": 10000000001},
+  {"key": "b", "label": "账号B", "account_id": 10000000002}
+]

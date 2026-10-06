@@ -1,0 +1,23 @@
+auth/
+data/
+tmp/
+.venv/
+*.pyc
+__pycache__/
+.git/
+.env
+docker-data/
+docker-auth/
+docker-config/
+*.har
+~$*
+ad_roi_report*.html
+jzt.jd.com.har
+
+# 本地私有配置：真实账户 ID / SKU 成本，不能烤进镜像层
+jd_roi/local_config.py
+config/accounts.json
+config/costs.json
+# Excel 成本表（含客单价/成本/扣点）与派生备份
+*.xls*
+*.bak2

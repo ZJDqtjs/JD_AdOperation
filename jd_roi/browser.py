@@ -6,13 +6,15 @@ from pathlib import Path
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
-from . import config
+from . import config, settings
 
 
 def _ensure_dirs() -> None:
     config.AUTH_DIR.mkdir(parents=True, exist_ok=True)
     config.USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 关键：把 tempfile 指到可写目录，否则 Playwright 建 artifacts 目录会 EPERM
+    settings.ensure_dirs()
 
 
 def launch_persistent(headless: bool | None = None, account: str | None = None):
@@ -63,6 +65,35 @@ def has_login(context: BrowserContext) -> bool:
     for c in context.cookies():
         if c.get("name") == "pin" and c.get("domain", "").endswith("jd.com") and c.get("value"):
             return True
+    return False
+
+
+_JS_LOGININFO = """
+async () => {
+  try {
+    const r = await fetch('https://jzt-api.jd.com/common/logininfo', {
+      method: 'POST', credentials: 'include',
+      headers: {'Content-Type':'application/json','accept':'application/json, text/plain, */*',
+        'referer':'https://jzt.jd.com/','language':'zh_CN','siteid':'0','loginmode':'0'},
+      body: JSON.stringify({requestFrom: 0})});
+    const j = await r.json();
+    return j && j.code === 1;
+  } catch (e) { return false; }
+}
+"""
+
+
+def session_ok(page: Page, retries: int = 2) -> bool:
+    """真正问一次服务端：cookie 还在但服务端会话过期时 has_login 会误判。
+
+    必须以 jzt-api /common/logininfo 返回 code==1 为准。
+    """
+    for _ in range(max(retries, 1)):
+        try:
+            if page.evaluate(_JS_LOGININFO):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
     return False
 
 

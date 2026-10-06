@@ -1,0 +1,14 @@
+{
+  "_说明": "每个 SKU 的真实成本。填了之后保本ROI/预估净利才是真实口径；不填则用 Excel 计算公式 sheet 的全店毛利率。",
+  "_字段": {
+    "supply": "供货价（单件商品成本）",
+    "price": "实际成交客单价（留空则用商智真实客单价）",
+    "shipping": "单件运费（留空用 default.shipping）",
+    "platformRate": "京东扣点比例，如 0.05",
+    "returnRate": "退货率，如 0.05"
+  },
+  "default": {"shipping": 5.0, "platformRate": 0.0, "returnRate": 0.05},
+  "skus": {
+    "100000000001": {"supply": 70.0, "price": 100.0, "shipping": 5.0}
+  }
+}

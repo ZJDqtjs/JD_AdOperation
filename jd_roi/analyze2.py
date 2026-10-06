@@ -3,7 +3,7 @@
 
 与旧 analyze.py 的区别：
 1. **两个账号都参与广告口径**（旧版默认只算账号B，却把主账号商智成交算进渗透率分母，口径错位）
-2. **三窗口对比** w0(调整前) / w1(调整后一周) / w2(最近一周)
+2. **三期对比** w0(前两期) / w1(前一期) / w2(用户所选区间)，区间长度任意
 3. **每个 SKU 单独的成本/毛利/保本ROI**（用商智真实客单价 × Excel 成本结构推算）
 4. **把京准通「操作日志」与效果变化对齐**，判定每次调整正确/有问题
 5. 计划、SKU、搜索词都保留三窗口趋势
@@ -15,28 +15,57 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import re
+import sys
 from collections import defaultdict
+from pathlib import Path
 
 from . import config, store
 
 # ---------------- 窗口定义 ----------------
+# 报表固定展示 3 期：w2 = 用户所选区间，w1/w0 = 等长的前两期（用于环比与趋势）
+WKEYS = ["w0", "w1", "w2"]
+WINDOW_ROLE = {0: "前两期", 1: "前一期", 2: "所选区间"}
+
+# 兼容旧脚本的固定窗口
 WINDOWS = [
     ("w0", "2026-09-13", "2026-09-19", "调整前 9/13-9/19"),
     ("w1", "2026-09-20", "2026-09-26", "第一轮调整 9/20-9/26"),
     ("w2", "2026-09-27", "2026-10-03", "9/29大调整后 9/27-10/3"),
 ]
-WKEYS = [w[0] for w in WINDOWS]
+
+
+def windows_for(start: str, end: str) -> list:
+    """以 [start,end] 为最后一期，向前生成两个等长窗口。
+
+    返回 [(key, start, end, label), ...]，顺序为 w0(最早) → w2(所选区间)。
+    """
+    d0 = _dt.date.fromisoformat(start)
+    d1 = _dt.date.fromisoformat(end)
+    if d1 < d0:
+        d0, d1 = d1, d0
+    n = (d1 - d0).days + 1
+    out = []
+    for idx, back in enumerate((2, 1, 0)):
+        s = d0 - _dt.timedelta(days=n * back)
+        e = d1 - _dt.timedelta(days=n * back)
+        label = f"{WINDOW_ROLE[idx]} {s.strftime('%m/%d')}~{e.strftime('%m/%d')}"
+        if back == 0:
+            label = f"所选区间 {s.strftime('%m/%d')}~{e.strftime('%m/%d')}（{n}天）"
+        out.append((WKEYS[idx], s.isoformat(), e.isoformat(), label))
+    return out
 
 # ---------------- 成本结构（来自 Excel「计算公式」，可被 load_cost_model 覆盖）----------------
+# 下面是「成本表缺失」时的兜底示例口径（非真实经营数据）：客单价 100 / 成本 70 / 运费 5
+# → 毛利率 25% → 保本 ROI 4.00。真实成本请放进 config/ 下的成本表（不入库）或 config/costs.json。
 COST_MODEL = {
-    "refPrice": 180.0,      # H2 参考客单价
-    "product": 120.0,       # H3 参考产品成本
+    "refPrice": 100.0,      # H2 参考客单价
+    "product": 70.0,        # H3 参考产品成本
     "platform": 0.0,        # H4 京东扣点（绝对值）
     "package": 0.0,         # H5 礼物及包装
     "shipping": 5.0,        # H6 运费
-    "returnRate": 0.04,     # I14 退货率
+    "returnRate": 0.05,     # I14 退货率
 }
-BREAKEVEN_FLAT = 3.27       # 全店统一成本口径下的保本ROI（Excel 直接算出）
+BREAKEVEN_FLAT = 4.00       # 兜底口径下的保本ROI（真实值由成本表算出）
 
 TYPE_LABEL = {61: "智能化", 2: "快车-关键词", 153: "全站智能", 0: "其他"}
 SZ_UV = "jdr_sch_traffic_brow_sku__page_cnt_traffic_plat_item_di_sz_bsg"
@@ -69,7 +98,8 @@ def load_cost_model():
     p = dict(COST_MODEL)
     try:
         import openpyxl
-        wb = openpyxl.load_workbook(config.EXCEL_PATH, data_only=True)
+        from . import settings as _settings
+        wb = openpyxl.load_workbook(_settings.excel_path(), data_only=True)
         ws = wb["计算公式"]
         for k, cell in (("refPrice", "H2"), ("product", "H3"), ("platform", "H4"),
                         ("package", "H5"), ("shipping", "H6")):
@@ -85,10 +115,14 @@ def load_cost_model():
 
 
 def global_margin(m: dict) -> float:
-    """Excel「计算公式」直接给出的全店毛利率：(客单价-产品成本-扣点-包装-运费-退货)/客单价。"""
+    """Excel「计算公式」H8 的口径：毛利率 = (客单价 - 产品成本 - 扣点 - 包装 - 运费) / 客单价。
+
+    注意：Excel 里退货成本（J14 = 产出笔数 × 退货率 × 运费）是**单独一行**，
+    不计入 H8，所以这里也不减 —— 否则会与成本表 H8 的口径打架（报表数字对不上模板）。
+    """
     price = _f(m.get("refPrice")) or 1.0
-    profit = (price - _f(m.get("product")) - _f(m.get("platform")) - _f(m.get("package"))
-              - _f(m.get("shipping")) - _f(m.get("returnRate")) * _f(m.get("shipping")))
+    profit = (price - _f(m.get("product")) - _f(m.get("platform"))
+              - _f(m.get("package")) - _f(m.get("shipping")))
     return round(profit / price, 4) if price else 0.0
 
 
@@ -189,28 +223,32 @@ def _flow_block(df):
     }
 
 
-def _load_accounts():
+def _load_accounts(windows=None, accounts=None):
+    """从「按天库」聚合出每个窗口的数据。"""
+    from . import dailystore as dstore
+    windows = windows or WINDOWS
+    accounts = accounts if accounts is not None else config.ACCOUNTS
     accts = []
-    for a in config.ACCOUNTS:
+    for a in accounts:
         k, label = a["key"], a.get("label") or a["key"]
-        ds = {"wins": {}, }
+        d = {"wins": {}}
         empty = True
-        for wk, s, e, _lab in WINDOWS:
+        for wk, s, e, _lab in windows:
             win = {
-                "jzt": _load(f"jzt_campaign_{wk}", k),
-                "camp": _load(f"jst_campaign_{wk}", k),
-                "sku": _load(f"jst_sku_{wk}", k),
-                "sw": _load(f"jst_searchword_{wk}", k),
-                "kw": _load(f"kw_{wk}", k),
-                "sz": _sz_rows(_load(f"sz_product_{wk}", k)),
-                "flow": _load(f"sz_flow_{wk}", k),
+                "jzt": dstore.load_window(k, "jzt_campaign", s, e),
+                "camp": dstore.load_window(k, "jst_campaign", s, e),
+                "sku": dstore.load_window(k, "jst_sku", s, e),
+                "sw": dstore.load_window(k, "jst_searchword", s, e),
+                "kw": dstore.load_window(k, "kw", s, e),
+                "sz": _sz_rows(dstore.load_window(k, "sz_product", s, e)),
+                "flow": dstore.load_window(k, "sz_flow", s, e),
+                "range": [s, e],
             }
-            ds["wins"][wk] = win
+            d["wins"][wk] = win
             if win["jzt"] or win["camp"] or win["sku"]:
                 empty = False
-        ds["daily"] = _load("jst_campaign_daily", k)
         accts.append({"key": k, "label": label, "accountId": a.get("account_id"),
-                      "ds": ds, "hasData": not empty})
+                      "ds": d, "hasData": not empty})
     return accts
 
 
@@ -221,10 +259,16 @@ def account_totals(acct):
         w = acct["ds"]["wins"][wk]
         jzt = w["jzt"] or {}
         ext = jzt.get("ext") or {}
+        # 概览缺失时退化为智能投放口径，避免整份报表变成 0（区间数据不全时很常见）
         if jzt.get("rows"):
             m = _sum_metrics(jzt["rows"])
+            m["source"] = "概览"
+        elif (w["camp"] or {}).get("rows"):
+            m = _sum_metrics(w["camp"]["rows"])
+            m["source"] = "智能投放(概览缺失)"
         else:
             m = _empty()
+            m["source"] = "无数据"
         m["extCost"] = round(_f(ext.get("cost")), 2)
         m["extAmt"] = round(_f(ext.get("totalOrderSum")), 2)
         m["extRoi"] = round(_f(ext.get("totalOrderROI")), 2)
@@ -233,6 +277,12 @@ def account_totals(acct):
         # 商智店铺口径（合计行）
         sz = w["sz"]
         summ = next((r for r in sz if r.get("__summary__")), None)
+        if summ is None and sz:
+            # 商智没给「合计」行时（按天聚合也会丢掉汇总行）用各 SKU 加总兜底
+            summ = {"amt": sum(_f(r.get("amt")) for r in sz),
+                    "orders": sum(_i(r.get("orders")) for r in sz),
+                    "visitors": sum(_i(r.get("visitors")) for r in sz),
+                    "views": sum(_i(r.get("views")) for r in sz)}
         m["sz"] = ({"amt": round(_f(summ["amt"]), 2), "orders": _i(summ["orders"]),
                     "visitors": _i(summ["visitors"]), "views": _i(summ["views"])}
                    if summ else None)
@@ -339,7 +389,7 @@ def sku_rows(accts, model):
                 if not e["name"] and s.get("name"):
                     e["name"] = s["name"]
 
-    # 主表只保留「有广告花费」的 SKU —— 商智里 180+ 个 SKU 大多没投广告，全列出来没有决策价值
+    # 主表只保留「有广告花费」的 SKU —— 商智里上百个 SKU 大多没投广告，全列出来没有决策价值
     ids = set()
     for wk in WKEYS:
         for sid, v in aggAd[wk].items():
@@ -588,12 +638,27 @@ def _clean(s):
     return re.sub(r"\s+", " ", _decode(s)).strip()
 
 
-def op_rows(accts):
+def op_rows(accts, start=None, end=None):
+    """操作日志：优先从按天库读区间内的记录（读不到再退回老的 data/oplog.json）。"""
+    from . import dailystore as dstore
     out = []
     for a in accts:
         k, label = a["key"], a["label"]
-        d = store.load("oplog", k)
-        for r in (d or {}).get("rows", []):
+        rows, seen = [], set()
+        if start and end:
+            for day in dstore.day_span(start, end):
+                payload = dstore.load_day(k, day, "oplog")
+                for r in (payload or {}).get("rows", []):
+                    key = "|".join(str(r.get(x)) for x in
+                                   ("optTime", "actionObjectId", "operationContent", "operationDetails"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(r)
+        if not rows:
+            d = store.load("oplog", k)
+            rows = (d or {}).get("rows", [])
+        for r in rows:
             t = str(r.get("optTime") or "")
             content = r.get("operationContent") or ""
             operator = r.get("operator") or ""
@@ -636,20 +701,29 @@ def _op_kind(content, detail):
 
 
 # ---------------- 调整复盘（日粒度前后对比）----------------
-def _daily_series(daily, cid):
-    if not daily:
-        return {}
-    out = defaultdict(dict)
-    for r in daily.get("rows", []):
-        if str(r.get("campaignId")) != str(cid):
+def _daily_series(account: str, cid, start: str, end: str) -> dict:
+    """从按天库取某个计划在 [start,end] 的逐日表现。"""
+    from . import dailystore as dstore
+    out = {}
+    for day in dstore.day_span(start, end):
+        payload = dstore.load_day(account, day, "jst_campaign")
+        if not payload:
             continue
-        dt = str(r.get("date") or "")
-        if len(dt) == 8:
-            dt = f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"
-        out[dt] = {"cost": _f(r.get("cost")), "amt": _f(r.get("totalOrderSum")),
-                   "ord": _i(r.get("totalOrderCnt")), "clk": _i(r.get("clicks")),
-                   "imp": _i(r.get("impressions"))}
-    return dict(out)
+        cost = amt = 0.0
+        ordv = clk = imp = 0
+        found = False
+        for r in payload.get("rows", []):
+            if str(r.get("campaignId")) != str(cid):
+                continue
+            found = True
+            cost += _f(r.get("cost"))
+            amt += _f(r.get("totalOrderSum"))
+            ordv += _i(r.get("totalOrderCnt"))
+            clk += _i(r.get("clicks"))
+            imp += _i(r.get("impressions"))
+        if found:
+            out[day] = {"cost": cost, "amt": amt, "ord": ordv, "clk": clk, "imp": imp}
+    return out
 
 
 def _slice(series, start, end):
@@ -675,8 +749,9 @@ def _wk_slice(p, wk):
             "dailyOrd": round(_i(m["ord"]) / 7, 2)}
 
 
-def adjustments(accts, ops, plans):
+def adjustments(accts, ops, plans, windows=None, span_from=None, span_to=None):
     """把人工调整与「调整前7天 / 调整后7天」效果对齐，给出判定。"""
+    windows = windows or WINDOWS
     planIdx = {}
     for p in plans:
         planIdx[(p["account"], p["campaignId"])] = p
@@ -687,7 +762,9 @@ def adjustments(accts, ops, plans):
             continue
         if op["level"] != "campaign":
             continue
-        if op["day"] < "2026-09-13":
+        if span_from and op["day"] < span_from:
+            continue
+        if span_to and op["day"] > span_to:
             continue
         if any(k in (op["content"] or "") for k in LOW_VALUE_OPS):
             continue
@@ -701,10 +778,16 @@ def adjustments(accts, ops, plans):
             p = next((x for x in plans if x["account"] == op["account"] and
                       (x["name"] == pname or (pname and pname in (x["name"] or ""))
                        or (x["name"] and x["name"] in (pname or "")))), None)
-        series = _daily_series(acct["ds"]["daily"], cid)
-        if not series and p is not None:
-            series = _daily_series(acct["ds"]["daily"], p["campaignId"])
         day = op["day"]
+        if day:
+            dd = _dt.date.fromisoformat(day)
+            s_lo = (dd - _dt.timedelta(days=8)).isoformat()
+            s_hi = (dd + _dt.timedelta(days=8)).isoformat()
+        else:
+            s_lo = s_hi = ""
+        series = _daily_series(op["account"], cid, s_lo, s_hi) if day else {}
+        if not series and p is not None and day:
+            series = _daily_series(op["account"], p["campaignId"], s_lo, s_hi)
         win = None
         if series and day:
             d0 = _dt.date.fromisoformat(day)
@@ -715,13 +798,20 @@ def adjustments(accts, ops, plans):
                 before = after = None
         else:
             before = after = None
-        # 没有日粒度数据（例如「全站智能推广」不在智能投放日报里）→ 退化为周窗口前后对比
+        # 没有日粒度数据（例如「全站智能推广」不在智能投放日报里）→ 退化为窗口前后对比
         if before is None and p is not None and day:
-            wk = "w0" if day <= "2026-09-26" else "w1"
-            nxt = "w1" if wk == "w0" else "w2"
-            before = _wk_slice(p, wk)
-            after = _wk_slice(p, nxt)
-            win = f"周窗口 {wk}→{nxt}"
+            idx = None
+            for i, (wkey, ws, we, _l) in enumerate(windows):
+                if ws <= day <= we:
+                    idx = i
+                    break
+            if idx is None:
+                idx = len(windows) - 1 if day > windows[-1][2] else 0
+            before_i = max(idx - 1, 0)
+            after_i = idx if idx == len(windows) - 1 else idx + 1
+            before = _wk_slice(p, windows[before_i][0])
+            after = _wk_slice(p, windows[after_i][0])
+            win = f"窗口 {windows[before_i][0]}→{windows[after_i][0]}"
         verdict, note = _judge(op, before, after, p)
         out.append({**op, "plan": p["name"] if p else op["target"],
                     "campaignId": p["campaignId"] if p else cid,
@@ -796,6 +886,21 @@ def _judge(op, before, after, plan):
     return "待观察", f"调整后 ROI {before['roi']} → {after['roi']}"
 
 
+def _coverage_block(active, wins):
+    """每个窗口实际有几天数据 —— 用于提示「区间里有空洞」。"""
+    from . import dailystore as dstore
+    out = {}
+    for a in active:
+        per = {}
+        for wk, s, e, _lab in wins:
+            want = len(dstore.day_span(s, e))
+            jzt = dstore.load_window(a["key"], "jzt_campaign", s, e)
+            got = len(jzt.get("days", [])) if jzt else 0
+            per[wk] = {"want": want, "got": got, "complete": got >= want}
+        out[a["key"]] = per
+    return out
+
+
 # ---------------- 决策建议 ----------------
 def _op_span(ops) -> str:
     days = sorted({o["day"] for o in ops if o["day"]})
@@ -842,14 +947,16 @@ def build_advice(accts, totals, skus, plans, ops, words, adj):
         (f"两账号合计：花费 ¥{c0['cost']:,.0f} → ¥{c1['cost']:,.0f} → ¥{c2['cost']:,.0f}；"
          f"成交 ¥{c0['amt']:,.0f} → ¥{c1['amt']:,.0f} → ¥{c2['amt']:,.0f}；"
          f"ROI {c0['roi']} → {c1['roi']} → {c2['roi']}"),
-        (f"最近一周两账号商智总成交 ¥{(c2['szAmt']):,.0f}，广告贡献 {c2['adShare']}%（广告成交/店铺总成交）"),
+        (f"所选区间两账号商智总成交 ¥{(c2['szAmt']):,.0f}，广告贡献 "
+         + (f"{c2['adShare']}%" if c2.get("adShare") is not None else "缺失（该区间无商智数据）")
+         + "（广告成交/店铺总成交）"),
         (f"{_op_span(ops)} 共 {len(ops)} 条快车操作日志：人工操作 {len(manual)} 条、"
          f"系统「自动提升预算」{autoBudget} 条。真正能对比前后 7 天效果的 {len(evaluable)} 条里，"
          f"{len(right)} 条正确、{len(wrong)} 条有问题、"
          f"{len([o for o in adj if o['verdict'] == '效果不明显'])} 条效果不明显、"
          f"{len([o for o in adj if o['verdict'] == '存疑'])} 条存疑；"
          f"另有 {unevaluable} 条因新建/删除/无花费无法对比"),
-        (f"最近一周仍有 {len(stop)} 个 SKU 的广告 ROI 低于保本线 {BREAKEVEN_FLAT}，合计花费 ¥{stopCost:,.0f}"
+        (f"所选区间仍有 {len(stop)} 个 SKU 的广告 ROI 低于保本线 {BREAKEVEN_FLAT}，合计花费 ¥{stopCost:,.0f}"
          f"（占 {stopCost / last['cost'] * 100:.0f}%），这部分是主要失血点" if last["cost"] else ""),
         (f"若把上述花费转移到 ROI≈{targetRoi} 的高效 SKU，预计多产出 ¥{estGain:,.0f}，"
          f"整体 ROI 可由 {last['roi']} 提升到约 {roiAfter}"),
@@ -870,23 +977,36 @@ def build_advice(accts, totals, skus, plans, ops, words, adj):
                        "estGain": estGain, "roiAfter": roiAfter, "lastCost": last["cost"]}}
 
 
-def build():
+def build(start=None, end=None, windows=None, accounts=None):
+    if windows is None:
+        windows = windows_for(start, end) if (start and end) else WINDOWS
+    global BREAKEVEN_FLAT
+    wins = list(windows)
+    win2 = wins[-1]
     model = load_cost_model()
-    accts = _load_accounts()
+    # 让「全店保本 ROI」由成本表实际算出，而不是写死 4.00；
+    # 这样 SKU 表里的保本线与结论里的保本线永远一致
+    _gm = global_margin(model)
+    if _gm > 0:
+        BREAKEVEN_FLAT = round(1 / _gm, 2)
+    accts = _load_accounts(wins, accounts)
     active = [a for a in accts if a["hasData"]]
     if not active:
-        raise FileNotFoundError("没有找到任何账号数据，请先运行 scrape_all")
+        raise FileNotFoundError(
+            f"没有找到 {win2[1]} ~ {win2[2]} 的数据，请先运行 python -m jd_roi.scrape_day")
     totals = {a["key"]: account_totals(a) for a in active}
     skus, no_ad = sku_rows(active, model)
     plans = plan_rows(active, model)
-    ops = op_rows(active)
+    ops = op_rows(active, wins[0][1], win2[2])
     words = word_rows(active, model)
-    adj = adjustments(active, ops, plans)
+    adj = adjustments(active, ops, plans, wins, span_from=win2[1], span_to=win2[2])
     advice = build_advice(active, totals, skus, plans, ops, words, adj)
 
     return {
         "meta": {
-            "windows": [{"key": w[0], "start": w[1], "end": w[2], "label": w[3]} for w in WINDOWS],
+            "windows": [{"key": w[0], "start": w[1], "end": w[2], "label": w[3]} for w in wins],
+            "range": {"start": win2[1], "end": win2[2]},
+            "coverage": _coverage_block(active, wins),
             "costModel": model, "breakevenFlat": BREAKEVEN_FLAT,
             "caliber": ("广告=京准通概览(点击15天/成交订单口径)；智能投放=智能投放报表；"
                         "商智=各店铺成交口径；商智客单价为真实值，产品成本按 Excel 成本率等比推算"),
@@ -904,15 +1024,28 @@ def build():
         "words": {a["key"]: {wk: {cid: {"sw": v["sw"][:60], "kw": v["kw"][:40]}
                                    for cid, v in (words[a["key"]].get(wk) or {}).items()}
                             for wk in WKEYS} for a in active},
+        "runtime": {"generatedAt": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
         "advice": advice,
     }
 
 
-def main():
-    data = build()
-    out = config.BASE_DIR / "data" / "analysis2.json"
+def analyze(start=None, end=None, accounts=None, out_path=None):
+    """对外主入口：给定区间返回分析 dict，并可落地 JSON。"""
+    data = build(start=start, end=end, accounts=accounts)
+    if out_path is None:
+        out_path = config.DATA_DIR / "analysis2.json"
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"[OK] -> {out}")
+    return data, out
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    start = args[0] if len(args) > 0 else None
+    end = args[1] if len(args) > 1 else None
+    data, out = analyze(start, end)
+    print(f"[OK] -> {out}  区间 {data['meta']['range']['start']} ~ {data['meta']['range']['end']}")
     adv = data["advice"]
     print(f"账号={[a['label'] for a in data['meta']['accounts']]} "
           f"SKU={len(data['skus'])} 计划={len(data['plans'])} 操作={len(data['ops'])} "
