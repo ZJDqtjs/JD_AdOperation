@@ -34,6 +34,30 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _load_dotenv() -> None:
+    """本地直接跑脚本（不经 docker-compose）时也认仓库根的 .env。
+
+    只填「进程环境里还没有」的键，已 export 的优先；解析失败就整体忽略。
+    """
+    root = Path(_env("JD_APP_DIR", str(Path(__file__).resolve().parent.parent)) or ".")
+    f = root / ".env"
+    if not f.exists():
+        return
+    try:
+        for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except OSError:
+        return
+
+
+_load_dotenv()
+
 BASE_DIR = Path(_env("JD_APP_DIR", str(Path(__file__).resolve().parent.parent)) or ".")
 DATA_DIR = Path(_env("JD_DATA_DIR", str(BASE_DIR / "data")) or ".")
 AUTH_DIR = Path(_env("JD_AUTH_DIR", str(BASE_DIR / "auth")) or ".")
@@ -41,6 +65,16 @@ CONFIG_DIR = Path(_env("JD_CONFIG_DIR", str(BASE_DIR / "config")) or ".")
 EXCEL_PATH = Path(_env("JD_EXCEL_PATH", str(CONFIG_DIR / "计算roi公式.xlsx")) or ".")
 ACCOUNTS_FILE = Path(_env("JD_ACCOUNTS_FILE", str(CONFIG_DIR / "accounts.json")) or ".")
 COSTS_FILE = Path(_env("JD_COSTS_FILE", str(CONFIG_DIR / "costs.json")) or ".")
+# 供货方 ERP 的「每个 SKU 真实成本」接口；留空 = 不启用，退回本地 costs.json / Excel 全店口径
+COSTS_URL = (_env("JD_COSTS_URL", "") or "").strip()
+COSTS_TOKEN = (_env("JD_COSTS_TOKEN", "") or "").strip()
+COSTS_TIMEOUT = _env_int("JD_COSTS_TIMEOUT", 20)
+COSTS_TTL = _env_int("JD_COSTS_TTL", 6 * 3600)          # 拉到的结果本地缓存 6 小时
+COSTS_CACHE_FILE = Path(_env("JD_COSTS_CACHE", str(DATA_DIR / "costs_cache.json")) or ".")
+# 1 = 按所选区间向接口要均值（会带 date_from/date_to）；0 = 用供货方默认（近 30 天）
+COSTS_FOLLOW_WINDOW = _env_bool("JD_COSTS_FOLLOW_WINDOW", True)
+# 本次报表实际用的成本口径来源，供报表展示（不入库）
+COSTS_SOURCE: dict = {"kind": "全店口径", "detail": "未配置成本来源"}
 # 进程临时目录（Playwright 的 artifacts 也落这里）
 TMP_DIR = Path(_env("JD_TMP_DIR", str(DATA_DIR / "tmp")) or ".")
 # 「已入库日期」缓存的存活秒数（Web 与抓取是两个进程，靠 TTL 感知对方写入）
@@ -200,16 +234,119 @@ def use_tmp_dir() -> str:
     return p
 
 
-def load_costs() -> dict:
-    """可选：每个 SKU 的真实供货价/运费，用于把「保本ROI」算准。
-
-    config/costs.json 形如：
-    {"default": {"shipping": 5.0, "platformRate": 0.0, "returnRate": 0.05},
-     "skus": {"100000000001": {"supply": 70.0, "price": 100.0, "shipping": 5.0}}}
-    """
-    if not COSTS_FILE.exists():
-        return {}
+def _costs_cache_read() -> dict:
     try:
-        return json.loads(COSTS_FILE.read_text(encoding="utf-8"))
+        return json.loads(COSTS_CACHE_FILE.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _costs_cache_write(data: dict) -> None:
+    try:
+        COSTS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = COSTS_CACHE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(COSTS_CACHE_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _costs_fetch(date_from: str = "", date_to: str = "") -> dict:
+    """拉供货方 ERP 的 SKU 成本接口；任何异常都抛给调用方处理。"""
+    import time
+    import urllib.parse
+    import urllib.request
+
+    url = COSTS_URL
+    qs = {}
+    if date_from:
+        qs["date_from"] = date_from
+    if date_to:
+        qs["date_to"] = date_to
+    if qs:
+        url = f"{url}{'&' if '?' in url else '?'}{urllib.parse.urlencode(qs)}"
+    headers = {"Accept": "application/json", "User-Agent": "jd-roi/1.0"}
+    if COSTS_TOKEN:
+        headers["X-Api-Token"] = COSTS_TOKEN
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=COSTS_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("skus"), dict):
+        raise ValueError(f"成本接口返回结构异常：{str(data)[:160]}")
+    data["_fetched_at"] = time.time()
+    data["_query"] = {"date_from": date_from, "date_to": date_to}
+    return data
+
+
+def costs_unit_map() -> dict:
+    """手工换算表 config/costs_units.json：{"<skuId>": 每 1 个京东售卖件 = 几个 ERP 计量单位}。
+
+    默认全部按 1:1，因为实测只有 1:1 成立：按 ERP出库件数÷商智京东件数（1.5~4.2 倍）换算后，
+    结算价会**高于**消费者实付价，显然不对 —— 那个比值差的是 ERP 里混入了其他渠道销量。
+    供货方若确认某个 SKU 真是「1 件 = N 袋」，在这里（或接口的 unitsPerSale）填 N 即可。
+    """
+    p = CONFIG_DIR / "costs_units.json"
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {}
+    for k, v in (raw or {}).items():
+        try:
+            out[str(k)] = float(v)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def load_costs(date_from: str = "", date_to: str = "") -> dict:
+    """每个 SKU 的真实成本：远端接口优先 → 本地缓存 → config/costs.json → 空（全店口径）。
+
+    返回结构：{"default": {...}, "skus": {"<skuId>": {"supply":…, "_goodsCost":…}},
+    外加 "_source"/"updatedAt" 等说明字段，供报表标注成本口径来源。
+    接口口径：**supply = 京东结算给我们的单件金额（收入，已扣点）**，
+    _goodsCost 才是我方货款成本 —— 见《SKU成本接口对接说明.md》第 2 节。
+    """
+    global COSTS_SOURCE
+    if COSTS_URL:
+        cached = _costs_cache_read()
+        fresh = (cached.get("skus") and
+                 time_ago(cached.get("_fetched_at")) < COSTS_TTL and
+                 (cached.get("_query") or {}).get("date_from", "") == date_from and
+                 (cached.get("_query") or {}).get("date_to", "") == date_to)
+        if not fresh:
+            try:
+                cached = _costs_fetch(date_from, date_to)
+                _costs_cache_write(cached)
+                COSTS_SOURCE = {"kind": "供货方接口",
+                                "detail": f"{COSTS_URL}｜updatedAt {cached.get('updatedAt', '—')}"}
+                return cached
+            except Exception as e:  # noqa: BLE001  断网/Token 失效/5xx 都走缓存，不阻断报表
+                print(f"[成本表] 接口拉取失败，改用本地缓存/costs.json：{type(e).__name__}: {e}")
+                COSTS_SOURCE = {"kind": "本地缓存" if cached.get("skus") else "本地成本文件",
+                                "detail": f"接口失败：{type(e).__name__}: {e}"}
+        else:
+            COSTS_SOURCE = {"kind": "本地缓存",
+                            "detail": f"接口结果缓存 {int(time_ago(cached.get('_fetched_at')) / 60)} 分钟前"}
+        if cached.get("skus"):
+            return cached
+    if COSTS_FILE.exists():
+        try:
+            data = json.loads(COSTS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("skus"):
+                COSTS_SOURCE = {"kind": "config/costs.json", "detail": str(COSTS_FILE)}
+                return data
+        except Exception as e:  # noqa: BLE001
+            COSTS_SOURCE = {"kind": "全店口径", "detail": f"costs.json 解析失败：{e}"}
+    return {}
+
+
+def time_ago(ts) -> float:
+    """时间戳距今秒数；无效值返回无穷大（视为过期）。"""
+    import time
+    try:
+        return max(0.0, time.time() - float(ts))
+    except (TypeError, ValueError):
+        return float("inf")

@@ -2,8 +2,8 @@
 """打开 MSA「编辑计划」弹窗，抓取读写接口与弹窗结构。
 
 用法:
-    python -m jd_roi.probe_edit --account=b --camp=入仓紫拇指
-    python -m jd_roi.probe_edit --account=b --camp=入仓紫拇指 --save   # 额外点保存（会真实提交！）
+    python -m jd_roi.probe_edit --account=b --camp=<计划名>
+    python -m jd_roi.probe_edit --account=b --camp=<计划名> --save   # 额外点保存（会真实提交！）
 输出:
     data/net/msa_edit_<ts>.json   —— 抓到的 XHR
     data/explore/msa_edit.html    —— 弹窗打开后的页面 HTML
@@ -29,7 +29,7 @@ def _arg(name: str, default: str | None = None) -> str | None:
 
 def main() -> int:
     account, _ = config.parse_account(sys.argv[1:])
-    camp = _arg("camp", "入仓紫拇指") or ""
+    camp = _arg("camp", "示例计划名") or ""
     do_save = "--save" in sys.argv
 
     net = config.BASE_DIR / "data" / "net"

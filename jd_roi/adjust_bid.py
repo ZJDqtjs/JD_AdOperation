@@ -22,7 +22,7 @@ import json
 import re
 import sys
 
-from . import analyze2, config
+from . import analyze2, config, settings
 from .browser import launch_profile
 
 API = "https://jzt-api.jd.com"
@@ -90,8 +90,10 @@ def rollback_plan(account: str) -> list[dict]:
     """
     accts = analyze2._load_accounts()
     model = analyze2.load_cost_model()
+    costs = settings.load_costs()
     ops = analyze2.op_rows(accts)
-    plans = analyze2.plan_rows(accts, model)
+    skus, _no_ad = analyze2.sku_rows(accts, model, costs)
+    plans, _planBe = analyze2.plan_rows(accts, model, skus)
     adj = analyze2.adjustments(accts, ops, plans)
 
     by_cid: dict[str, dict] = {}

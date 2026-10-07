@@ -39,6 +39,7 @@ envs["JD_EXCEL_PATH"] = str(TMP / "config" / "计算roi公式.xlsx")
 envs["JD_ENABLE_SCHEDULER"] = "0"
 envs["JD_RUN_ON_START"] = "0"
 envs["JD_ACCOUNTS"] = json.dumps([{"key": "main", "label": "主账号", "account_id": 111}])
+envs["JD_COSTS_URL"] = ""          # 测试保持离线：不连供货方成本接口，保本线走全店口径
 envs["JD_WEB_PORT"] = "8901"
 
 for k, v in envs.items():

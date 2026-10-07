@@ -25,6 +25,7 @@ TMP = Path(tempfile.mkdtemp(prefix="jdroi_e2e_"))
 
 # settings 在导入时求值，必须先设环境变量
 os.environ["JD_DATA_DIR"] = str(TMP / "data")
+os.environ.setdefault("JD_COSTS_URL", "")   # 离线：测试不连供货方成本接口
 os.environ["JD_AUTH_DIR"] = str(TMP / "auth")
 os.environ["JD_CONFIG_DIR"] = str(TMP / "config")
 os.environ["JD_EXCEL_PATH"] = str(TMP / "config" / "missing.xlsx")

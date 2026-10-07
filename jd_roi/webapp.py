@@ -364,9 +364,19 @@ def report(request: Request):
 # ================================================================ API
 @app.get("/api/status")
 def api_status():
+    cached = settings._costs_cache_read() or {}
     return {"ok": True,
             "server": dt.datetime.now().isoformat(timespec="seconds"),
             "tz": settings.TZ,
+            "costs": {"apiConfigured": bool(settings.COSTS_URL),
+                      "intendedSource": ("供货方接口" if settings.COSTS_URL else
+                                         ("config/costs.json" if settings.COSTS_FILE.exists()
+                                          else "全店 Excel 口径")),
+                      "lastRunSource": (settings.COSTS_SOURCE or {}).get("kind") or "",
+                      "skus": len(cached.get("skus") or {}),
+                      "updatedAt": cached.get("updatedAt") or "",
+                      "ageSec": (None if not cached.get("_fetched_at")
+                                 else round(settings.time_ago(cached.get("_fetched_at"))))},
             "schedule": {"hour": settings.SCHEDULE_HOUR, "minute": settings.SCHEDULE_MINUTE,
                          "refreshDays": settings.REFRESH_DAYS},
             "accounts": [{"key": a["key"], "label": a.get("label")} for a in settings.ACCOUNTS],

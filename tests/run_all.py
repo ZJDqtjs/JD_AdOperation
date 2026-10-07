@@ -15,6 +15,7 @@ PY = sys.executable
 
 SUITES = [
     ("区间聚合（按天入库 → 任意区间加总）", "tests/test_range_agg.py"),
+    ("按 SKU 真实成本（收入口径/单位换算/回落/加权保本线）", "tests/test_sku_costs.py"),
     ("按天索引缓存（跨进程可见性）", "tests/test_day_cache.py"),
     ("端到端管线（冷启动/抓取编排/聚合/报表/HTTP）", "tests/test_pipeline_e2e.py"),
     ("真实浏览器 + 打桩京东接口（分页/限流/isDaily/商智capture/操作日志）", "tests/test_scrape_live_http.py"),

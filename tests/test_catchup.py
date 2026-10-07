@@ -19,6 +19,7 @@ _TMPROOT.mkdir(parents=True, exist_ok=True)
 TMP = Path(tempfile.mkdtemp(prefix="jdroi_catchup_", dir=str(_TMPROOT)))
 
 os.environ["JD_DATA_DIR"] = str(TMP / "data")
+os.environ.setdefault("JD_COSTS_URL", "")   # 离线：测试不连供货方成本接口
 os.environ["JD_AUTH_DIR"] = str(TMP / "auth")
 os.environ["JD_CONFIG_DIR"] = str(TMP / "config")
 os.environ["JD_ACCOUNTS"] = json.dumps([{"key": "main", "label": "主账号", "account_id": 111}])

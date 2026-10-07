@@ -1,14 +1,19 @@
 {
-  "_说明": "每个 SKU 的真实成本。填了之后保本ROI/预估净利才是真实口径；不填则用 Excel 计算公式 sheet 的全店毛利率。",
+  "_说明": "每个 SKU 的真实成本（手工维护版）。生产上更推荐直接连供货方接口：配 JD_COSTS_URL / JD_COSTS_TOKEN 即可，本文件作为接口不通时的兜底。",
+  "_口径": "供货方接口里 supply 是「京东结算给我们的单件金额」= 收入（已扣点），成本是 _goodsCost；本文件把那个成本字段写成 goodsCost。单件贡献 = supply − goodsCost − shipping − package − labor；毛利率 = 贡献 ÷ 件单价；保本 ROI = 1 ÷ 毛利率。",
+  "_注意": "不要把 platformRate 再乘一遍算扣点成本 —— supply 已经是扣点后的结算额。缺字段则回落 default，整个 SKU 缺失则回落 Excel 全店口径（报表标 *）。",
   "_字段": {
-    "supply": "供货价（单件商品成本）",
-    "price": "实际成交客单价（留空则用商智真实客单价）",
+    "supply": "每件结算给我们多少钱（收入，含我方利润）",
+    "goodsCost": "每件买货成本（接口里的 _goodsCost）",
+    "price": "单件售价，可留空；留空用商智真实件单价",
     "shipping": "单件运费（留空用 default.shipping）",
-    "platformRate": "京东扣点比例，如 0.05",
-    "returnRate": "退货率，如 0.05"
+    "package": "单件包材",
+    "labor": "单件打包人工",
+    "returnRate": "退货率，如 0.05（留空用 default.returnRate）"
   },
-  "default": {"shipping": 5.0, "platformRate": 0.0, "returnRate": 0.05},
+  "default": {"shipping": 5.0, "goodsCost": 40.0, "package": 0.0, "labor": 0.0, "returnRate": 0.05},
   "skus": {
-    "100000000001": {"supply": 70.0, "price": 100.0, "shipping": 5.0}
+    "100000000001": {"supply": 70.0, "goodsCost": 45.0, "price": null, "shipping": 5.0, "package": 0.6, "labor": 0.4},
+    "100000000002": {"supply": 45.0, "goodsCost": 30.0, "shipping": 5.0, "package": 0.5, "labor": 0.5, "returnRate": null}
   }
 }

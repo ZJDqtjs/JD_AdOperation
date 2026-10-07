@@ -19,7 +19,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from . import config, store
+from . import config, settings, store
 
 # ---------------- 窗口定义 ----------------
 # 报表固定展示 3 期：w2 = 用户所选区间，w1/w0 = 等长的前两期（用于环比与趋势）
@@ -153,7 +153,99 @@ def sku_margin(aov: float, m: dict) -> dict:
         "grossPerOrder": round(price * margin, 2),
         "margin": round(margin, 4),
         "breakeven": be,
+        "growLine": round(be * GROW_FACTOR, 2) if be else 0.0,
+        "costSource": "store",
     }
+
+
+# ---------------- 按 SKU 的真实成本 ----------------
+# 供货方 ERP 接口（/api/open/sku-costs）的口径与 Excel 全店口径不同，必须按「收入 − 成本」算：
+#   supply   = 京东**结算给我们**的单件金额（已扣点，含我方利润）→ 这是收入，不是成本
+#   _goodsCost = 我方买货成本 → 这才是成本
+# 因此：单件贡献 = supply − 货款 − 包材 − 人工 − 运费；
+#       毛利率（对成交额）= 单件贡献 ÷ 件单价；保本 ROI = 1 ÷ 毛利率 = 件单价 ÷ 单件贡献。
+# 注意别把 platformRate 再乘一遍：supply 已经是扣点后的结算额（platformRate 仅供核对）。
+GROW_FACTOR = 1.25        # 放量线 = 保本线 × 1.25（例：全店口径 4.00 → 5.00）
+
+
+def sku_cost_of(sid: str, unit_price: float, m: dict, costs: dict, units: dict | None = None) -> dict:
+    """取某个 SKU 的真实保本线；ERP 里查不到就回落全店口径（Excel / COST_MODEL）。
+
+    unit_price 用「件单价」（商智成交额÷件数），没有件数就退回客单价，
+    因为 supply/包材/人工/运费 都是**每件**口径，除以客单价会低估多件订单的毛利。
+
+    units：每 1 个「京东售卖件」等于几个 ERP 计量单位（袋/盒）。默认 1；
+    实测 1 才成立（按 ERP÷商智 的件数比换算会让结算价高于消费者实付），
+    那个比值差的是 ERP 里含了其他渠道销量。真有换算需求时用接口返回的
+    unitsPerSale，或写 config/costs_units.json，两者都没有就按 1 并做口径体检。
+    """
+    units = units if units is not None else settings.costs_unit_map()
+    d = (costs or {}).get("default") or {}
+    row = ((costs or {}).get("skus") or {}).get(str(sid)) or {}
+    price = _f(unit_price)
+    if price <= 0:
+        price = _f(row.get("price")) or _f(m.get("refPrice")) or 1.0
+    supply = _f(row.get("supply"))
+    goods = _f(row.get("_goodsCost"), _f(row.get("goodsCost"), _f(d.get("goodsCost"))))
+    if supply <= 0 or goods <= 0:                   # 没接入该 SKU → 全店口径
+        out = sku_margin(_f(unit_price) or _f(m.get("refPrice")), m)
+        out["priceBasis"] = "store"
+        out["unitFactor"] = 1.0
+        out["unitFactorSource"] = "n/a"
+        return out
+    k = _f(row.get("unitsPerSale"))
+    kf = "erp"
+    if k <= 0:
+        k = _f(units.get(str(sid)), 1.0)
+        kf = "manual" if str(sid) in units else "assumed"
+    if k <= 0:
+        k = 1.0
+    shipping = _f(row.get("shipping"), _f(m.get("shipping"), _f(d.get("shipping")))) * k
+    package = _f(row.get("package"), _f(m.get("package"), _f(d.get("package")))) * k
+    labor = _f(row.get("labor"), _f(d.get("labor"))) * k
+    supply, goods = supply * k, goods * k
+    ret_rate = _f(row.get("returnRate"), _f(d.get("returnRate"), _f(m.get("returnRate"))))
+    contrib = supply - goods - shipping - package - labor
+    margin = round(contrib / price, 4) if price > 0 else 0.0
+    be = round(1 / margin, 2) if margin > 0 else 0.0
+    return {
+        "aov": round(price, 2),
+        "supply": round(supply, 2),
+        "supplyGross": round(_f(row.get("supplyGross")) * k, 2),
+        "productCost": round(goods, 2),
+        "shipping": round(shipping, 2),
+        "package": round(package, 2),
+        "labor": round(labor, 2),
+        "platform": round((_f(row.get("supplyGross")) - supply) * k, 4),   # 已含在结算价里，仅展示
+        "platformRate": _f(row.get("platformRate"), _f(d.get("platformRate"))),
+        "returnCost": round(ret_rate * (shipping + package), 2),      # 单独一行，不进毛利率
+        "grossPerOrder": round(contrib, 2),
+        "margin": margin,
+        "breakeven": be,
+        "growLine": round(be * GROW_FACTOR, 2) if be else 0.0,
+        "costSource": "erp",
+        "erpName": row.get("_name") or "",
+        "erpSource": row.get("_source") or "",
+        "erpQty": _f(row.get("_qty")),
+        "unitFactor": round(k, 2),
+        "unitFactorSource": kf,
+        "priceBasis": "unit" if _f(unit_price) > 0 else "fallback",
+    }
+
+
+def blended_breakeven(rows: list) -> tuple:
+    """一篮子 SKU 的加权保本线：按成交额加权毛利率 → 1/加权毛利率。
+
+    计划级、词级、以及整页文案都需要一条「这堆东西的保本线」，
+    用加权而不是算术平均，才与「花费转移到高毛利商品」这类结论一致。
+    """
+    amt = sum(_f(r.get("amt")) for r in rows)
+    profit = sum(_f(r.get("amt")) * _f(r.get("margin")) for r in rows)
+    if amt <= 0 or profit <= 0:
+        return round(1 / global_margin(COST_MODEL), 2) if global_margin(COST_MODEL) > 0 else BREAKEVEN_FLAT, 0.0
+    mg = profit / amt
+    return round(1 / mg, 2), round(mg, 4)
+
 
 
 def _metrics(imp, clk, cost, ord_, amt, cart):
@@ -320,7 +412,9 @@ def type_split(accts):
 
 
 # ---------------- 按 SKU 交叉（跨账号合并广告 + 分店铺商智）----------------
-def sku_rows(accts, model):
+def sku_rows(accts, model, costs=None):
+    costs = costs or {}
+    units = settings.costs_unit_map()
     aggAd = {wk: defaultdict(lambda: {"cost": 0.0, "amt": 0.0, "ord": 0, "imp": 0,
                                       "clk": 0, "cart": 0, "byAcct": {}, "plans": set()})
              for wk in WKEYS}
@@ -380,9 +474,11 @@ def sku_rows(accts, model):
                 sid = s["skuId"]
                 e = szMap[wk].setdefault(sid, {"name": s["name"], "img": s.get("img"),
                                                "url": s.get("url"), "amt": 0.0, "orders": 0,
+                                               "qty": 0.0,
                                                "visitors": 0, "views": 0, "shops": {}})
                 e["amt"] += s["amt"]
                 e["orders"] += s["orders"]
+                e["qty"] += _f(s.get("qty"))
                 e["visitors"] += s["visitors"]
                 e["views"] += s["views"]
                 e["shops"][k] = e["shops"].get(k, 0.0) + s["amt"]
@@ -409,10 +505,11 @@ def sku_rows(accts, model):
                 m["szVisitors"] = sz["visitors"]
                 m["szViews"] = sz["views"]
                 m["szOrders"] = sz["orders"]
+                m["szQty"] = round(_f(sz.get("qty")), 1)
                 m["szCvr"] = round(sz["orders"] / sz["visitors"] * 100, 2) if sz["visitors"] else 0.0
             else:
                 m["szAmt"] = 0.0
-                m["szVisitors"] = m["szViews"] = m["szOrders"] = 0
+                m["szVisitors"] = m["szViews"] = m["szOrders"] = m["szQty"] = 0
                 m["szCvr"] = 0.0
             share = round(m["amt"] / m["szAmt"] * 100, 1) if m["szAmt"] else None
             # 广告成交 > 店铺成交 说明两个口径期间不一致（归因跨期/商智无该SKU），此时渗透率不可比
@@ -437,7 +534,34 @@ def sku_rows(accts, model):
                 if per[wk]["amt"] and per[wk]["ord"]:
                     aovRef = per[wk]["amt"] / per[wk]["ord"]
                     break
-        cost = sku_margin(aovRef, model)
+        # 商智件数（qty）才是 ERP 成本项的分母；一件 multi-pack 的 2~3 倍很常见
+        unit_price = 0.0
+        for e in (szMap["w1"].get(sid), szMap["w2"].get(sid), szMap["w0"].get(sid)):
+            if e and _f(e.get("qty")) > 0:
+                unit_price = round(_f(e["amt"]) / _f(e["qty"]), 2)
+                break
+        cost = sku_cost_of(sid, unit_price or aovRef, model, costs, units)
+        # 两条自动体检：
+        #   ① 结算价 ≥ 件单价：不可能成立（结算价是消费者实付里的一部分），多半是促销价/期间口径不一致
+        #   ② ERP 件数 ÷ 商智件数 偏离 1：仅作参考。实测换算系数取 1 才成立
+        #      （若按倍数换算，结算价会超过消费者实付），说明 ERP 的 _qty 含了其他渠道，不动成本
+        if cost.get("costSource") == "erp":
+            erp_q = _f(cost.get("erpQty"))
+            # 接口是按「所选区间」要的均值（= w2），所以件数也只能跟 w2 比，跨三期比会得到 0.3 这种假异常
+            sz_q = _f((szMap["w2"].get(sid) or {}).get("qty"))
+            ratio = round(erp_q / sz_q, 2) if (erp_q > 0 and sz_q > 0) else 0.0
+            if ratio:
+                cost["qtyRatio"] = ratio
+            warn = []
+            if _f(cost.get("supply")) >= _f(cost.get("aov")) > 0:
+                cost["supplyOverPrice"] = True
+                warn.append(f"结算价 ¥{_f(cost.get('supply'))} ≥ 件单价 ¥{_f(cost.get('aov'))}，"
+                            f"成本或售价口径待确认（是否为促销价/跨期）")
+            # 入仓品的 _qty 是「全部记录」汇总（接口不吃 date_from/date_to），
+            # 跟本区间的商智件数没有可比性，只对出库口径做这个体检
+            if ratio >= 1.3 and _f(cost.get("unitFactor")) <= 1 and cost.get("erpSource") == "sale":
+                warn.append(f"ERP 出库件数为该区间商智京东件数的 {ratio} 倍（已按 1:1 计，疑含其他渠道销量）")
+            cost["unitWarn"] = "；".join(warn)
         est = {}
         for wk in WKEYS:
             m = per[wk]
@@ -459,6 +583,8 @@ def sku_rows(accts, model):
             "skuId": sid, "name": name, "img": szInfo.get("img"), "url": szInfo.get("url"),
             "aov": round(aovRef, 2), "margin": cost["margin"], "breakeven": cost["breakeven"],
             "grossPerOrder": cost["grossPerOrder"],
+            "unitPrice": unit_price or round(aovRef, 2), "growLine": cost.get("growLine") or 0.0,
+            "costSource": cost.get("costSource") or "store", "costParams": cost,
             "wins": per, "est": est, "byAccount": byAcct,
             "shops": {labelOf.get(k2, k2): round(v, 2) for k2, v in (szInfo.get("shops") or {}).items()},
             "adAccounts": sorted((aggAd["w1"].get(sid, {}).get("byAcct") or {}).keys()),
@@ -486,39 +612,96 @@ def sku_rows(accts, model):
     return rows, no_ad[:20]
 
 
+def _cost_coverage(skus: list, costs: dict) -> dict:
+    """报表要回答「真实成本覆盖了多少花费」，否则读者会把回落全店口径的 SKU 也当成真实结论。"""
+    def _own(s):
+        w = s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"]
+        return _f(w["cost"])
+    tot = sum(_own(s) for s in skus)
+    erp = [s for s in skus if s.get("costSource") == "erp"]
+    erp_cost = sum(_own(s) for s in erp)
+    zero = [s for s in erp if _f(s.get("breakeven")) <= 0]
+    warn = [{"skuId": s["skuId"], "name": s["name"], "warn": (s.get("costParams") or {}).get("unitWarn")}
+            for s in erp if (s.get("costParams") or {}).get("unitWarn")]
+    missing = [{"skuId": s["skuId"], "name": s["name"], "cost": _own(s)}
+               for s in skus if s.get("costSource") != "erp" and _own(s) > 0]
+    missing.sort(key=lambda x: -x["cost"])
+    return {
+        "skuTotal": len(skus), "skuErp": len(erp), "skuStore": len(skus) - len(erp),
+        "costErp": round(erp_cost, 2), "costTotal": round(tot, 2),
+        "costShare": round(erp_cost / tot * 100, 1) if tot else 0.0,
+        "negativeMargin": [{"skuId": s["skuId"], "name": s["name"],
+                            "cost": _own(s), "grossPerOrder": s.get("grossPerOrder")}
+                           for s in zero],
+        "unitWarn": warn, "missing": missing[:40],
+        "missingCost": round(sum(x["cost"] for x in missing), 2),
+        "skusInErp": len((costs or {}).get("skus") or {}),
+    }
+
+
 def _verdict(r):
     w0, w1, w2 = r["wins"]["w0"], r["wins"]["w1"], r["wins"]["w2"]
-    be = BREAKEVEN_FLAT
+    # 每个 SKU 用自己那条保本线；没接入真实成本的，sku_cost_of 已回落成全店保本线。
+    # 注意 be==0 是有意义的（结算价低于成本 → 保本线不存在），不能当成「没值」
+    be = _f(r.get("breakeven"))
+    if (r.get("costSource") == "erp") and be <= 0:
+        cp = r.get("costParams") or {}
+        return {"tier": "严重亏损", "score": 4,
+                "reason": (f"ERP 结算价 ¥{_f(cp.get('supply'))} 低于单件成本"
+                           f"（货款 {_f(cp.get('productCost'))}+运费 {_f(cp.get('shipping'))}"
+                           f"+包材 {_f(cp.get('package'))}+人工 {_f(cp.get('labor'))}），"
+                           f"卖一件亏一件，ROI {r['wins']['w2']['roi'] if r['wins']['w2']['cost'] > 0 else r['wins']['w1']['roi']} 无意义")}
+    be = be or BREAKEVEN_FLAT
+    grow = _f(r.get("growLine")) or round(be * GROW_FACTOR, 2)
     latest = w2 if w2["cost"] > 0 else w1
     roi = latest["roi"]
     adCost = latest["cost"]
     net = r["est"]["w2" if w2["cost"] > 0 else "w1"]["netProfit"]
     if adCost <= 0:
         return {"tier": "未投放", "score": 9, "reason": "本周无广告花费"}
-    if roi >= 4:
+    if roi >= grow:
         if net <= 0:
             return {"tier": "优化", "score": 1,
-                    "reason": f"ROI {roi} 已达放量线，但按当前毛利估算扣除广告费后仍为负，先压 CPC 再放量"}
+                    "reason": f"ROI {roi} 已达放量线 {grow}，但按本 SKU 真实毛利扣广告费后仍为负，先压 CPC 再放量"}
         return {"tier": "放大", "score": 0,
-                "reason": f"ROI {roi} 高于放量线 4，且高于保本 {be}"}
+                "reason": f"ROI {roi} 高于本 SKU 放量线 {grow}（保本 {be}），且扣广告费后为正"}
     if roi >= be:
         return {"tier": "优化", "score": 1,
-                "reason": f"ROI {roi} 在保本 {be} 之上，仍有抠词/提效空间"}
+                "reason": f"ROI {roi} 在本 SKU 保本 {be} 之上、未到放量线 {grow}，仍有抠词/提效空间"}
     if net > 0:
         return {"tier": "止损", "score": 2,
-                "reason": f"ROI {roi} < 保本 {be}，广告在亏，但自然成交兜住了整体利润"}
+                "reason": f"ROI {roi} < 本 SKU 保本 {be}，广告在亏，但自然成交兜住了整体利润"}
     return {"tier": "严重亏损", "score": 3,
-            "reason": f"ROI {roi} < 保本 {be}，且扣掉广告费后整体估算为负"}
+            "reason": f"ROI {roi} < 本 SKU 保本 {be}，且扣掉广告费后整体估算为负"}
 
 
 # ---------------- 计划级 ----------------
-def plan_rows(accts, model):
+def plan_rows(accts, model, skus=None):
+    """计划级分层。计划可能同时投多个 SKU，所以保本线用「该计划内各 SKU 按成交额加权的毛利率」，
+    而不是全店一条线；SKU 里查不到的部分才落回全店毛利率。返回 (out, beOfPlan)。"""
+    marginOf = {s["skuId"]: _f(s.get("margin")) for s in (skus or [])}
+    srcOf = {s["skuId"]: (s.get("costSource") or "store") for s in (skus or [])}
+    skuAmt = defaultdict(dict)        # (account, campaignId) -> {skuId: 成交额}
+    planBe = {}
     out = []
     for a in accts:
         k, label = a["key"], a["label"]
         ids = {}
         for wk in WKEYS:
             w = a["ds"]["wins"][wk]
+            for r in (w["sku"] or {}).get("rows", []):
+                cid, sid = str(r.get("campaignId")), str(r.get("skuId") or "")
+                if sid:
+                    e = skuAmt[(k, cid)].setdefault(sid, 0.0)
+                    skuAmt[(k, cid)][sid] = e + _f(r.get("totalOrderSum"))
+            for r in (w["jzt"] or {}).get("rows", []):
+                if _i(r.get("campaignType")) != 153:
+                    continue
+                cid = str(r.get("campaignId"))
+                sid = str(r.get("spuId") or r.get("childProNo") or "").strip()
+                if sid and sid != "0":
+                    e = skuAmt[(k, cid)].setdefault(sid, 0.0)
+                    skuAmt[(k, cid)][sid] = e + _f(r.get("totalOrderSum"))
             for r in (w["jzt"] or {}).get("rows", []):
                 cid = str(r.get("campaignId"))
                 e = ids.setdefault(cid, {"campaignId": cid, "name": r.get("campaignName"),
@@ -545,23 +728,34 @@ def plan_rows(accts, model):
                 if e.get("jstWins"):
                     e["jstWins"].setdefault(wk, _empty())
             latest = e["wins"]["w2"] if e["wins"]["w2"]["cost"] > 0 else e["wins"]["w1"]
-            be = BREAKEVEN_FLAT
+            # 该计划的保本线 = 计划内各 SKU 按成交额加权的毛利率的倒数
+            pairs = skuAmt.get((k, cid)) or {}
+            sm = global_margin(model)
+            amt_tot = sum(pairs.values())
+            prof = sum(a * _f(marginOf.get(s), sm) for s, a in pairs.items())
+            pmargin = round(prof / amt_tot, 4) if amt_tot > 0 else round(sm, 4)
+            be = round(1 / pmargin, 2) if pmargin > 0 else 0.0
+            planBe[(k, cid)] = be
+            grow = round(be * GROW_FACTOR, 2) if be else 0.0
             roi = latest["roi"]
             if latest["cost"] <= 0:
                 tier = "未投放"
-            elif roi >= 4:
+            elif be <= 0:
+                tier = "严重亏损"          # 计划内的货卖一件亏一件，广告只是放大亏损
+            elif roi >= grow:
                 tier = "放大"
             elif roi >= be:
                 tier = "优化"
             else:
                 tier = "止损"
             e.update({"account": k, "accountLabel": label, "typeLabel": TYPE_LABEL.get(e["type"], "其他"),
-                      "tier": tier, "breakeven": be,
+                      "tier": tier, "breakeven": be, "growLine": grow, "planMargin": pmargin,
+                      "costMapped": bool(pairs) and any(srcOf.get(s) == "erp" for s in pairs),
                       "deltaRoi": round(e["wins"]["w1"]["roi"] - e["wins"]["w0"]["roi"], 2),
                       "deltaCost": round(e["wins"]["w1"]["cost"] - e["wins"]["w0"]["cost"], 2)})
             out.append(e)
     out.sort(key=lambda p: (-p["wins"]["w1"]["cost"] - p["wins"]["w2"]["cost"],))
-    return out
+    return out, planBe
 
 
 # ---------------- 搜索词 / 关键词 ----------------
@@ -583,7 +777,10 @@ def _terms(df, key):
     return out
 
 
-def word_rows(accts, model):
+def word_rows(accts, model, beByName=None):
+    """词级分层。词报表只有计划名，所以保本线按「该计划内 SKU 加权保本线」取；
+    计划里没匹配到任何真实成本 SKU 时退回全店线。"""
+    beByName = beByName or {}
     per_account = {}
     for a in accts:
         k = a["key"]
@@ -594,10 +791,12 @@ def word_rows(accts, model):
             kw = _terms(w["kw"], "keywordName")
             byPlan = defaultdict(lambda: {"sw": [], "kw": [], "totCost": 0.0})
             for (cid, word), t in sw.items():
-                byPlan[cid]["sw"].append(_word_dict(word, t, BREAKEVEN_FLAT))
+                be = _f(beByName.get((k, cid))) or BREAKEVEN_FLAT
+                byPlan[cid]["sw"].append(_word_dict(word, t, be))
                 byPlan[cid]["totCost"] += t["cost"]
             for (cid, word), t in kw.items():
-                byPlan[cid]["kw"].append(_word_dict(word, t, BREAKEVEN_FLAT))
+                be = _f(beByName.get((k, cid))) or BREAKEVEN_FLAT
+                byPlan[cid]["kw"].append(_word_dict(word, t, be))
             for cid, v in byPlan.items():
                 for key in ("sw", "kw"):
                     v[key].sort(key=lambda x: -x["cost"])
@@ -617,7 +816,7 @@ def _word_dict(word, t, be):
         kind = "low"
     return {"word": word, "cost": round(t["cost"], 2), "amt": round(t["amt"], 2),
             "ord": t["ord"], "clk": t["clk"], "imp": t["imp"],
-            "roi": round(roi, 2), "kind": kind}
+            "roi": round(roi, 2), "kind": kind, "be": round(be, 2)}
 
 
 # ---------------- 操作日志 ----------------
@@ -825,7 +1024,7 @@ def adjustments(accts, ops, plans, windows=None, span_from=None, span_to=None):
 def _judge(op, before, after, plan):
     if not before or not after or before["days"] < 3 or after["days"] < 3:
         return "无法评估", "该计划缺少足够的日粒度数据（新计划或被删除）"
-    be = BREAKEVEN_FLAT
+    be = _f((plan or {}).get("breakeven")) or BREAKEVEN_FLAT
     dr = after["roi"] - before["roi"]
     dc = after["dailyCost"] - before["dailyCost"]
     da = after["dailyAmt"] - before["dailyAmt"]
@@ -940,6 +1139,18 @@ def build_advice(accts, totals, skus, plans, ops, words, adj):
             (s["wins"]["w2"]["cost"] > 0 or s["wins"]["w1"]["cost"] > 0)]
     grow = [s for s in skus if s["verdict"]["tier"] == "放大"]
 
+    def _own(s):
+        """该 SKU 的「本期花费」：与 stop/grow 的取数口径保持一致。"""
+        w = s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"]
+        return w["cost"]
+    erpS = [s for s in skus if s.get("costSource") == "erp"]
+    _all = sum(_own(s) for s in skus)
+    erpShare = round(sum(_own(s) for s in erpS) / _all * 100, 1) if _all else 0.0
+    negMargin = [s for s in erpS if _f(s.get("breakeven")) <= 0]
+    negNames = "、".join((s["name"] or s["skuId"])[:16] for s in negMargin[:6])
+    if len(negMargin) > 6:
+        negNames += " 等"
+
     stopCost = sum((s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"])["cost"] for s in stop)
     stopAmt = sum((s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"])["amt"] for s in stop)
     growCost = sum((s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"])["cost"] for s in grow)
@@ -966,8 +1177,11 @@ def build_advice(accts, totals, skus, plans, ops, words, adj):
          f"{len([o for o in adj if o['verdict'] == '效果不明显'])} 条效果不明显、"
          f"{len([o for o in adj if o['verdict'] == '存疑'])} 条存疑；"
          f"另有 {unevaluable} 条因新建/删除/无花费无法对比"),
-        (f"所选区间仍有 {len(stop)} 个 SKU 的广告 ROI 低于保本线 {BREAKEVEN_FLAT}，合计花费 ¥{stopCost:,.0f}"
+        (f"所选区间仍有 {len(stop)} 个 SKU 的广告 ROI 低于「各自」的保本线"
+         f"（真实成本覆盖 {erpShare:.0f}% 的花费），合计花费 ¥{stopCost:,.0f}"
          f"（占 {stopCost / last['cost'] * 100:.0f}%），这部分是主要失血点" if last["cost"] else ""),
+        (f"其中 {len(negMargin)} 个 SKU 按 ERP 结算价算出「卖一件亏一件」"
+         f"（结算价 < 货款+运费+包材+人工），不投广告也在亏：{negNames}" if negMargin else ""),
         (f"若把上述花费转移到 ROI≈{targetRoi} 的高效 SKU，预计多产出 ¥{estGain:,.0f}，"
          f"整体 ROI 可由 {last['roi']} 提升到约 {roiAfter}"),
     ]
@@ -976,12 +1190,16 @@ def build_advice(accts, totals, skus, plans, ops, words, adj):
             "stop": [{"skuId": s["skuId"], "name": s["name"],
                       "cost": (s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"])["cost"],
                       "roi": (s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"])["roi"],
-                      "breakeven": s["breakeven"], "netProfit": s["est"]["w2"]["netProfit"]}
+                      "breakeven": s["breakeven"], "costSource": s.get("costSource") or "store",
+                      "unitPrice": s.get("unitPrice"), "grossPerOrder": s.get("grossPerOrder"),
+                      "netProfit": s["est"]["w2"]["netProfit"]}
                      for s in sorted(stop, key=lambda x: -(x["wins"]["w2"] if x["wins"]["w2"]["cost"] > 0 else x["wins"]["w1"])["cost"])],
             "grow": [{"skuId": s["skuId"], "name": s["name"],
                       "cost": (s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"])["cost"],
                       "roi": (s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"])["roi"],
-                      "breakeven": s["breakeven"]}
+                      "breakeven": s["breakeven"], "growLine": s.get("growLine"),
+                      "costSource": s.get("costSource") or "store",
+                      "unitPrice": s.get("unitPrice"), "grossPerOrder": s.get("grossPerOrder")}
                      for s in sorted(grow, key=lambda x: -x["wins"]["w2"]["roi"])],
             "upside": {"stopCost": round(stopCost, 2), "targetRoi": targetRoi,
                        "estGain": estGain, "roiAfter": roiAfter, "lastCost": last["cost"]}}
@@ -1004,13 +1222,24 @@ def build(start=None, end=None, windows=None, accounts=None):
     if not active:
         raise FileNotFoundError(
             f"没有找到 {win2[1]} ~ {win2[2]} 的数据，请先运行 python -m jd_roi.scrape_day")
+    # 每个 SKU 的真实成本：接口优先（按所选区间要均值），断网退回缓存/costs.json/全店口径
+    costs = {}
+    if settings.COSTS_FOLLOW_WINDOW:
+        costs = settings.load_costs(win2[1], win2[2])
+    else:
+        costs = settings.load_costs()
     totals = {a["key"]: account_totals(a) for a in active}
-    skus, no_ad = sku_rows(active, model)
-    plans = plan_rows(active, model)
+    skus, no_ad = sku_rows(active, model, costs)
+    plans, planBe = plan_rows(active, model, skus)
+    beByName = {(p["account"], p["name"]): _f(p.get("breakeven")) for p in plans}
     ops = op_rows(active, wins[0][1], win2[2])
-    words = word_rows(active, model)
+    words = word_rows(active, model, beByName)
     adj = adjustments(active, ops, plans, wins, span_from=win2[1], span_to=win2[2])
     advice = build_advice(active, totals, skus, plans, ops, words, adj)
+    # 整店一条「加权保本线」：按本期各 SKU 成交额加权毛利率取倒数，
+    # 用它替代「全店一条线」做汇总文案，才不会把高毛利 SKU 的花费算成打平
+    beBlend, marginBlend = blended_breakeven(
+        [{"amt": s["wins"]["w1"]["amt"], "margin": s["margin"]} for s in skus])
 
     return {
         "meta": {
@@ -1018,6 +1247,11 @@ def build(start=None, end=None, windows=None, accounts=None):
             "range": {"start": win2[1], "end": win2[2]},
             "coverage": _coverage_block(active, wins),
             "costModel": model, "breakevenFlat": BREAKEVEN_FLAT,
+            "breakevenBlend": beBlend, "marginBlend": marginBlend,
+            "growFactor": GROW_FACTOR,
+            "costSource": dict(settings.COSTS_SOURCE or {}),
+            "costCoverage": _cost_coverage(skus, costs),
+            "costUpdatedAt": costs.get("updatedAt") or "",
             "caliber": ("广告=京准通概览(点击15天/成交订单口径)；智能投放=智能投放报表；"
                         "商智=各店铺成交口径；商智客单价为真实值，产品成本按 Excel 成本率等比推算"),
             "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"]} for a in active],

@@ -20,6 +20,11 @@ services:
       JD_RUN_ON_START: "${JD_RUN_ON_START:-1}"
       JD_ENABLE_SCHEDULER: "${JD_ENABLE_SCHEDULER:-1}"
       JD_SCOPE: "${JD_SCOPE:-}"
+      # 供货方 SKU 成本接口（算「每个 SKU 自己的保本线」）。token 只写 .env，别提交
+      JD_COSTS_URL: "${JD_COSTS_URL:-}"
+      JD_COSTS_TOKEN: "${JD_COSTS_TOKEN:-}"
+      JD_COSTS_TTL: "${JD_COSTS_TTL:-21600}"
+      JD_COSTS_TIMEOUT: "${JD_COSTS_TIMEOUT:-20}"
       # 也可以在环境变量里直接给账号（JSON），优先级高于 config/accounts.json
       # JD_ACCOUNTS: '[{"key":"main","label":"主账号","account_id":10000000001}]'
     volumes:

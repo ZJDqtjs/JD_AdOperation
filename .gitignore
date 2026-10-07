@@ -18,6 +18,11 @@ docker-config/
 jd_roi/local_config.py
 config/accounts.json
 config/costs.json
+config/costs.template.json
+config/needed_skus.csv
+config/costs_units.json
+# 内部对接文档原件（含真实 SKU / 结算价 / 内部地址，不入库；脱敏版是 SKU成本接口对接说明.md）
+SKU成本接口对接说明.local.md
 .env
 .env.*
 !.env.example

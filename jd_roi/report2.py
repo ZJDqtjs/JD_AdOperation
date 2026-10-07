@@ -469,7 +469,7 @@ def page_overview(d) -> str:
         _kpi("广告成交额", "¥" + _money(c["amt"]),
              f'<span class="{dacls}">{da}</span> vs 前一期 ¥{_money(comb[pre]["amt"])}'),
         _kpi("整体投产比 ROI", f'{_n(c["roi"]):.2f}',
-             f'<span class="{drcls}">{dr}</span> ｜ 全店保本线 {_n(d["meta"]["breakevenFlat"]):.2f}',
+             f'<span class="{drcls}">{dr}</span> ｜ {_be_label(d)} {_be_all(d):.2f}',
              drcls),
         _kpi("店铺总成交（商智）", "¥" + _money(c.get("szAmt")),
              (f'广告贡献 {_pct(c.get("adShare"))} ｜ 自然成交 ¥{_money(max(_n(c.get("szAmt")) - _n(c["amt"]), 0))}'
@@ -488,7 +488,7 @@ def page_overview(d) -> str:
         cells = f'<td class="l"><b>{_e(a["label"])}</b><div class="mini">ID {_e(a["accountId"])}</div></td>'
         for k in wkeys:
             m = t[k]
-            cls = _roi_cls(m["roi"], d["meta"]["breakevenFlat"])
+            cls = _roi_cls(m["roi"], _be_all(d))
             cells += (f'<td class="mono">{_money(m["cost"])}</td>'
                       f'<td class="mono">{_money(m["amt"])}</td>'
                       f'<td class="mono {cls}"><b>{_n(m["roi"]):.2f}</b></td>'
@@ -542,20 +542,11 @@ def page_overview(d) -> str:
     搜索词报表按「花费」降序取前 2000 行，覆盖约 99.9% 花费。
   </div>
   {_source_note(d)}
-  <div class="warnbox">
-    <b>成本假设</b>：Excel「计算公式」只给了<b>全店一套</b>成本 —— 客单价 ¥{_n(d["meta"]["costModel"]["refPrice"])}、
-    产品成本 ¥{_n(d["meta"]["costModel"]["product"])}、京东扣点 ¥{_n(d["meta"]["costModel"]["platform"])}、
-    包装 ¥{_n(d["meta"]["costModel"]["package"])}、运费 ¥{_n(d["meta"]["costModel"]["shipping"])}、
-    退货率 {_n(d["meta"]["costModel"]["returnRate"]) * 100:.0f}%，算得毛利率 {(1 - 0) and (1 / _n(d["meta"]["breakevenFlat"], 1) * 100):.1f}%、
-    <b>保本 ROI = {_n(d["meta"]["breakevenFlat"]):.2f}</b>。<br>
-    所以本报告的「保本」对所有商品都是同一条 {_n(d["meta"]["breakevenFlat"]):.2f} 线；
-    「毛利/单」= 该商品<b>真实客单价</b> × 全店毛利率；
-    「预估净利」= 商智成交额（缺失时用广告成交额兜底）× 全店毛利率 − 广告花费。<br>
-    <b>如果各商品真实毛利率差异大（生鲜尤其如此），请提供每个 SKU 的供货价/运费，我可以替换成本模型重算 —— 那会让「哪些商品其实在亏」这一结论变得确定。</b>
-  </div>
+  {_cost_block(d)}
   <div class="note">
     <b>毛利率敏感性</b>：保本 ROI = 1 ÷ 毛利率。毛利率 20% → 保本 5.00；25% → 4.00；30% → 3.33；35% → 2.86。
-    当前按 {_n(d["meta"]["breakevenFlat"]):.2f} 判定，若你的实际毛利率更低，下面标「放大」的商品里会有一部分其实只是打平。
+    未接入真实成本的 SKU（下表标 <b>*</b>）仍按全店 {_n(d["meta"]["breakevenFlat"]):.2f} 判定，
+    这部分标「放大」的商品里会有一部分其实只是打平。
   </div>
   <p class="hint">生成时间 {_e(d["meta"]["generatedAt"])} ｜ 页签顺序即为建议的阅读顺序</p>
 </div>
@@ -563,6 +554,44 @@ def page_overview(d) -> str:
 
 
 # ---------------------------------------------------------------- 页面：商品 ROI 交叉表
+def _be_all(d) -> float:
+    """整店一条线：有真实成本时是「按本期成交额加权」的线，否则退回全店 Excel 线。"""
+    m = d.get("meta") or {}
+    return _n(m.get("breakevenBlend")) or _n(m.get("breakevenFlat"), 4.00)
+
+
+def _be_label(d) -> str:
+    m = d.get("meta") or {}
+    return "加权保本线" if _n(m.get("breakevenBlend")) else "全店保本线"
+
+
+def _cost_tip(s) -> str:
+    """保本线旁边那个悬停：这条线是怎么来的，一眼能看到成本明细。"""
+    cp = s.get("costParams") or {}
+    if s.get("costSource") != "erp":
+        return (f"未接入该 SKU 真实成本：保本线按全店 Excel 口径 {_n(s.get('breakeven')):.2f}；"
+                f"贡献/件 = 件单价 × 全店毛利率")
+    tip = (f"ERP 每件：结算价 ¥{_n(cp.get('supply'))}（扣点已含）− 货款 ¥{_n(cp.get('productCost'))}"
+           f" − 运费 ¥{_n(cp.get('shipping'))} − 包材 ¥{_n(cp.get('package'))}"
+           f" − 人工 ¥{_n(cp.get('labor'))} = 贡献 ¥{_n(cp.get('grossPerOrder'))}"
+           f" ÷ 件单价 ¥{_n(cp.get('aov'))} = 毛利率 {_n(cp.get('margin')) * 100:.1f}%"
+           f" → 保本 {_n(s.get('breakeven')):.2f}、放量 {_n(s.get('growLine')):.2f}")
+    if _n(cp.get("unitFactor"), 1.0) != 1.0:
+        tip += f"；单位换算 ×{_n(cp.get('unitFactor'))}（{cp.get('unitFactorSource')}）"
+    if cp.get("unitWarn"):
+        tip += f"；⚠ {cp.get('unitWarn')}"
+    if cp.get("erpName"):
+        tip += f"；ERP 品名 {cp.get('erpName')}"
+    return tip
+
+
+def _supply_cell(s) -> str:
+    cp = s.get("costParams") or {}
+    if s.get("costSource") != "erp":
+        return '<td class="mono" data-v="0">—</td>'
+    return f'<td class="mono" data-v="{_n(cp.get("supply"))}">{_money(cp.get("supply"), 1)}</td>'
+
+
 def _sku_row(i, s, labels) -> str:
     cur = _latest(s)
     wk = _latest_key(s)
@@ -584,12 +613,14 @@ def _sku_row(i, s, labels) -> str:
         f'<td class="mono" data-v="{_n(cur["cost"])}">{_money(cur["cost"])}</td>'
         f'<td class="mono" data-v="{_n(cur["amt"])}">{_money(cur["amt"])}</td>'
         f'<td class="mono {_roi_cls(roi, be)}" data-v="{roi}"><b>{roi:.2f}</b></td>'
-        f'<td class="mono" data-v="{be}">{be:.2f}</td>'
+        f'<td class="mono" data-v="{be}" title="{_e(_cost_tip(s))}">'
+        f'{be:.2f}{"*" if s.get("costSource") != "erp" else ""}</td>'
         f'<td class="mono {"up" if gap >= 0 else "down"}" data-v="{gap}">{gap:+.2f}</td>'
         f'<td class="mono" data-v="{_n(cur["ord"])}">{int(_n(cur["ord"]))}</td>'
         f'<td class="mono" data-v="{_n(cur["cpa"])}">{_num(cur["cpa"], 2)}</td>'
-        f'<td class="mono" data-v="{_n(s["aov"])}">{_money(s["aov"], 1)}</td>'
-        f'<td class="mono" data-v="{_n(s["grossPerOrder"])}">{_num(s["grossPerOrder"], 1)}</td>'
+        f'<td class="mono" data-v="{_n(s.get("unitPrice"))}">{_money(s.get("unitPrice"), 1)}</td>'
+        f'{_supply_cell(s)}'
+        f'<td class="mono" data-v="{_n(s["grossPerOrder"])}" title="{_e(_cost_tip(s))}">{_num(s["grossPerOrder"], 1)}</td>'
         f'<td class="mono" data-v="{_n(cur.get("adShare"))}">{_pct(cur.get("adShare"))}</td>'
         f'<td class="mono" data-v="{_n(cur.get("szAmt"))}">{_money(cur.get("szAmt"))}</td>'
         f'<td class="mono" data-v="{_n(cur.get("naturalAmt"))}">{_money(cur.get("naturalAmt"))}</td>'
@@ -622,10 +653,14 @@ def page_sku(d) -> str:
 <div class="card">
   <h2>商品 ROI 交叉表 <span class="tagline">按 SKU 合并两个账号的广告，商智成交分店展示</span></h2>
   <p class="hint">
-    共 {len(skus)} 个有广告投放的 SKU。近周花费合计 <b>¥{_money(tot_cost)}</b>、广告成交 <b>¥{_money(tot_amt)}</b>
+    共 {len(skus)} 个有广告投放的 SKU，其中 {(d["meta"].get("costCoverage") or {}).get("skuErp", 0)} 个已接入
+    ERP 真实成本（覆盖本期花费 {((d["meta"].get("costCoverage") or {}).get("costShare") or 0):.0f}%）。
+    近周花费合计 <b>¥{_money(tot_cost)}</b>、广告成交 <b>¥{_money(tot_amt)}</b>
     （ROI {_n(tot_amt) / max(tot_cost, 1):.2f}），这些商品商智总成交 <b>¥{_money(tot_sz)}</b>，
     按成本假设估算净利 <b>¥{_money(tot_net)}</b>。
-    「保本」采用 Excel 算出的全店保本线 {_n(d["meta"]["breakevenFlat"]):.2f}；「毛利/单」= 该商品真实客单价 × 全店毛利率。
+    「保本」= <b>该 SKU 自己的保本线</b>（真实成本：结算价−货款−运费−包材−人工 ÷ 件单价）；
+    标 <b>*</b> 的表示 ERP 里没有这个 SKU，仍按全店 Excel 口径线判；悬停保本线可看成本明细。
+    「贡献/件」= 每卖一件真正赚到的钱（未扣广告费）。
   </p>
   <div class="toolbar" id="skuChips">{chips}<span style="width:14px"></span>{achips}
     <span class="mini" style="margin-left:8px">点表头排序 · 鼠标悬停商品名看分店成交</span>
@@ -636,7 +671,7 @@ def page_sku(d) -> str:
       <th class="l noSort">商品</th>
       <th class="l noSort">投放账号</th>
       <th>近周花费</th><th>成交额</th><th>ROI</th><th>保本</th><th>ROI-保本</th>
-      <th>订单</th><th>CPA</th><th>客单价</th><th>毛利/单</th>
+      <th>订单</th><th>CPA</th><th>件单价</th><th>结算价</th><th>贡献/件</th>
       <th>广告占比</th><th>商智总成交</th><th>自然成交</th><th>预估净利</th>
       <th data-num="1">近3周ROI</th><th class="l">档位</th>
     </tr></thead><tbody>{''.join(rows)}</tbody></table>
@@ -869,14 +904,19 @@ def page_action(d) -> str:
     stop_rows = "".join(
         f'<tr><td class="l"><b>{_e(s["name"])}</b></td><td class="mono" data-v="{_n(s["cost"])}">¥{_money(s["cost"])}</td>'
         f'<td class="mono down" data-v="{_n(s["roi"])}">{_n(s["roi"]):.2f}</td>'
-        f'<td class="mono" data-v="{_n(s["breakeven"])}">{_n(s["breakeven"]):.2f}</td>'
+        f'<td class="mono" data-v="{_n(s["breakeven"])}">{_n(s["breakeven"]):.2f}'
+        f'{"*" if s.get("costSource") != "erp" else ""}</td>'
         f'<td class="mono" data-v="{_n(s["netProfit"])}">¥{_money(s["netProfit"])}</td>'
         f'<td class="l">{_e(_sku_advice(next(x for x in d["skus"] if x["skuId"] == s["skuId"])))}</td></tr>'
         for s in stop)
     grow_rows = "".join(
-        f'<tr><td class="l"><b>{_e(s["name"])}</b></td><td class="mono">¥{_money(s["cost"])}</td>'
-        f'<td class="mono up">{_n(s["roi"]):.2f}</td>'
-        f'<td class="mono">¥{_money(_n(s["cost"]) * 0.3)}</td>'
+        f'<tr><td class="l"><b>{_e(s["name"])}</b></td><td class="mono" data-v="{_n(s["cost"])}">¥{_money(s["cost"])}</td>'
+        f'<td class="mono up" data-v="{_n(s["roi"])}">{_n(s["roi"]):.2f}</td>'
+        f'<td class="mono" data-v="{_n(s["breakeven"])}">{_n(s["breakeven"]):.2f}'
+        f'{"*" if s.get("costSource") != "erp" else ""}</td>'
+        f'<td class="mono" data-v="{_n(s.get("growLine"))}">{_n(s.get("growLine")):.2f}</td>'
+        f'<td class="mono" data-v="{_n(s.get("grossPerOrder"))}">{_num(s.get("grossPerOrder"), 1)}</td>'
+        f'<td class="mono" data-v="{_n(s["cost"]) * 0.3}">¥{_money(_n(s["cost"]) * 0.3)}</td>'
         f'<td class="l">{_e(_sku_advice(next(x for x in d["skus"] if x["skuId"] == s["skuId"])))}</td></tr>'
         for s in grow[:15])
     wrong_html = "".join(
@@ -890,7 +930,7 @@ def page_action(d) -> str:
 
     return f"""
 <div class="card">
-  <h2>第一步 · 止血 <span class="tagline">所选区间 ROI 低于保本线 {_n(d["meta"]["breakevenFlat"]):.2f} 的 SKU</span></h2>
+  <h2>第一步 · 止血 <span class="tagline">所选区间 ROI 低于「各自保本线」的 SKU（标 * = 按全店线判）</span></h2>
   <p class="hint">
     合计花费 <b>¥{_money(up["stopCost"])}</b>，占所选区间总花费
     {_pct(_n(up["stopCost"]) / max(_n(up["lastCost"]), 1) * 100)}。逐个处理，不要一刀切关闭。
@@ -902,12 +942,13 @@ def page_action(d) -> str:
 </div>
 
 <div class="card">
-  <h2>第二步 · 加投 <span class="tagline">ROI ≥ 4 的 SKU，是增量池</span></h2>
-  <p class="hint">按 30% 加预算试探，加完盯 3 天 ROI 是否守住。</p>
+  <h2>第二步 · 加投 <span class="tagline">ROI 已到「各自放量线」（保本线 ×{_n(d['meta'].get('growFactor'), 1.25):.2f}）的 SKU，才是增量池</span></h2>
+  <p class="hint">按 30% 加预算试探，加完盯 3 天 ROI 是否守住。保本线只是不亏钱，放量线以上加投才划算。</p>
   <div class="tblwrap short"><table><thead><tr>
     <th class="l noSort">商品</th><th data-num="1">近周花费</th><th data-num="1">ROI</th>
+    <th data-num="1">保本ROI</th><th data-num="1">放量线</th><th data-num="1">贡献/件</th>
     <th data-num="1">建议加投</th><th class="l noSort">动作</th>
-  </tr></thead><tbody>{grow_rows or '<tr><td colspan="5" class="l">暂无明显高效商品</td></tr>'}</tbody></table></div>
+  </tr></thead><tbody>{grow_rows or '<tr><td colspan="8" class="l">暂无明显高效商品</td></tr>'}</tbody></table></div>
 </div>
 
 <div class="card">
@@ -979,6 +1020,52 @@ def _source_note(d) -> str:
         return ""
     return ('<div class="warnbox"><b>口径降级</b>：' + "；".join(_e(x) for x in bad) +
             '。缺「概览」数据时会退化为智能投放口径（不含全站智能推广），账号总额会偏小。</div>')
+
+
+def _cost_block(d) -> str:
+    """成本来源面板：每个 SKU 的保本线到底是谁算的、覆盖了多少钱、哪些数还不可信。"""
+    m = d.get("meta") or {}
+    cov = m.get("costCoverage") or {}
+    src = m.get("costSource") or {}
+    flat, blend = _n(m.get("breakevenFlat"), 4.00), _n(m.get("breakevenBlend"))
+    kind = src.get("kind") or "全店 Excel 口径"
+    head = (f'<b>成本来源</b>：{_e(kind)}'
+            + (f'（{_e(src.get("detail") or "")}）' if src.get("detail") else '')
+            + (f'｜ERP 更新日 {_e(m.get("costUpdatedAt") or "")}' if m.get("costUpdatedAt") else '')
+            + '</>')
+    if not cov.get("skuErp"):
+        cm = m.get("costModel") or {}
+        return ('<div class="warnbox">' + head +
+                f'还没接入每个 SKU 的真实供货价，全店只用 Excel「计算公式」里那<b>一套</b>假设 —— '
+                f'客单价 ¥{_n(cm.get("refPrice"))}、产品成本 ¥{_n(cm.get("product"))}、'
+                f'包装 ¥{_n(cm.get("package"))}、运费 ¥{_n(cm.get("shipping"))}，'
+                f'得出<b>保本 ROI = {flat:.2f}</b>，所有商品共用这一条线。<br>'
+                '生鲜各商品毛利率差好几倍，共用一条线会把「打平」误判成「放大」：'
+                '<b>接入各 SKU 真实成本后结论会变</b>（配 JD_COSTS_URL / JD_COSTS_TOKEN 即可自动接入）。</div>')
+    parts = [head,
+             f'按<b>每个 SKU 自己的保本线</b>判定：本期 {cov.get("skuErp")}/{cov.get("skuTotal")} 个在投 SKU '
+             f'命中 ERP 成本，覆盖花费 ¥{_money(cov.get("costErp"))}／¥{_money(cov.get("costTotal"))}'
+             f'（<b>{_n(cov.get("costShare")):.0f}%</b>）；'
+             f'其余 {cov.get("skuStore")} 个仍按全店 {flat:.2f} 线并标 <b>*</b>。']
+    if blend:
+        parts.append(f'整店参考线：全店口径 {flat:.2f} → <b>按真实成本加权 {blend:.2f}</b>'
+                     f'（加权毛利率 {(1 / blend * 100):.1f}%），放量线 = 保本线 × {_n(m.get("growFactor"), 1.25):.2f}。')
+    neg = cov.get("negativeMargin") or []
+    if neg:
+        parts.append(f'<b class="down">结算价低于单件成本（卖一件亏一件，投广告只会放大亏损）</b>：' +
+                     "；".join(f'{_e(x.get("name") or x.get("skuId"))}（贡献 ¥{_num(x.get("grossPerOrder"), 2)}/件，'
+                               f'本期花费 ¥{_money(x.get("cost"))}）' for x in neg[:6]) + '。')
+    warn = cov.get("unitWarn") or []
+    if warn:
+        parts.append('<b>成本口径待确认</b>（这些 SKU 的 ERP 数字与商智对不上，按 1:1 计算，'
+                     '结论请抽查后再落地）：' +
+                     "；".join(f'{_e(x.get("name") or x.get("skuId"))} — { _e(x.get("warn"))}' for x in warn[:6]) + '。')
+    miss = cov.get("missing") or []
+    if miss:
+        parts.append(f'<b>未接入真实成本</b>（¥{_money(cov.get("missingCost"))} 花费，按全店线判）：' +
+                     "、".join(f'{_e((x.get("name") or "")[:14])} ¥{_money(x.get("cost"))}' for x in miss[:8]) +
+                     ('…' if len(miss) > 8 else '') + '。')
+    return '<div class="warnbox">' + '<br>'.join(parts) + '</div>'
 
 
 def _coverage_notice(d) -> str:
@@ -1053,7 +1140,8 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
 <div class="wrap">{_coverage_notice(d)}{body}
   <div class="foot">
     数据来源：京准通（概览 / 智能投放 / 快车关键词 / 操作日志）+ 商智（商品明细 / 流量概况）。<br>
-    「保本ROI」「预估净利」为按 Excel 成本结构推算，非真实财务数据；其余指标均为接口真实返回值。<br>
+    「保本ROI」「贡献/件」「预估净利」：已接入的 SKU 用 ERP 每件结算价与货款/运费/包材/人工逐件算，
+    未接入（标 <b>*</b>）仍按全店 Excel 成本结构推算 —— 均为投放决策参考，不是财务对账数据。<br>
     本页为按天入库后的<b>区间聚合</b>结果，区间由上方选择器决定。
   </div>
 </div>
