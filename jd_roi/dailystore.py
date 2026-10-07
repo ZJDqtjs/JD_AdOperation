@@ -19,6 +19,7 @@ import datetime as dt
 import gzip
 import json
 import threading
+import time
 from pathlib import Path
 
 from . import settings
@@ -114,9 +115,16 @@ def has_day(account: str, day: str, kind: str) -> bool:
 
 
 def days_for(account: str, kind: str) -> list:
+    """列出某账号某数据源已入库的日期。
+
+    带 TTL 缓存：抓取进程和 Web 进程是**两个进程**，各有一份缓存。
+    如果没有 TTL，Web 进程启动时扫一次就永远不再更新，
+    新抓的天在控制台/覆盖度里永远不出现（报告本身走文件系统所以没问题）。
+    """
+    now = time.time()
     with _lock:
-        cache = _days_cache.get(account)
-    if cache is None:
+        ent = _days_cache.get(account)
+    if ent is None or (now - ent[0]) > settings.DAYS_CACHE_TTL:
         root = settings.DAILY_DIR / account
         cache = {}   # kind -> [day, ...]
         if root.exists():
@@ -128,8 +136,9 @@ def days_for(account: str, kind: str) -> list:
         for v in cache.values():
             v.sort()
         with _lock:
-            _days_cache[account] = cache
-    return list(cache.get(kind, []))
+            _days_cache[account] = (time.time(), cache)
+        ent = _days_cache[account]
+    return list(ent[1].get(kind, []))
 
 
 def invalidate_cache(account: str | None = None) -> None:

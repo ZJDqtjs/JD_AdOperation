@@ -462,7 +462,7 @@ def page_overview(d) -> str:
     dr, drcls = _delta(c["roi"], comb[pre]["roi"])
 
     kpis = "".join([
-        _kpi("两账号广告花费（所选区间 " +
+        _kpi(_acct_scope(d) + "广告花费（所选区间 " +
              f'{_e((d["meta"].get("range") or {}).get("start",""))[5:]}~{_e((d["meta"].get("range") or {}).get("end",""))[5:]}）',
              "¥" + _money(c["cost"]),
              f'<span class="{dccls}">{dc}</span> vs 前一期 ¥{_money(comb[pre]["cost"])}'),
@@ -508,7 +508,7 @@ def page_overview(d) -> str:
 
     return f"""
 <div class="card">
-  <h2>核心结论 <span class="tagline">两账号合并口径</span></h2>
+  <h2>核心结论 <span class="tagline">{_e(_acct_scope(d))}合并口径</span></h2>
   <ul class="sum">{''.join(f"<li>{_e(s)}</li>" for s in adv["summary"])}</ul>
 </div>
 
@@ -957,6 +957,15 @@ UI_CSS = """
 .covbox{background:#fffbeb;border-left:3px solid #d97706;padding:10px 14px;border-radius:0 8px 8px 0;
   font-size:12.5px;color:#92400e;margin-bottom:14px}
 """
+
+
+def _acct_scope(d) -> str:
+    labels = [a["label"] for a in d.get("accounts", [])]
+    if len(labels) == 2:
+        return "两账号"
+    if len(labels) == 1:
+        return labels[0]
+    return "、".join(labels)
 
 
 def _source_note(d) -> str:

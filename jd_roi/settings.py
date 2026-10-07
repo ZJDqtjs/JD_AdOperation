@@ -43,6 +43,8 @@ ACCOUNTS_FILE = Path(_env("JD_ACCOUNTS_FILE", str(CONFIG_DIR / "accounts.json"))
 COSTS_FILE = Path(_env("JD_COSTS_FILE", str(CONFIG_DIR / "costs.json")) or ".")
 # 进程临时目录（Playwright 的 artifacts 也落这里）
 TMP_DIR = Path(_env("JD_TMP_DIR", str(DATA_DIR / "tmp")) or ".")
+# 「已入库日期」缓存的存活秒数（Web 与抓取是两个进程，靠 TTL 感知对方写入）
+DAYS_CACHE_TTL = float(_env("JD_DAYS_CACHE_TTL", "30") or 30)
 
 # 历史 Profile 目录名（老版本用的是 auth/browser_profile、auth/browser_profile_b）
 _LEGACY_PROFILE = {"main": "browser_profile", "b": "browser_profile_b"}

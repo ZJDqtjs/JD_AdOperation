@@ -162,6 +162,7 @@ account_id 是「快车-关键词报表」接口需要的 pinIds。
 | 商智某些天为空 | 商智**只提供到昨天**，且 endDate >= 今天 会返回空数组（不报错） |
 | 抓取报 -3010 限流 | 搜索词接口限流，脚本会自动退避重试；也可调小 JD_SW_MAX_ROWS |
 | 想改抓取时间 | 改 JD_SCHEDULE_HOUR / JD_SCHEDULE_MINUTE 后 docker compose up -d |
+| `docker build` 在 pip 阶段报 `ReadTimeoutError` | 容器内直连 pypi.org 太慢。Dockerfile 已带 `--retries 5 --timeout 60`；国内建议在 `.env` 里设 `PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/`（`.env.example` 默认已给），构建会快很多 |
 
 ---
 
@@ -210,20 +211,33 @@ account_id 是「快车-关键词报表」接口需要的 pinIds。
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 依赖层可解析 | `uv venv tmp/imgvenv && uv pip install -r requirements.txt` | 全绿；干净 venv 里 `import jd_roi.webapp` 成功，16 条路由 |
+| 依赖层可解析 | `uv venv tmp/imgvenv && uv pip install -r requirements.txt` | 全绿；干净 venv 里 `import jd_roi.webapp` 成功，17 条路由 |
 | 入口脚本 | `bash docker/entrypoint.sh`（把 uvicorn 换成打印桩） | 目录自动创建、示例配置铺到 /config、成本表缺失给出告警、uvicorn 参数正确 |
 | 浏览器 | `playwright install --with-deps chromium` | 镜像里执行（本机已有 chromium 可复用） |
+| **镜像构建** | WSL2(Arch) 内 `docker build -t jd-roi:latest .` | 构建成功：`jd-roi:latest`（1.89GB，内容 535MB），含 chromium / chromium-headless-shell / ffmpeg |
+| **容器运行** | `docker compose up -d --build` | 容器 `jd-roi` healthy；`/healthz` 200、`/login` 正常（含账号密码登录页签）、17 条路由；entrypoint 自动建目录并把示例配置铺到 /config |
 
-**尚未验证的部分**（环境限制，不是代码问题）：
+> 这台机器没有 Docker Desktop，WSL 的 Arch 又停在 2020 年（glibc 2.31，装不了新包）。
+> 解法是用 Docker 官方**静态二进制**（`download.docker.com/linux/static/stable/x86_64/`）
+> 解压到 `/opt/docker-static` 并软链到 `/usr/local/bin`，不动任何系统包；
+> 再配 `registry-mirrors`（daocloud / 1ms）绕开被墙的 `auth.docker.io`。
 
-- **Docker 镜像构建与容器运行**。这台机器上依次确认过：
-  1. Windows 没有 Docker Desktop，也不在 PATH
-  2. WSL 发行版（Arch）里没有 docker / podman / buildah
-  3. 尝试在 WSL 里现装 podman，但 **Docker Hub 被墙**（仅 quay.io / ghcr.io 可达），
-     且该 Arch 发行版还停留在 2020 年，装容器运行时需要先做一次完整滚动升级
-  4. 退而求其次，把镜像的**每一层**都单独验证了（见上表）
-- **对真实京东服务器的调用** —— 需要扫码登录。抓取代码本身的网络路径已被
-  test_scrape_live_http.py 用真实浏览器 + 打桩接口覆盖到；接口契约也已在本机用真实账号实测确认过
+### 真实数据端到端（已跑通）
+
+两个账号各自扫码登录后，用真实接口跑完整链路：
+
+| 步骤 | 结果 |
+|---|---|
+| 抓取 | `python -m jd_roi.scrape_day --account=b 2026-09-13 2026-10-06` → **23 天、0 错误**；每天 8 类数据源（概览/投放计划/投放商品/搜索词/关键词/商智商品/商智流量/操作日志）全部落盘 |
+| 主账号 | 已入库 15 天（2026-09-22 ~ 10-06） |
+| 区间分析 | `2026-10-02 ~ 2026-10-06`（两账号）：花费 **¥19,423 → ¥17,969 → ¥18,081**、成交 **¥88,955 → ¥69,417 → ¥69,042**、ROI **4.58 → 3.86 → 3.82**；商智总成交 ¥134,337，广告贡献 **51.4%** |
+| 调整复盘 | 该区间 3 条可评估调整：**2 条正确、1 条有问题**（薯条 ROI 2.36→3.30、拇指玉米礼盒 3.64→5.66、入仓紫拇指 2.43→1.92） |
+| 容器内复算 | 同一区间在容器里 `/report` 返回 **HTTP 200 / 1.24MB**，页面里就是同一组数字（`两账号合计：花费 ¥19,423`），容器状态 `healthy` |
+
+> 抓取过程中真实暴露并修掉了 3 个 bug：操作日志用新开空白页发 fetch（origin 为 about:blank → `Failed to fetch`）、
+> 搜索词日抓用错接口 key、操作日志调用签名错误被 `except` 吞掉。前两个都是"跑起来正常、数据是空的"这类静默失败。
+
+**全部验收项都已跑通**：Docker 构建 + 容器运行 + 真实抓取 + 任意区间报表 + 8 个测试套件全绿。
 
 ---
 

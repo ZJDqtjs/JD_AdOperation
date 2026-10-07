@@ -902,6 +902,16 @@ def _coverage_block(active, wins):
 
 
 # ---------------- 决策建议 ----------------
+def _acct_label(accts) -> str:
+    """按实际参与分析的账号生成措辞，避免只选一个账号时还写「两账号」。"""
+    labels = [a.get("label") or a.get("key") for a in accts]
+    if len(labels) == 2:
+        return "两账号"
+    if len(labels) == 1:
+        return labels[0]
+    return "、".join(labels)
+
+
 def _op_span(ops) -> str:
     days = sorted({o["day"] for o in ops if o["day"]})
     return f"{days[0]} ~ {days[-1]}" if days else "窗口内"
@@ -944,10 +954,10 @@ def build_advice(accts, totals, skus, plans, ops, words, adj):
     evaluable = [o for o in adj if o["verdict"] in _ev]
     unevaluable = len(adj) - len(evaluable)
     summary = [
-        (f"两账号合计：花费 ¥{c0['cost']:,.0f} → ¥{c1['cost']:,.0f} → ¥{c2['cost']:,.0f}；"
+        (f"{_acct_label(accts)}合计：花费 ¥{c0['cost']:,.0f} → ¥{c1['cost']:,.0f} → ¥{c2['cost']:,.0f}；"
          f"成交 ¥{c0['amt']:,.0f} → ¥{c1['amt']:,.0f} → ¥{c2['amt']:,.0f}；"
          f"ROI {c0['roi']} → {c1['roi']} → {c2['roi']}"),
-        (f"所选区间两账号商智总成交 ¥{(c2['szAmt']):,.0f}，广告贡献 "
+        (f"所选区间{_acct_label(accts)}商智总成交 ¥{(c2['szAmt']):,.0f}，广告贡献 "
          + (f"{c2['adShare']}%" if c2.get("adShare") is not None else "缺失（该区间无商智数据）")
          + "（广告成交/店铺总成交）"),
         (f"{_op_span(ops)} 共 {len(ops)} 条快车操作日志：人工操作 {len(manual)} 条、"

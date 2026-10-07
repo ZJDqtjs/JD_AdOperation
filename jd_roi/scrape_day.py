@@ -277,6 +277,14 @@ SRC_UV_REF = "jdr_sch_traffic_brow_sku_cnt_jd_unified_attribution_sz"
 def fetch_oplog_range(page, acct_key: str, start: str, end: str) -> dict:
     # 注意：scrape_oplog._post(page, url, payload) 只接 3 个参数
     from .scrape_oplog import LEVELS, URL_QUERY, _post as _op_post
+    # 必须先在这个页面里打开操作日志页：新开的空白页 origin 是 about:blank，
+    # 在它上面 fetch jzt-api 会直接 "TypeError: Failed to fetch"（没有 origin/referer/cookie 上下文）
+    try:
+        page.goto("https://jzt.jd.com/logging/#/business?businessType=-16",
+                  wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(6000)
+    except Exception:  # noqa: BLE001
+        pass
     win = dt.date.fromisoformat(start)
     end_d = dt.date.fromisoformat(end)
     rows, seen, errors = [], set(), []
