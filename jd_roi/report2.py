@@ -105,6 +105,7 @@ ul.sum li{margin:5px 0}
 .evt .t{font-family:ui-monospace,monospace;font-size:12px;color:var(--sub);flex:none}
 .evt .a{font-weight:700}
 .mini{font-size:12px;color:var(--sub)}
+.qtysub{display:block;font-size:11px;color:#94a3b8;font-weight:400;line-height:1.2}
 .pill{display:inline-block;background:#f1f5f9;border-radius:6px;padding:1px 7px;font-size:11.5px;color:#475569;margin-right:4px}
 .foot{color:var(--sub);font-size:12px;text-align:center;margin-top:26px;line-height:1.9}
 a.lk{color:var(--blue);text-decoration:none}
@@ -570,7 +571,7 @@ def _cost_tip(s) -> str:
     cp = s.get("costParams") or {}
     if s.get("costSource") != "erp":
         return (f"未接入该 SKU 真实成本：保本线按全店 Excel 口径 {_n(s.get('breakeven')):.2f}；"
-                f"贡献/件 = 前台件单价 × 全店毛利率")
+                f"毛利/件 = 前台件单价 × 全店毛利率")
     tip = (f"每件（ERP 真实口径）：到手结算价 ¥{_n(cp.get('supply'))}"
            f" ＝ 前台件单价 ¥{_n(cp.get('aov'))} × 到手率 {_n(cp.get('settleRate')) * 100:.0f}%"
            f"（扣点与京东差价已扣）"
@@ -613,6 +614,14 @@ def _roi_tip(s, roi, be) -> str:
             f"该口径保本 {cp.get('breakevenSettle')}（两对不能混用）")
 
 
+def _natural_qty(m) -> float:
+    """自然成交件数 = 商智成交件数 − 广告订单数（近似：广告一单一弊，仅用于量级参考）。"""
+    q = _n(m.get("szQty"))
+    if q <= 0:
+        return 0.0
+    return max(q - _n(m.get("ord")), 0.0)
+
+
 def _sku_row(i, s, labels) -> str:
     cur = _latest(s)
     wk = _latest_key(s)
@@ -633,11 +642,9 @@ def _sku_row(i, s, labels) -> str:
         f'<td class="l">{pills or "—"}</td>'
         f'<td class="mono" data-v="{_n(cur["cost"])}">{_money(cur["cost"])}</td>'
         f'<td class="mono" data-v="{_n(cur["amt"])}">{_money(cur["amt"])}</td>'
-        f'<td class="mono {_roi_cls(roi, be)}" data-v="{roi}" title="{_e(_roi_tip(s, roi, be))}">'
-        f'<b>{roi:.2f}</b></td>'
+        f'<td class="mono {_roi_cls(roi, be)}" data-v="{roi}" title="{_e(_roi_tip(s, roi, be))}">{roi:.2f}</td>'
         f'<td class="mono" data-v="{be}" title="{_e(_cost_tip(s))}">'
         f'{be:.2f}{"*" if s.get("costSource") != "erp" else ""}</td>'
-        f'<td class="mono {"up" if gap >= 0 else "down"}" data-v="{gap}">{gap:+.2f}</td>'
         f'<td class="mono" data-v="{_n(cur["ord"])}">{int(_n(cur["ord"]))}</td>'
         f'<td class="mono" data-v="{_n(cur["cpa"])}">{_num(cur["cpa"], 2)}</td>'
         f'<td class="mono" data-v="{_n(s.get("unitPrice"))}" '
@@ -646,8 +653,12 @@ def _sku_row(i, s, labels) -> str:
         f'{_supply_cell(s)}'
         f'<td class="mono" data-v="{_n(s["grossPerOrder"])}" title="{_e(_cost_tip(s))}">{_num(s["grossPerOrder"], 1)}</td>'
         f'<td class="mono" data-v="{_n(cur.get("adShare"))}">{_pct(cur.get("adShare"))}</td>'
-        f'<td class="mono" data-v="{_n(cur.get("szAmt"))}">{_money(cur.get("szAmt"))}</td>'
-        f'<td class="mono" data-v="{_n(cur.get("naturalAmt"))}">{_money(cur.get("naturalAmt"))}</td>'
+        f'<td class="mono" data-v="{_n(cur.get("szAmt"))}">{_money(cur.get("szAmt"))}'
+        f'<span class="qtysub"> {_num(_n(cur.get("szQty")), 0)}件</span></td>'
+        f'<td class="mono" data-v="{_n(cur.get("naturalAmt"))}" '
+        f'title="自然成交＝商智总成交 − 广告成交（金额口径）；件数为商智件数 − 广告订单数（近似）">'
+        f'{_money(cur.get("naturalAmt"))}'
+        f'<span class="qtysub"> {_num(_natural_qty(cur), 0)}件</span></td>'
         f'<td class="mono {"up" if _n(s["est"][wk]["netProfit"]) > 0 else "down"}" '
         f'data-v="{_n(s["est"][wk]["netProfit"])}">{_money(s["est"][wk]["netProfit"])}</td>'
         f'<td data-v="{roi}">{spark}</td>'
@@ -682,25 +693,29 @@ def page_sku(d) -> str:
     近周花费合计 <b>¥{_money(tot_cost)}</b>、广告成交 <b>¥{_money(tot_amt)}</b>
     （ROI {_n(tot_amt) / max(tot_cost, 1):.2f}），这些商品商智总成交 <b>¥{_money(tot_sz)}</b>，
     按成本假设估算净利 <b>¥{_money(tot_net)}</b>。
-    「保本」= <b>该 SKU 自己的保本线</b>，算法是
-    （到手结算价 − 货款 − 运费 − 包材 − 人工）÷ <b>前台件单价</b>；
-    注意 <b>前台件单价是消费者实付，不等于我们到手的钱</b>——到手结算价通常只有它的
-    7~9 成（差的那部分是京东扣点与自营差价），所以毛利率看着比 ERP 里那个数低，
-    但只有它是和京准通 ROI 同一个口径（平台 ROI 的分子就是前台成交额）。
-    标 <b>*</b> 的表示 ERP 里没有这个 SKU，仍按全店 Excel 口径线判；悬停保本线可看成本明细与两种口径对照。
-    「贡献/件」= 每卖一件真正赚到的钱（未扣广告费）。
+    「ROI」= 京准通平台报的广告 ROI（广告成交额 ÷ 花费，分子是消费者实付）；「保本ROI」= 该 SKU
+    自己的保本线，算法是（到手结算价 − 货款 − 运费 − 包材 − 人工）÷ <b>前台件单价</b>，
+    ROI 高于它才值得继续投（两者同一前台口径，可直接比大小）。标 <b>*</b> 表示 ERP 无此 SKU，按全店口径线判。
+    「商智总成交」下方为该商品<b>全店全渠道成交件数</b>，「自然成交」下方为
+    <b>自然成交件数</b>（商智件数 − 广告订单数，近似）。
+    「毛利/件」= 每卖一件真正赚到的钱（未扣广告费），算法是
+    到手结算价 − 货款 − 运费 − 包材 − 人工，其中到手结算价 ≈ 前台件单价 × 到手率（7~9 成）。
   </p>
   <div class="toolbar" id="skuChips">{chips}<span style="width:14px"></span>{achips}
-    <span class="mini" style="margin-left:8px">点表头排序 · 悬停商品名看分店成交 · 悬停 ROI / 保本看「前台口径 vs 到手口径」换算</span>
+    <span class="mini" style="margin-left:8px">点表头排序 · 悬停商品名看分店成交 · 悬停 ROI / 到手结算价看「前台口径 vs 到手口径」换算</span>
   </div>
   <div class="tblwrap">
     <table id="skuTable"><thead><tr>
       <th class="noSort">#</th>
       <th class="l noSort">商品</th>
       <th class="l noSort">投放账号</th>
-      <th>近周花费</th><th>成交额</th><th>ROI</th><th>保本</th><th>ROI-保本</th>
-      <th>订单</th><th>CPA</th><th>前台件单价</th><th>到手结算价(到手率)</th><th>贡献/件</th>
-      <th>广告占比</th><th>商智总成交</th><th>自然成交</th><th>预估净利</th>
+      <th>近周花费</th><th>成交额</th><th title="京准通平台报的广告ROI＝广告成交额÷花费">ROI</th>
+      <th title="该 SKU 自己的保本 ROI 线，ROI 高于它才值得继续投">保本ROI</th>
+      <th title="广告带来的成交订单数（京准通，点击后15天归因）">订单</th><th>CPA</th>
+      <th title="商智成交额 ÷ 商智成交件数，消费者实付">前台件单价</th>
+      <th>到手结算价(到手率)</th><th title="每卖一件真正赚到的钱（未扣广告费）">毛利/件</th>
+      <th>广告占比</th><th title="商智全店全渠道成交额，下方为成交件数">商智总成交</th>
+      <th title="商智总成交 − 广告成交；下方为自然成交件数（近似）">自然成交</th><th>预估净利</th>
       <th data-num="1">近3周ROI</th><th class="l">档位</th>
     </tr></thead><tbody>{''.join(rows)}</tbody></table>
   </div>
@@ -974,7 +989,7 @@ def page_action(d) -> str:
   <p class="hint">按 30% 加预算试探，加完盯 3 天 ROI 是否守住。保本线只是不亏钱，放量线以上加投才划算。</p>
   <div class="tblwrap short"><table><thead><tr>
     <th class="l noSort">商品</th><th data-num="1">近周花费</th><th data-num="1">ROI</th>
-    <th data-num="1">保本ROI</th><th data-num="1">放量线</th><th data-num="1">贡献/件</th>
+    <th data-num="1">保本ROI</th><th data-num="1">放量线</th><th data-num="1">毛利/件</th>
     <th data-num="1">建议加投</th><th class="l noSort">动作</th>
   </tr></thead><tbody>{grow_rows or '<tr><td colspan="8" class="l">暂无明显高效商品</td></tr>'}</tbody></table></div>
 </div>
@@ -1180,7 +1195,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
 <div class="wrap">{_coverage_notice(d)}{body}
   <div class="foot">
     数据来源：京准通（概览 / 智能投放 / 快车关键词 / 操作日志）+ 商智（商品明细 / 流量概况）。<br>
-    「保本ROI」「贡献/件」「预估净利」：已接入的 SKU 用 ERP 每件<b>到手结算价</b>与货款/运费/包材/人工逐件算，
+    「保本ROI」「毛利/件」「预估净利」：已接入的 SKU 用 ERP 每件<b>到手结算价</b>与货款/运费/包材/人工逐件算，
     分母用商智<b>前台件单价</b>（消费者实付，与京准通 ROI 同口径）；
     未接入（标 <b>*</b>）仍按全店 Excel 成本结构推算 —— 均为投放决策参考，不是财务对账数据。<br>
     本页为按天入库后的<b>区间聚合</b>结果，区间由上方选择器决定。

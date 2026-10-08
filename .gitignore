@@ -69,3 +69,6 @@ env/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ---- agent 本地记忆（含真实 SKU / 经营数字，不入库）----
+.workbuddy/
