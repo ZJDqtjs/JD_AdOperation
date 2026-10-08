@@ -69,6 +69,7 @@ th{background:#f9fafb;font-weight:700;color:#374151;position:sticky;top:0;z-inde
   cursor:pointer;white-space:nowrap;font-size:12.5px}
 th.noSort{cursor:default}
 th:hover{background:#f3f4f6}
+.sortmark{font-size:10px;color:#94a3b8;margin-left:2px}
 td.l,th.l{text-align:left}
 td.mono,th.mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas,monospace}
 tbody tr:hover{background:#f8fafc}
@@ -125,6 +126,10 @@ function sortTable(th){
   var tb=th.closest('table');
   var idx=Array.prototype.indexOf.call(th.parentNode.children,th);
   var asc=!(th.dataset.asc==='1'); th.dataset.asc=asc?'1':'0';
+  // 清掉同表其它表头的排序标记，只保留当前列
+  Array.prototype.forEach.call(th.parentNode.children,function(h){
+    if(h!==th){h.dataset.asc='';var m=h.querySelector('.sortmark');if(m)m.remove();}
+  });
   var rows=Array.prototype.slice.call(tb.tBodies[0].rows);
   var num=th.dataset.num==='1';
   rows.sort(function(a,b){
@@ -135,6 +140,14 @@ function sortTable(th){
     return asc?String(x).localeCompare(String(y),'zh'):String(y).localeCompare(String(x),'zh');
   });
   rows.forEach(function(r){tb.tBodies[0].appendChild(r);});
+  var mk=th.querySelector('.sortmark')||th.appendChild(document.createElement('span'));
+  mk.className='sortmark'; mk.textContent=asc?' ▲':' ▼';
+}
+function initSort(){
+  document.querySelectorAll('table thead th').forEach(function(th){
+    if(th.classList.contains('noSort'))return;
+    th.addEventListener('click',function(){sortTable(th);});
+  });
 }
 function applyTier(btn){
   var val=btn.dataset.f; var card=btn.closest('.card');
@@ -162,6 +175,7 @@ function toggleWords(btn){
 }
 function initCharts(){
   window.__CH=window.__CH||{};
+  initSort();
   if(typeof echarts==='undefined'){
     document.querySelectorAll('.chart').forEach(function(d){
       d.innerHTML='<div style="padding:20px;color:#6b7280">ECharts 未内联</div>';});
@@ -708,14 +722,19 @@ def page_sku(d) -> str:
     <table id="skuTable"><thead><tr>
       <th class="noSort">#</th>
       <th class="l noSort">商品</th>
-      <th class="l noSort">投放账号</th>
-      <th>近周花费</th><th>成交额</th><th title="京准通平台报的广告ROI＝广告成交额÷花费">ROI</th>
-      <th title="该 SKU 自己的保本 ROI 线，ROI 高于它才值得继续投">保本ROI</th>
-      <th title="广告带来的成交订单数（京准通，点击后15天归因）">订单</th><th>CPA</th>
-      <th title="商智成交额 ÷ 商智成交件数，消费者实付">前台件单价</th>
-      <th>到手结算价(到手率)</th><th title="每卖一件真正赚到的钱（未扣广告费）">毛利/件</th>
-      <th>广告占比</th><th title="商智全店全渠道成交额，下方为成交件数">商智总成交</th>
-      <th title="商智总成交 − 广告成交；下方为自然成交件数（近似）">自然成交</th><th>预估净利</th>
+      <th class="l">投放账号</th>
+      <th data-num="1">近周花费</th><th data-num="1">成交额</th>
+      <th data-num="1" title="京准通平台报的广告ROI＝广告成交额÷花费">ROI</th>
+      <th data-num="1" title="该 SKU 自己的保本 ROI 线，ROI 高于它才值得继续投">保本ROI</th>
+      <th data-num="1" title="广告带来的成交订单数（京准通，点击后15天归因）">促成订单</th>
+      <th data-num="1">CPA</th>
+      <th data-num="1" title="商智成交额 ÷ 商智成交件数，消费者实付">前台件单价</th>
+      <th data-num="1">到手结算价(到手率)</th>
+      <th data-num="1" title="每卖一件真正赚到的钱（未扣广告费）">毛利/件</th>
+      <th data-num="1">广告占比</th>
+      <th data-num="1" title="商智全店全渠道成交额，下方为成交件数">商智总成交</th>
+      <th data-num="1" title="商智总成交 − 广告成交；下方为自然成交件数（近似）">自然成交</th>
+      <th data-num="1">预估净利</th>
       <th data-num="1">近3周ROI</th><th class="l">档位</th>
     </tr></thead><tbody>{''.join(rows)}</tbody></table>
   </div>

@@ -314,8 +314,13 @@ def dashboard(request: Request):
     <div class="lbl">当前任务</div><div class="val" style="font-size:16px">{task_html}</div>
     <div class="hint">{task_hint}{busy}</div>
     <div class="hint" style="color:#2563eb">点击查看任务中心 →</div></div>
-  <div class="kpi"><div class="lbl">登录状态</div><div class="val" style="font-size:16px">{login_html}</div>
-    <div class="hint"><a href="/login">扫码 / 账号密码登录 →</a></div></div>
+  <div class="kpi"><div class="lbl">登录状态</div>
+    <div class="val" style="font-size:16px" id="loginVal"><span class="badge b-idle">未检查</span></div>
+    <div class="hint" id="loginHint">点击「检查登录」确认落盘登录态是否有效</div>
+    <div class="hint" style="margin-top:6px">
+      <button class="btn sec mini" onclick="checkLogin()">检查登录</button>
+      <a href="/login" style="margin-left:6px">扫码 / 账号密码登录 →</a>
+    </div></div>
   <div class="kpi"><div class="lbl">抓取回刷窗口</div><div class="val" style="font-size:16px">最近 {settings.REFRESH_DAYS} 天</div>
     <div class="hint">每晚重刷以修正归因延迟</div></div>
 </div>
@@ -388,6 +393,44 @@ def dashboard(request: Request):
   </div>
 </div>
 <script>
+function loginBadge(st){{
+  if(st==='logged_in') return ['<span class="badge b-ok">已登录</span>','ok'];
+  if(st==='logged_out') return ['<span class="badge b-bad">未登录</span>','bad'];
+  if(st==='checking') return ['<span class="badge b-warn">检查中…</span>','warn'];
+  if(st==='error') return ['<span class="badge b-bad">检查失败</span>','bad'];
+  return ['<span class="badge b-idle">未检查</span>','idle'];
+}}
+function renderLogin(j){{
+  var val=document.getElementById('loginVal'), hint=document.getElementById('loginHint');
+  if(!val) return;
+  var accs=j.accounts||[];
+  var parts=accs.map(function(a){{
+    var b=loginBadge(a.state)[0];
+    return (accs.length>1 ? '<span class="mini" style="color:#64748b">'+(a.label||a.key)+' </span>' : '')+b;
+  }});
+  var overall='idle';
+  if(accs.some(function(a){{return a.state==='checking';}})) overall='checking';
+  else if(accs.length && accs.every(function(a){{return a.state==='logged_in';}})) overall='logged_in';
+  else if(accs.some(function(a){{return a.state==='logged_out'||a.state==='error';}})) overall='logged_out';
+  if(!accs.length){{ val.innerHTML=loginBadge(j.checkState==='checking'?'checking':'idle')[0]; }}
+  else {{ val.innerHTML=parts.join('　'); }}
+  hint.textContent = j.message || (j.checkState==='checking' ? '正在检查登录态…' : '点击「检查登录」确认落盘登录态是否有效');
+}}
+function loadLogin(){{
+  fetch('/api/login/accounts').then(r=>r.json()).then(function(j){{
+    renderLogin(j);
+    if(j.checkState==='checking') setTimeout(loadLogin, 2500);
+  }}).catch(function(e){{}});
+}}
+function checkLogin(){{
+  var hint=document.getElementById('loginHint');
+  if(hint) hint.textContent='正在检查登录态…（需打开浏览器，约 10~30 秒）';
+  fetch('/api/login/check', {{method:'POST'}}).then(r=>r.json()).then(function(j){{
+    if(!j.ok && hint) hint.textContent = j.error||'检查未能开始';
+    setTimeout(loadLogin, 1500);
+  }}).catch(function(e){{ if(hint) hint.textContent='请求失败 '+e; }});
+}}
+loadLogin();
 function doRun(force, s, e){{
   var qs = new URLSearchParams();
   qs.set('start', s || document.getElementById('runStart').value);
@@ -756,6 +799,13 @@ class LoginSession:
         self.qr_at = 0.0
         self.message = ""
         self.updated_at = 0.0
+        # 登录态检查（落盘 Profile 的真实状态，与控制台展示 / 登录流程状态相互独立）
+        self._check_thread = None
+        self._check_stop = threading.Event()
+        self.accounts_state = {}          # {accountKey: {state, message, at}}
+        self.check_state = "idle"         # idle | checking | done | error
+        self.check_message = ""
+        self.check_updated_at = 0.0
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -763,6 +813,85 @@ class LoginSession:
                     "hasQr": self.qr_png is not None, "qrAt": self.qr_at,
                     "message": self.message, "updatedAt": self.updated_at,
                     "qrUrl": "/api/login/qr"}
+
+    def accounts_snapshot(self) -> dict:
+        """落盘登录态的真实快照（按账号），供控制台展示。"""
+        with self._lock:
+            return {"checkState": self.check_state, "message": self.check_message,
+                    "updatedAt": self.check_updated_at,
+                    "accounts": {k: dict(v) for k, v in self.accounts_state.items()}}
+
+    def _set_check(self, **kv):
+        with self._lock:
+            self.__dict__.update(kv)
+            self.check_updated_at = time.time()
+
+    def _set_account_state(self, key: str, state: str, message: str) -> None:
+        with self._lock:
+            self.accounts_state[key] = {"state": state, "message": message, "at": time.time()}
+
+    def start_check(self, account: str | None = None, force: bool = False) -> bool:
+        """检查落盘登录态是否仍然有效（真实请求京准通接口，不是只看内存状态）。"""
+        with self._lock:
+            if self.check_state == "checking" and not force:
+                return False
+        self._check_stop.clear()
+        self._set_check(check_state="checking", check_message="正在检查登录态…")
+        keys = [account] if account else [a["key"] for a in settings.ACCOUNTS]
+        self._check_thread = threading.Thread(target=self._loop_check, args=(keys,),
+                                              name="login-check", daemon=True)
+        self._check_thread.start()
+        return True
+
+    def stop_check(self) -> None:
+        self._check_stop.set()
+
+    def _loop_check(self, keys: list) -> None:
+        from . import config
+        from .browser import has_login, launch_persistent, session_ok
+        n_ok = 0
+        try:
+            for key in keys:
+                if self._check_stop.is_set():
+                    break
+                self._set_account_state(key, "checking", "检查中…")
+                pw = ctx = None
+                try:
+                    pw, ctx = launch_persistent(headless=True, account=key)
+                    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                    try:
+                        page.set_viewport_size({"width": 1440, "height": 900})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # 先看有没有登录凭证，再让服务端确认是否真的没过期
+                    if not has_login(ctx):
+                        self._set_account_state(key, "logged_out", "未登录：Profile 里没有登录票据")
+                        continue
+                    page.goto(config.JZT_HOME, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(3000)
+                    if session_ok(page):
+                        self._set_account_state(key, "logged_in", "已登录，登录态有效")
+                        n_ok += 1
+                    else:
+                        self._set_account_state(key, "logged_out", "登录态已失效，需要重新登录")
+                except Exception as exc:  # noqa: BLE001
+                    self._set_account_state(key, "error", f"检查失败：{type(exc).__name__}")
+                finally:
+                    try:
+                        ctx and ctx.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        pw and pw.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if self._check_stop.is_set():
+                self._set_check(check_state="done", check_message="检查已取消")
+            else:
+                self._set_check(check_state="done",
+                                check_message=f"检查完成：{n_ok}/{len(keys)} 个账号登录有效")
+        except Exception as exc:  # noqa: BLE001
+            self._set_check(check_state="error", check_message=f"检查出错：{type(exc).__name__}")
 
     def _set(self, **kv):
         with self._lock:
@@ -1216,6 +1345,23 @@ async def api_login_password(request: Request):
     ok = _login.start_password((body.get("account") or "").strip() or None, username, password,
                                show_window=bool(body.get("showWindow", True)), replace=True)
     return {"ok": ok, "error": None if ok else "已有登录流程在进行"}
+
+
+@app.post("/api/login/check")
+def api_login_check(account: str | None = None, force: int = 0):
+    """检查落盘登录态是否仍然有效（真实请求京准通 logininfo）。"""
+    ok = _login.start_check(account, force=bool(force))
+    return {"ok": ok, "error": None if ok else "检查正在进行中"}
+
+
+@app.get("/api/login/accounts")
+def api_login_accounts():
+    """各账号的落盘登录态快照。"""
+    snap = _login.accounts_snapshot()
+    labels = {a["key"]: a.get("label") for a in settings.ACCOUNTS}
+    snap["accounts"] = [dict(v, key=k, label=labels.get(k, k))
+                        for k, v in snap["accounts"].items()]
+    return {"ok": True, **snap}
 
 
 @app.post("/api/login/cancel")
