@@ -1,11 +1,11 @@
 {
   "_说明": "每个 SKU 的真实成本（手工维护版）。生产上更推荐直接连供货方接口：配 JD_COSTS_URL / JD_COSTS_TOKEN 即可，本文件作为接口不通时的兜底。",
-  "_口径": "供货方接口里 supply 是「京东结算给我们的单件金额」= 收入（已扣点），成本是 _goodsCost；本文件把那个成本字段写成 goodsCost。单件贡献 = supply − goodsCost − shipping − package − labor；毛利率 = 贡献 ÷ 件单价；保本 ROI = 1 ÷ 毛利率。",
-  "_注意": "不要把 platformRate 再乘一遍算扣点成本 —— supply 已经是扣点后的结算额。缺字段则回落 default，整个 SKU 缺失则回落 Excel 全店口径（报表标 *）。",
+  "_口径": "术语：supply = 到手结算价（京东每件结算给我们的钱，已扣点，是收入不是成本）；goodsCost = 货款成本（接口里叫 _goodsCost）；前台件单价 = 商智成交额 ÷ 件数（消费者实付）。单件贡献 = supply − goodsCost − shipping − package − labor；毛利率 = 单件贡献 ÷ 前台件单价；保本 ROI = 1 ÷ 毛利率。",
+  "_注意": "不要把 platformRate 再乘一遍算扣点成本 —— supply 已经是扣点后的到手结算价。缺字段则回落 default，整个 SKU 缺失则回落 Excel 全店口径（报表标 *）。",
   "_字段": {
-    "supply": "每件结算给我们多少钱（收入，含我方利润）",
+    "supply": "到手结算价：京东每件结算给我们多少钱（收入，已扣点，含我方利润）",
     "goodsCost": "每件买货成本（接口里的 _goodsCost）",
-    "price": "单件售价，可留空；留空用商智真实件单价",
+    "price": "ERP 的单件售价，实测恒为 null；留空即用商智前台件单价（成交额 ÷ 件数）",
     "shipping": "单件运费（留空用 default.shipping）",
     "package": "单件包材",
     "labor": "单件打包人工",

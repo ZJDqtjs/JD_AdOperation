@@ -293,6 +293,25 @@ def main() -> int:
     check("GET /report 状态", code, 200)
     check_true("/report 标题含区间", "2026-10-01 ~ 2026-10-03" in body)
     check_true("/report 含计划名", "计划A" in body)
+
+    # 两个账号同时勾选：复选框提交的是同名多值，不能被「只取最后一个」吞掉
+    print("")
+    print("[5b] 勾选多个账号")
+    code, body = http("/api/analysis?start=2026-10-01&end=2026-10-03&accounts=main&accounts=b")
+    check("GET /api/analysis 两账号状态", code, 200)
+    check("两账号花费 = 两账号之和",
+          json.loads(body)["data"]["advice"]["combined"]["w2"]["cost"], 1200.0)
+    code, body = http("/api/analysis?start=2026-10-01&end=2026-10-03&accounts=main,b")
+    check("逗号串写法仍兼容",
+          json.loads(body)["data"]["advice"]["combined"]["w2"]["cost"], 1200.0)
+    code, body = http("/api/coverage?accounts=main&accounts=b")
+    check("覆盖度含两个账号", sorted(json.loads(body)["coverage"].keys()), ["b", "main"])
+    code, body = http("/report?start=2026-10-01&end=2026-10-03&accounts=main&accounts=b")
+    check("GET /report 两账号状态", code, 200)
+    check_true("报表标题列出两个账号", "主账号 / 账号B" in body)
+    check_true("两个账号复选框都是勾选态", body.count('name="accounts" value="main" checked') == 1
+               and body.count('name="accounts" value="b" checked') == 1)
+    check_true("两账号报表里的花费合计也翻倍", body.count("1,200") >= 1)
     code, body = http("/")
     check("GET / 状态", code, 200)
     check_true("控制台含数据覆盖", "数据覆盖" in body)

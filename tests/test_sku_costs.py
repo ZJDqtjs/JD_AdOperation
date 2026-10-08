@@ -2,10 +2,10 @@
 """按 SKU 真实成本算保本线（口径测试）。
 
 关键口径（供货方 ERP 接口 /api/open/sku-costs）：
-  supply  = 京东结算给我们的单件金额（**收入**，已扣点）
-  _goodsCost = 我方买货成本
-  单件贡献 = supply − 货款 − 运费 − 包材 − 人工
-  毛利率   = 贡献 ÷ 件单价；  保本 ROI = 1 ÷ 毛利率
+  到手结算价 supply = 京东结算给我们的每件金额（**收入**，已扣点）
+  _goodsCost = 我方买货成本（货款）
+  单件贡献 = 到手结算价 − 货款 − 运费 − 包材 − 人工
+  毛利率   = 单件贡献 ÷ 前台件单价；  保本 ROI = 1 ÷ 毛利率
 旧文档把 supply 当成本、又乘一遍 platformRate，会算出负毛利与 999 的保本线 —— 本测试把正确口径钉住。
 """
 from __future__ import annotations
@@ -56,13 +56,13 @@ COSTS = {
 
 
 def main() -> int:
-    print("[1] supply 是「收入」：贡献 = 结算价 − 货款 − 运费 − 包材 − 人工")
+    print("[1] supply 是「收入」：贡献 = 到手结算价 − 货款 − 运费 − 包材 − 人工")
     c = a.sku_cost_of("1001", 25.0, M, COSTS, {})
     check("单件贡献 20-10-2-0.5-0.5", c["grossPerOrder"], 7.0)
     check("毛利率 7/25", c["margin"], 0.28)
     check("保本 ROI 25/7", c["breakeven"], 3.57)
     check("放量线 保本×1.25", c["growLine"], 4.46)
-    check("件单价优先于 ERP price(null)", c["aov"], 25.0)
+    check("前台件单价优先于 ERP price(null)", c["aov"], 25.0)
     check("成本来源", c["costSource"], "erp")
     check("扣点只展示、不再进成本", c["platform"], 1.0)
     # 旧公式（把 supply 当成本 + 再扣 price×platformRate）会得到什么：
@@ -77,7 +77,7 @@ def main() -> int:
     check("回落毛利率", f["margin"], a.global_margin(M))
     check("回落保本线", f["breakeven"], round(1 / a.global_margin(M), 2))
 
-    print("[3] 结算价低于成本 = 卖一件亏一件：保本线 0 是「有意义」，不能被当成空值回落")
+    print("[3] 到手结算价低于成本 = 卖一件亏一件：保本线 0 是「有意义」，不能被当成空值回落")
     # 1002 只有 supply/shipping/_goodsCost，包材按「全店模型 0.6 → default 0」的顺序回落
     z = a.sku_cost_of("1002", 20.0, M, COSTS, {})
     check("贡献为负 12-10.5-2-0.6", z["grossPerOrder"], -1.1)
@@ -92,7 +92,7 @@ def main() -> int:
 
     print("[4] 单位换算：接口 unitsPerSale 优先于手工表，两者都没有按 1:1")
     u = a.sku_cost_of("1003", 20.0, M, COSTS, {"1003": 3.0})
-    check("结算价 ×2（接口值优先）", u["supply"], 16.0)
+    check("到手结算价 ×2（接口值优先）", u["supply"], 16.0)
     check("货款 ×2", u["productCost"], 6.0)
     check("贡献 ×2 = 16-6-2-1.2（包材回落全店 0.6）", u["grossPerOrder"], 6.8)
     check("换算来源", u["unitFactorSource"], "erp")
@@ -111,26 +111,51 @@ def main() -> int:
     check("高毛利占大头时接近 2.00", be2, 2.05)
     check("空篮子退回全店线", a.blended_breakeven([])[0], round(1 / a.global_margin(a.COST_MODEL), 2))
 
-    print("[6] 覆盖率统计：报表必须说清「多少钱是按真实成本判的」")
+    print("[6] 覆盖率统计：报表必须说清「多少钱是按真实成本判的」，以及成交额里我们真正到手多少")
     def mk(sid, cost, src, be, warn=None):
         cp = {"unitWarn": warn} if warn else {}
+        if src == "erp":
+            cp.update({"settleRate": 0.8, "margin": 0.28})
         return {"skuId": sid, "name": sid, "costSource": src, "breakeven": be,
                 "grossPerOrder": be, "costParams": cp,
-                "wins": {k: {"cost": 0.0, "roi": 0.0, "amt": 0.0} for k in a.WKEYS},
+                "wins": {k: {"cost": 0.0, "roi": 0.0, "amt": 0.0, "szAmt": 0.0} for k in a.WKEYS},
                 "est": {k: {"netProfit": 0.0} for k in a.WKEYS}}
     s = [mk("1001", 200.0, "erp", 3.5), mk("1002", 50.0, "erp", 0.0),
-         mk("9999", 100.0, "store", 3.3), mk("1004", 50.0, "erp", 2.0, warn="结算价≥件单价")]
-    for x, c in zip(s, (200.0, 50.0, 100.0, 50.0)):
+         mk("9999", 100.0, "store", 3.3), mk("1004", 50.0, "erp", 2.0, warn="到手结算价≥前台件单价")]
+    for x, c, g in zip(s, (200.0, 50.0, 100.0, 50.0), (1000.0, 250.0, 500.0, 250.0)):
         x["wins"]["w2"]["cost"] = c
+        x["wins"]["w2"]["szAmt"] = g        # 前台成交额（商智）
     cov = a._cost_coverage(s, COSTS)
     check("命中数", cov["skuErp"], 3)
     check("真实成本花费", cov["costErp"], 300.0)
     check("本期总花费", cov["costTotal"], 400.0)
     check("覆盖率", cov["costShare"], 75.0)
+    check("前台成交额（只算命中 ERP 的）", cov["gmvErp"], 1500.0)
+    check("到手结算价合计 = ×0.8", cov["settleAmt"], 1200.0)
+    check("到手率", cov["settleRate"], 0.8)
+    check("到手结算口径保本 = 1200/(1500×0.28)", cov["breakevenSettle"], 2.86)
     check("结构性亏损 1 个", len(cov["negativeMargin"]), 1)
     check("口径待确认 1 个", len(cov["unitWarn"]), 1)
     check("未接入清单只 1 个", [x["skuId"] for x in cov["missing"]], ["9999"])
     check("ERP 内 SKU 总数", cov["skusInErp"], 3)
+
+    print("[8] 前台件单价 ≠ 到手结算价：两个口径分开算，判定只用前者")
+    c8 = a.sku_cost_of("1001", 25.0, M, COSTS, {})      # 前台件单价 25 元，到手结算价 20 元，贡献 7 元
+    check("到手率 = 20/25", c8["settleRate"], 0.8)
+    check("占到手结算价毛利率 = 7/20（ERP 里那个 _marginRate 口径）", c8["marginSettle"], 0.35)
+    check("到手结算口径保本 = 20/7", c8["breakevenSettle"], 2.86)
+    check("两条线只差一个到手率", round(c8["breakeven"] * c8["settleRate"], 2), c8["breakevenSettle"])
+    # 广告 ROI = 3.0：按到手结算口径(2.86)像打平，按前台口径(3.57)其实在亏。
+    # 京准通报的 ROI 分子是前台成交额 ⇒ 绝不能判成「达标」，只能落到止损/严重亏损。
+    def mkrow(net):
+        return {"skuId": "1001", "costSource": "erp", "costParams": c8,
+                "breakeven": c8["breakeven"], "growLine": c8["growLine"],
+                "wins": {k: {"cost": 100.0 if k == "w2" else 0.0, "roi": 3.0, "amt": 300.0} for k in a.WKEYS},
+                "est": {k: {"netProfit": net} for k in a.WKEYS}}
+    check("ROI 3.0 + 净利为负 → 严重亏损（不是「已达标」）", a._verdict(mkrow(-16.0))["tier"], "严重亏损")
+    check("ROI 3.0 + 净利为正 → 止损（仍低于前台口径保本 3.57）", a._verdict(mkrow(20.0))["tier"], "止损")
+    check("回落口径没到手结算价（不误显示 0 到手率）",
+          a.sku_cost_of("9999", 25.0, M, COSTS, {})["settleRate"], 0.0)
 
     print("\n" + ("ALL GREEN" if not FAILS else "FAILURES: " + ", ".join(FAILS)))
     return 0 if not FAILS else 1

@@ -153,6 +153,8 @@ def sku_margin(aov: float, m: dict) -> dict:
         "grossPerOrder": round(price * margin, 2),
         "margin": round(margin, 4),
         "breakeven": be,
+        "frontPrice": round(price, 2),
+        "settleRate": 0.0, "marginSettle": 0.0, "breakevenSettle": 0.0,   # 全店口径没有到手结算价
         "growLine": round(be * GROW_FACTOR, 2) if be else 0.0,
         "costSource": "store",
     }
@@ -160,22 +162,29 @@ def sku_margin(aov: float, m: dict) -> dict:
 
 # ---------------- 按 SKU 的真实成本 ----------------
 # 供货方 ERP 接口（/api/open/sku-costs）的口径与 Excel 全店口径不同，必须按「收入 − 成本」算：
-#   supply   = 京东**结算给我们**的单件金额（已扣点，含我方利润）→ 这是收入，不是成本
-#   _goodsCost = 我方买货成本 → 这才是成本
-# 因此：单件贡献 = supply − 货款 − 包材 − 人工 − 运费；
-#       毛利率（对成交额）= 单件贡献 ÷ 件单价；保本 ROI = 1 ÷ 毛利率 = 件单价 ÷ 单件贡献。
-# 注意别把 platformRate 再乘一遍：supply 已经是扣点后的结算额（platformRate 仅供核对）。
+#   到手结算价 supply = 京东**结算给我们**的每件金额（已扣点，含我方利润）→ 这是收入，不是成本
+#   货款 _goodsCost   = 我方买货成本 → 这才是成本
+# 因此：单件贡献 = 到手结算价 − 货款 − 运费 − 包材 − 人工。
+#
+# 分母有两个候选，只有一个能用：
+#   前台件单价 price  = 商智成交额 ÷ 件数 = **消费者实付**（入仓品 24 元这类）
+#   到手结算价 supply = 真正进我们账户的钱（同一件 18 元，差额是京东扣点+入仓差价）
+# 京准通 ROI 的分子是**前台成交额**（实测约 20 个 SKU 广告客单价 ÷ 商智客单价 中位数 ≈ 1.05），
+# 所以保本线 = 前台件单价 ÷ 贡献；若改用到手结算价做分母，线会低 ~25%，把亏的判成赚。
+# 同时保留 marginSettle / breakevenSettle（贡献 ÷ 到手结算价，与 ERP 里 _marginRate 同口径）供对照展示。
+# 注意别把 platformRate 再乘一遍：supply 已经是扣点后的到手结算价（platformRate 仅供核对）。
 GROW_FACTOR = 1.25        # 放量线 = 保本线 × 1.25（例：全店口径 4.00 → 5.00）
 
 
 def sku_cost_of(sid: str, unit_price: float, m: dict, costs: dict, units: dict | None = None) -> dict:
     """取某个 SKU 的真实保本线；ERP 里查不到就回落全店口径（Excel / COST_MODEL）。
 
-    unit_price 用「件单价」（商智成交额÷件数），没有件数就退回客单价，
-    因为 supply/包材/人工/运费 都是**每件**口径，除以客单价会低估多件订单的毛利。
+    unit_price 用「**前台件单价**」（商智成交额÷件数 = 消费者实付），没有件数就退回客单价：
+    京准通 ROI 的分子就是这个前台成交额，分母必须与它同口径；
+    到手结算价 supply 只是我们从中真正拿到的那部分（到手率一般 70%~95%），不能拿来当分母。
 
     units：每 1 个「京东售卖件」等于几个 ERP 计量单位（袋/盒）。默认 1；
-    实测 1 才成立（按 ERP÷商智 的件数比换算会让结算价高于消费者实付），
+    实测 1 才成立（按 ERP÷商智 的件数比换算会让到手结算价高于消费者实付），
     那个比值差的是 ERP 里含了其他渠道销量。真有换算需求时用接口返回的
     unitsPerSale，或写 config/costs_units.json，两者都没有就按 1 并做口径体检。
     """
@@ -206,8 +215,14 @@ def sku_cost_of(sid: str, unit_price: float, m: dict, costs: dict, units: dict |
     supply, goods = supply * k, goods * k
     ret_rate = _f(row.get("returnRate"), _f(d.get("returnRate"), _f(m.get("returnRate"))))
     contrib = supply - goods - shipping - package - labor
+    # 两个口径别混：price 是**前台件单价**（消费者实付），supply 是**到手结算价**。
+    # 京准通 ROI 的分子是前台成交额（实测：广告客单价 ÷ 商智客单价 ≈ 1.0），
+    # 所以保本线只能除以 price；除以 supply 会把线算低约 25%，把亏的判成赚。
     margin = round(contrib / price, 4) if price > 0 else 0.0
     be = round(1 / margin, 2) if margin > 0 else 0.0
+    settle_rate = round(supply / price, 4) if price > 0 else 0.0        # 到手结算价 ÷ 前台件单价
+    margin_settle = round(contrib / supply, 4) if supply > 0 else 0.0   # ERP 口径毛利率（对到手结算价）
+    be_settle = round(supply / contrib, 2) if contrib > 0 else 0.0      # 到手结算口径保本线，仅展示
     return {
         "aov": round(price, 2),
         "supply": round(supply, 2),
@@ -216,12 +231,16 @@ def sku_cost_of(sid: str, unit_price: float, m: dict, costs: dict, units: dict |
         "shipping": round(shipping, 2),
         "package": round(package, 2),
         "labor": round(labor, 2),
-        "platform": round((_f(row.get("supplyGross")) - supply) * k, 4),   # 已含在结算价里，仅展示
+        "platform": round((_f(row.get("supplyGross")) - supply) * k, 4),   # 已含在到手结算价里，仅展示
         "platformRate": _f(row.get("platformRate"), _f(d.get("platformRate"))),
         "returnCost": round(ret_rate * (shipping + package), 2),      # 单独一行，不进毛利率
         "grossPerOrder": round(contrib, 2),
         "margin": margin,
         "breakeven": be,
+        "frontPrice": round(price, 2),                 # = aov，前台件单价（消费者实付）
+        "settleRate": settle_rate,                     # 到手结算价 ÷ 前台件单价
+        "marginSettle": margin_settle,                 # 贡献 ÷ 到手结算价（与 ERP 毛利率同口径）
+        "breakevenSettle": be_settle,                  # 到手结算口径保本线（展示用）
         "growLine": round(be * GROW_FACTOR, 2) if be else 0.0,
         "costSource": "erp",
         "erpName": row.get("_name") or "",
@@ -542,9 +561,9 @@ def sku_rows(accts, model, costs=None):
                 break
         cost = sku_cost_of(sid, unit_price or aovRef, model, costs, units)
         # 两条自动体检：
-        #   ① 结算价 ≥ 件单价：不可能成立（结算价是消费者实付里的一部分），多半是促销价/期间口径不一致
+        #   ① 到手结算价 ≥ 前台件单价：不可能成立（到手结算价是消费者实付里的一部分），多半是促销价/期间口径不一致
         #   ② ERP 件数 ÷ 商智件数 偏离 1：仅作参考。实测换算系数取 1 才成立
-        #      （若按倍数换算，结算价会超过消费者实付），说明 ERP 的 _qty 含了其他渠道，不动成本
+        #      （若按倍数换算，到手结算价会超过消费者实付），说明 ERP 的 _qty 含了其他渠道，不动成本
         if cost.get("costSource") == "erp":
             erp_q = _f(cost.get("erpQty"))
             # 接口是按「所选区间」要的均值（= w2），所以件数也只能跟 w2 比，跨三期比会得到 0.3 这种假异常
@@ -555,7 +574,7 @@ def sku_rows(accts, model, costs=None):
             warn = []
             if _f(cost.get("supply")) >= _f(cost.get("aov")) > 0:
                 cost["supplyOverPrice"] = True
-                warn.append(f"结算价 ¥{_f(cost.get('supply'))} ≥ 件单价 ¥{_f(cost.get('aov'))}，"
+                warn.append(f"到手结算价 ¥{_f(cost.get('supply'))} ≥ 前台件单价 ¥{_f(cost.get('aov'))}，"
                             f"成本或售价口径待确认（是否为促销价/跨期）")
             # 入仓品的 _qty 是「全部记录」汇总（接口不吃 date_from/date_to），
             # 跟本区间的商智件数没有可比性，只对出库口径做这个体检
@@ -626,10 +645,24 @@ def _cost_coverage(skus: list, costs: dict) -> dict:
     missing = [{"skuId": s["skuId"], "name": s["name"], "cost": _own(s)}
                for s in skus if s.get("costSource") != "erp" and _own(s) > 0]
     missing.sort(key=lambda x: -x["cost"])
+    # 「前台成交额 → 到手结算价」的比例：京准通 ROI 的分子是前者，我们赚的是后者差额，
+    # 报表必须把这层差价摊开，否则读者会把 24 元的前台件单价当成我们的收入。
+    gmv = settle = contrib = 0.0
+    for s in erp:
+        w = s["wins"]["w2"] if s["wins"]["w2"]["cost"] > 0 else s["wins"]["w1"]
+        g = _f(w.get("szAmt")) or _f(w["amt"])
+        cp = s.get("costParams") or {}
+        if g > 0 and _f(cp.get("settleRate")) > 0:
+            gmv += g
+            settle += g * _f(cp.get("settleRate"))
+            contrib += g * _f(cp.get("margin"))
     return {
         "skuTotal": len(skus), "skuErp": len(erp), "skuStore": len(skus) - len(erp),
         "costErp": round(erp_cost, 2), "costTotal": round(tot, 2),
         "costShare": round(erp_cost / tot * 100, 1) if tot else 0.0,
+        "gmvErp": round(gmv, 2), "settleAmt": round(settle, 2),
+        "settleRate": round(settle / gmv, 4) if gmv else 0.0,
+        "breakevenSettle": round(settle / contrib, 2) if contrib > 0 else 0.0,
         "negativeMargin": [{"skuId": s["skuId"], "name": s["name"],
                             "cost": _own(s), "grossPerOrder": s.get("grossPerOrder")}
                            for s in zero],
@@ -642,12 +675,12 @@ def _cost_coverage(skus: list, costs: dict) -> dict:
 def _verdict(r):
     w0, w1, w2 = r["wins"]["w0"], r["wins"]["w1"], r["wins"]["w2"]
     # 每个 SKU 用自己那条保本线；没接入真实成本的，sku_cost_of 已回落成全店保本线。
-    # 注意 be==0 是有意义的（结算价低于成本 → 保本线不存在），不能当成「没值」
+    # 注意 be==0 是有意义的（到手结算价低于成本 → 保本线不存在），不能当成「没值」
     be = _f(r.get("breakeven"))
     if (r.get("costSource") == "erp") and be <= 0:
         cp = r.get("costParams") or {}
         return {"tier": "严重亏损", "score": 4,
-                "reason": (f"ERP 结算价 ¥{_f(cp.get('supply'))} 低于单件成本"
+                "reason": (f"ERP 到手结算价 ¥{_f(cp.get('supply'))} 低于单件成本"
                            f"（货款 {_f(cp.get('productCost'))}+运费 {_f(cp.get('shipping'))}"
                            f"+包材 {_f(cp.get('package'))}+人工 {_f(cp.get('labor'))}），"
                            f"卖一件亏一件，ROI {r['wins']['w2']['roi'] if r['wins']['w2']['cost'] > 0 else r['wins']['w1']['roi']} 无意义")}
@@ -1180,8 +1213,8 @@ def build_advice(accts, totals, skus, plans, ops, words, adj):
         (f"所选区间仍有 {len(stop)} 个 SKU 的广告 ROI 低于「各自」的保本线"
          f"（真实成本覆盖 {erpShare:.0f}% 的花费），合计花费 ¥{stopCost:,.0f}"
          f"（占 {stopCost / last['cost'] * 100:.0f}%），这部分是主要失血点" if last["cost"] else ""),
-        (f"其中 {len(negMargin)} 个 SKU 按 ERP 结算价算出「卖一件亏一件」"
-         f"（结算价 < 货款+运费+包材+人工），不投广告也在亏：{negNames}" if negMargin else ""),
+        (f"其中 {len(negMargin)} 个 SKU 按 ERP 到手结算价算出「卖一件亏一件」"
+         f"（到手结算价 < 货款+运费+包材+人工），不投广告也在亏：{negNames}" if negMargin else ""),
         (f"若把上述花费转移到 ROI≈{targetRoi} 的高效 SKU，预计多产出 ¥{estGain:,.0f}，"
          f"整体 ROI 可由 {last['roi']} 提升到约 {roiAfter}"),
     ]

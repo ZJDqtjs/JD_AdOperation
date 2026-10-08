@@ -282,7 +282,7 @@ def costs_unit_map() -> dict:
     """手工换算表 config/costs_units.json：{"<skuId>": 每 1 个京东售卖件 = 几个 ERP 计量单位}。
 
     默认全部按 1:1，因为实测只有 1:1 成立：按 ERP出库件数÷商智京东件数（1.5~4.2 倍）换算后，
-    结算价会**高于**消费者实付价，显然不对 —— 那个比值差的是 ERP 里混入了其他渠道销量。
+    到手结算价会**高于**消费者实付价，显然不对 —— 那个比值差的是 ERP 里混入了其他渠道销量。
     供货方若确认某个 SKU 真是「1 件 = N 袋」，在这里（或接口的 unitsPerSale）填 N 即可。
     """
     p = CONFIG_DIR / "costs_units.json"
@@ -306,7 +306,7 @@ def load_costs(date_from: str = "", date_to: str = "") -> dict:
 
     返回结构：{"default": {...}, "skus": {"<skuId>": {"supply":…, "_goodsCost":…}},
     外加 "_source"/"updatedAt" 等说明字段，供报表标注成本口径来源。
-    接口口径：**supply = 京东结算给我们的单件金额（收入，已扣点）**，
+    接口口径：**到手结算价 supply = 京东结算给我们的每件金额（收入，已扣点）**，
     _goodsCost 才是我方货款成本 —— 见《SKU成本接口对接说明.md》第 2 节。
     """
     global COSTS_SOURCE

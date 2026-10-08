@@ -75,11 +75,29 @@ def resolve_range(start: str | None, end: str | None, days: int | None) -> tuple
     return s.isoformat(), e.isoformat()
 
 
-def account_list(accounts: str | None) -> list:
-    if not accounts:
+def account_list(accounts) -> list:
+    """把账号筛选参数归一成账号列表。
+
+    复选框同名提交会变成 `?accounts=main&accounts=b`（多值），
+    而 FastAPI 对 `str` 类型只取最后一个值、Starlette 的 `query_params.get` 也是取最后一个，
+    结果就是「两个都勾选，只有最后一个生效」。所以这里统一按列表接收，
+    同时兼容 `?accounts=main,b` 这种逗号串。空/无效值 = 全部账号。
+
+    注意：以函数方式直接调用接口（测试、脚本）时，FastAPI 的 `Query(None)` 默认值
+    会原样传进来，它不是字符串也不是列表 —— 这种情况按「未筛选」处理。
+    """
+    if isinstance(accounts, str):
+        raw = [accounts]
+    elif isinstance(accounts, (list, tuple, set)):
+        raw = list(accounts)
+    else:
         return settings.ACCOUNTS
-    want = [x.strip() for x in accounts.split(",") if x.strip()]
-    got = [a for a in settings.ACCOUNTS if a["key"] in want]
+    keys = set()
+    for item in raw:
+        keys.update(x.strip() for x in str(item).split(",") if x.strip())
+    if not keys:
+        return settings.ACCOUNTS
+    got = [a for a in settings.ACCOUNTS if a["key"] in keys]
     return got or settings.ACCOUNTS
 
 
@@ -593,7 +611,7 @@ function clearTasks(){{
 def report(request: Request):
     q = request.query_params
     start, end = resolve_range(q.get("start"), q.get("end"), 7)
-    accounts = account_list(q.get("accounts"))
+    accounts = account_list(q.getlist("accounts"))
     try:
         data = analyze2.build(start=start, end=end, accounts=accounts)
     except FileNotFoundError as exc:
@@ -609,8 +627,8 @@ def report(request: Request):
     keys = [a["key"] for a in accounts]
     ui = _range_bar(start, end, keys, "/report",
                     extra='<a href="/">← 控制台</a>'
-                          '<a href="/api/analysis?start=%s&end=%s" target="_blank">看 JSON</a>'
-                          % (_e(start), _e(end)))
+                          '<a href="/api/analysis?start=%s&end=%s&accounts=%s" target="_blank">看 JSON</a>'
+                          % (_e(start), _e(end), _e(",".join(keys))))
     title = f"广告运营分析 {start} ~ {end}（{(dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days + 1}天）"
     return HTMLResponse(report2.render(data, ui=ui, title=title))
 
@@ -640,13 +658,13 @@ def api_status():
 
 
 @app.get("/api/coverage")
-def api_coverage(accounts: str | None = None):
+def api_coverage(accounts: list[str] | None = Query(None)):
     return {"ok": True, "coverage": ds.coverage(account_list(accounts))}
 
 
 @app.get("/api/analysis")
 def api_analysis(start: str | None = None, end: str | None = None,
-                 days: int | None = None, accounts: str | None = None,
+                 days: int | None = None, accounts: list[str] | None = Query(None),
                  save: int = 0):
     s, e = resolve_range(start, end, days)
     try:
@@ -667,7 +685,8 @@ def api_run_status():
 
 @app.post("/api/run")
 def api_run(start: str | None = None, end: str | None = None,
-            days: int | None = None, force: int = 0, accounts: str | None = None):
+            days: int | None = None, force: int = 0,
+            accounts: list[str] | None = Query(None)):
     s, e = resolve_range(start, end, days)
     accs = account_list(accounts)
     res = scrape_day.run_background(accs, s, e, force=bool(force),
