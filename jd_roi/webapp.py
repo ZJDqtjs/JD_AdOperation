@@ -13,8 +13,14 @@ API：
     GET  /api/status            运行状态 / 登录状态 / 最近一次任务
     GET  /api/coverage          按天数据覆盖情况
     GET  /api/analysis          区间分析 JSON
-    GET  /api/run/status        抓取进度
+    GET  /api/run/status        抓取进度 + 抓取锁状态
     POST /api/run               触发抓取（后台线程）
+    POST /api/run/cancel        取消当前抓取 / 解锁卡死的抓取锁
+    GET  /api/tasks             任务中心：运行中 + 历史任务
+    GET  /api/tasks/{id}        单个任务详情（含完整日志）
+    POST /api/tasks/{id}/cancel 取消该任务（仅运行中的可取消）
+    POST /api/tasks/{id}/rerun  按原参数重跑
+    POST /api/tasks/clear       清空历史任务
     POST /api/login/start       开始扫码登录
     GET  /api/login/qr          登录二维码 PNG
     GET  /api/login/status      登录状态
@@ -29,7 +35,6 @@ import json
 import os
 import threading
 import time
-import traceback
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
@@ -165,6 +170,28 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 code{background:#f1f5f9;padding:1px 6px;border-radius:5px;font-size:12px}
 footer{color:var(--sub);font-size:12px;text-align:center;margin-top:24px;line-height:1.9}
 a{color:var(--blue)}
+.kpi.click{cursor:pointer;transition:box-shadow .15s,border-color .15s}
+.kpi.click:hover{border-color:#93c5fd;box-shadow:0 2px 10px rgba(37,99,235,.12)}
+.btn.mini{padding:4px 10px;font-size:12px;border-radius:7px}
+.btn.danger{background:#dc2626}.btn.danger:hover{background:#b91c1c}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+.modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.5);z-index:50;
+ padding:28px 14px;overflow:auto}
+.modal.open{display:block}
+.modal-card{max-width:1000px;margin:0 auto;background:#fff;border-radius:14px;
+ box-shadow:0 20px 50px rgba(2,6,23,.35)}
+.modal-head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--line)}
+.modal-head h2{margin:0;font-size:17px;flex:1}
+.modal-body{padding:16px 20px;max-height:76vh;overflow:auto}
+.tasklog{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px 12px;font-size:12px;
+ line-height:1.7;max-height:190px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+ font-family:Consolas,Menlo,monospace;margin-top:8px}
+.tm{display:flex;flex-wrap:wrap;gap:12px;font-size:12.5px;color:#374151;margin:6px 0}
+.tm b{font-weight:700}
+.trow{cursor:pointer}
+.trow:hover td{background:#f8fafc}
+.trow.open td{background:#eff6ff}
+tbody .det td{background:#f8fafc;padding:0 9px 12px}
 """
 
 
@@ -236,6 +263,21 @@ def dashboard(request: Request):
     }.get(login_state.get("state"), '<span class="badge b-idle">—</span>')
 
     busy = "（正在抓取：%s）" % _e(run.get("progress") or "") if run.get("active") else ""
+    lock = run.get("lock") or {}
+    if run.get("active"):
+        task_html = '<span class="badge b-warn">运行中</span>'
+    elif lock.get("stale"):
+        task_html = '<span class="badge b-bad">锁卡死</span>'
+    elif run.get("cancelled"):
+        task_html = '<span class="badge b-warn">已取消</span>'
+    else:
+        task_html = '<span class="badge b-ok">空闲</span>'
+    if lock.get("locked") and not run.get("active"):
+        task_hint = ('抓取锁被占用（持有者 %s，开始于 %s），但没有存活的任务线程'
+                     % (_e(lock.get("thread") or lock.get("name") or "未知"),
+                        _e(lock.get("acquiredAt") or "-")))
+    else:
+        task_hint = _e(run.get("progress") or "")
 
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -250,8 +292,10 @@ def dashboard(request: Request):
 
 <div class="grid g4">
   <div class="kpi"><div class="lbl">最近一次自动抓取</div><div class="val" style="font-size:14px">{lr_html}</div></div>
-  <div class="kpi"><div class="lbl">当前任务</div><div class="val" style="font-size:16px">{'运行中' if run.get('active') else '空闲'}</div>
-    <div class="hint">{_e(run.get('progress') or '')}{busy}</div></div>
+  <div class="kpi click" onclick="openTasks()" title="点击查看任务中心：运行中与历史任务">
+    <div class="lbl">当前任务</div><div class="val" style="font-size:16px">{task_html}</div>
+    <div class="hint">{task_hint}{busy}</div>
+    <div class="hint" style="color:#2563eb">点击查看任务中心 →</div></div>
   <div class="kpi"><div class="lbl">登录状态</div><div class="val" style="font-size:16px">{login_html}</div>
     <div class="hint"><a href="/login">扫码 / 账号密码登录 →</a></div></div>
   <div class="kpi"><div class="lbl">抓取回刷窗口</div><div class="val" style="font-size:16px">最近 {settings.REFRESH_DAYS} 天</div>
@@ -279,6 +323,7 @@ def dashboard(request: Request):
     <button class="btn green" onclick="doRun()">立即抓取</button>
     <button class="btn sec" onclick="quickRun(1)">补昨天</button>
     <button class="btn sec" onclick="quickRun(3)">补近3天</button>
+    <button class="btn sec" onclick="doCancel()">取消 / 解锁</button>
     <span id="runMsg" class="hint"></span>
   </div>
   <div class="note">说明：京准通是「点击后 15 天归因」，昨天的数据在未来两周还会增长，所以每晚都会<b>回刷最近 {settings.REFRESH_DAYS} 天</b>。商智数据当天结算后不再变化。</div>
@@ -302,6 +347,28 @@ def dashboard(request: Request):
   数据目录 <code>{_e(settings.DATA_DIR)}</code> ｜ 登录态 <code>{_e(settings.AUTH_DIR)}</code>
 </footer>
 </div>
+
+<div class="modal" id="taskModal" onclick="if(event.target===this)closeTasks()">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>任务中心</h2>
+      <span class="hint" id="taskMeta" style="margin:0"></span>
+      <button class="btn sec mini" onclick="loadTasks()">刷新</button>
+      <button class="btn sec mini" onclick="clearTasks()">清理历史</button>
+      <button class="btn sec mini" onclick="closeTasks()">关闭</button>
+    </div>
+    <div class="modal-body">
+      <h2 style="font-size:15px;margin:0 0 8px">运行中</h2>
+      <div id="taskRunning"></div>
+      <h2 style="font-size:15px;margin:22px 0 8px">历史任务</h2>
+      <div style="overflow:auto"><table id="taskTable">
+        <thead><tr><th>状态</th><th>触发</th><th>区间</th><th>账号</th>
+          <th class="n">耗时</th><th>开始时间</th><th>操作</th></tr></thead>
+        <tbody id="taskRows"><tr><td colspan="7" class="hint">加载中…</td></tr></tbody>
+      </table></div>
+    </div>
+  </div>
+</div>
 <script>
 function doRun(force, s, e){{
   var qs = new URLSearchParams();
@@ -322,14 +389,201 @@ function quickRun(n){{
   document.getElementById('runEnd').value=e.toISOString().slice(0,10);
   doRun(false, s.toISOString().slice(0,10), e.toISOString().slice(0,10));
 }}
+function doCancel(){{
+  var msg = document.getElementById('runMsg');
+  msg.textContent = '正在取消…';
+  fetch('/api/run/cancel', {{method:'POST'}}).then(r=>r.json()).then(function(j){{
+    if(!j.ok){{ msg.textContent = '取消失败：'+(j.error||''); return; }}
+    if(j.cancelRequested){{
+      msg.textContent = '已请求取消，任务将在当前这一天结束后停止'
+        + (j.lockReleased ? '（并已解锁卡死的锁）' : '');
+    }} else if(j.lockReleased){{
+      msg.textContent = '已解锁卡死的抓取锁，现在可以重新抓取';
+    }} else {{
+      msg.textContent = '当前没有抓取任务';
+    }}
+    poll();
+  }}).catch(function(e){{ msg.textContent='请求失败 '+e; }});
+}}
 function poll(){{
   fetch('/api/run/status').then(r=>r.json()).then(function(j){{
     var msg=document.getElementById('runMsg');
-    msg.textContent = j.active ? ('抓取中：'+(j.progress||'')) : ('已完成 '+(j.finishedAt||''));
-    if(j.active) setTimeout(poll, 3000); else if(j.error) msg.textContent='失败：'+j.error;
+    if(j.active){{
+      msg.textContent = '抓取中：'+(j.progress||'')
+        + (j.cancelRequested ? '（正在取消…）' : '');
+      setTimeout(poll, 3000);
+      return;
+    }}
+    if(j.error){{ msg.textContent='失败：'+j.error; return; }}
+    if(j.lock && j.lock.stale){{
+      msg.textContent='抓取锁卡死（无存活任务），点「取消 / 解锁」即可恢复';
+      return;
+    }}
+    msg.textContent = '已完成 '+(j.finishedAt||'')+(j.cancelled ? '（已取消）' : '');
+  }}).catch(function(e){{
+    var msg=document.getElementById('runMsg'); msg.textContent='状态查询失败 '+e;
   }});
 }}
-(function(){{ fetch('/api/run/status').then(r=>r.json()).then(function(j){{ if(j.active) poll(); }}); }})();
+(function(){{ fetch('/api/run/status').then(r=>r.json()).then(function(j){{
+  if(j.active || (j.lock && (j.lock.stale || j.lock.locked))) poll();
+}}); }})();
+
+/* ------------------------------------------------ 任务中心 */
+var TASK_TIMER = null, TASK_OPEN = [];
+var T_STATUS = {{running:['运行中','b-warn'], done:['成功','b-ok'],
+                 failed:['失败','b-bad'], cancelled:['已取消','b-idle']}};
+var T_TRIGGER = {{manual:'手动', schedule:'定时', rerun:'重跑', cli:'命令行'}};
+
+function esc(s){{ return (s===null||s===undefined) ? '' : String(s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+
+function fmtDur(sec){{
+  if(sec===null||sec===undefined) return '—';
+  var s=Math.max(0,Math.round(sec));
+  if(s<60) return s+' 秒';
+  var m=Math.floor(s/60);
+  if(m<60) return m+' 分 '+(s%60)+' 秒';
+  return Math.floor(m/60)+' 时 '+(m%60)+' 分';
+}}
+
+function durOf(t){{
+  // 耗时一律用服务端算好的秒数：前端拿 startedAt 自己相减会受时区影响
+  if(t.elapsedSec===null || t.elapsedSec===undefined) return '—';
+  return fmtDur(t.elapsedSec) + (t.status==='running' ? '（进行中）' : '');
+}}
+
+function openTasks(){{
+  document.getElementById('taskModal').classList.add('open');
+  TASK_OPEN = [];
+  loadTasks();
+  if(TASK_TIMER) clearInterval(TASK_TIMER);
+  TASK_TIMER = setInterval(loadTasks, 4000);
+}}
+function closeTasks(){{
+  document.getElementById('taskModal').classList.remove('open');
+  if(TASK_TIMER){{ clearInterval(TASK_TIMER); TASK_TIMER=null; }}
+}}
+
+function loadTasks(){{
+  fetch('/api/tasks').then(r=>r.json()).then(function(j){{
+    if(!j.ok) return;
+    renderTasks(j);
+  }}).catch(function(e){{
+    document.getElementById('taskMeta').textContent = '加载失败 '+e;
+  }});
+}}
+
+function renderTasks(j){{
+  document.getElementById('taskMeta').textContent = '共 '+j.count+' 条历史';
+  var box = document.getElementById('taskRunning');
+  var cur = j.running;
+  if(cur){{
+    var cancelling = j.cancelRequested ? ' <span class="badge b-warn">正在取消…</span>' : '';
+    box.innerHTML =
+      '<div class="card" style="margin:0;border-color:#fcd34d;background:#fffbeb">'
+      + '<div class="val" style="font-size:15px"><span class="badge b-warn">运行中</span>'
+      + cancelling + ' <b>'+esc(cur.name)+'</b></div>'
+      + '<div class="tm"><span>区间 <b>'+esc(cur.start)+' ~ '+esc(cur.end)+'</b></span>'
+      + '<span>账号 <b>'+esc((cur.accounts||[]).join(', '))+'</b></span>'
+      + '<span>触发 <b>'+esc(T_TRIGGER[cur.trigger]||cur.trigger||'')+'</b></span>'
+      + '<span>'+(cur.force?'强制覆盖':'只补缺失')+'</span>'
+      + '<span>已运行 <b>'+durOf(cur)+'</b></span>'
+      + '<span>开始 <b>'+esc(cur.startedAt)+'</b></span></div>'
+      + '<div class="tm"><span>'+esc(cur.progress||'')+'</span></div>'
+      + '<button class="btn danger mini" onclick="taskCancel(\\'' + cur.id + '\\')">取消该任务</button>'
+      + ' <button class="btn sec mini" onclick="doCancel()">强制解锁（锁卡死时用）</button>'
+      + '<pre class="tasklog">'+esc((cur.log||[]).join('\\n') || '（暂无日志）')+'</pre>'
+      + '</div>';
+  }} else {{
+    var lock = j.lock || {{}};
+    box.innerHTML = lock.stale
+      ? '<div class="warn">没有运行中的任务，但抓取锁被占用（无存活线程）。'
+        + '点下方按钮解锁后即可重新抓取。<div style="margin-top:8px">'
+        + '<button class="btn danger mini" onclick="doCancel()">解锁</button></div></div>'
+      : '<div class="hint">当前没有运行中的任务。</div>';
+  }}
+
+  var rows = j.items || [];
+  if(!rows.length){{
+    document.getElementById('taskRows').innerHTML =
+      '<tr><td colspan="7" class="hint">暂无历史任务</td></tr>';
+    return;
+  }}
+  var html = '';
+  for(var i=0;i<rows.length;i++){{
+    var t = rows[i];
+    var st = T_STATUS[t.status] || [t.status,'b-idle'];
+    var open = TASK_OPEN.indexOf(t.id) >= 0;
+    html += '<tr class="trow'+(open?' open':'')+'" onclick="toggleDetail(\\'' + t.id + '\\')">'
+      + '<td><span class="badge '+st[1]+'">'+esc(st[0])+'</span></td>'
+      + '<td>'+esc(T_TRIGGER[t.trigger]||t.trigger||'')+'</td>'
+      + '<td>'+esc(t.start)+' ~ '+esc(t.end)+'<div class="hint" style="margin:0">'
+      + esc(t.days)+' 天</div></td>'
+      + '<td>'+esc((t.accounts||[]).join(', '))+'</td>'
+      + '<td class="n">'+durOf(t)+'</td>'
+      + '<td>'+esc(t.startedAt)+'</td>'
+      + '<td onclick="event.stopPropagation()">'
+      + '<button class="btn sec mini" onclick="toggleDetail(\\'' + t.id + '\\')">'
+      + (open?'收起':'详情')+'</button> '
+      + '<button class="btn sec mini" onclick="taskRerun(\\'' + t.id + '\\')">重跑</button></td></tr>';
+    if(open) html += '<tr class="det"><td colspan="7" id="det-'+t.id+'">加载详情…</td></tr>';
+  }}
+  document.getElementById('taskRows').innerHTML = html;
+  for(var k=0;k<TASK_OPEN.length;k++) loadDetail(TASK_OPEN[k]);
+}}
+
+function toggleDetail(id){{
+  var i = TASK_OPEN.indexOf(id);
+  if(i>=0) TASK_OPEN.splice(i,1); else TASK_OPEN.push(id);
+  loadTasks();
+}}
+
+function loadDetail(id){{
+  fetch('/api/tasks/'+encodeURIComponent(id)).then(r=>r.json()).then(function(j){{
+    var td = document.getElementById('det-'+id);
+    if(!td) return;
+    if(!j.ok){{ td.textContent = j.error || '任务不存在'; return; }}
+    var t = j.task;
+    var errs = [];
+    var accs = t.summary && t.summary.accounts || {{}};
+    for(var k in accs){{ (accs[k].errors||[]).forEach(function(e){{ errs.push(k+': '+e); }}); }}
+    var head = '<div class="tm"><span>任务 ID <b>'+esc(t.id)+'</b></span>'
+      + '<span>完成 <b>'+esc(t.finishedAt||'—')+'</b></span>'
+      + '<span>耗时 <b>'+durOf(t)+'</b></span>'
+      + '<span>日志 <b>'+(t.logCount||0)+'</b> 行</span></div>';
+    if(t.error) head += '<div class="warn" style="margin:6px 0">失败原因：'+esc(t.error)+'</div>';
+    if(errs.length) head += '<div class="warn" style="margin:6px 0">抓取错误 '
+      + errs.length+' 条：<br>'+esc(errs.slice(0,10).join('\\n'))+'</div>';
+    head += '<pre class="tasklog">'+esc((t.log||[]).join('\\n')||'（无日志）')+'</pre>';
+    td.innerHTML = head;
+  }});
+}}
+
+function taskCancel(id){{
+  if(!confirm('确认取消该抓取任务？')) return;
+  fetch('/api/tasks/'+encodeURIComponent(id)+'/cancel', {{method:'POST'}})
+    .then(r=>r.json()).then(function(j){{
+      alert(j.ok ? (j.message||'已请求取消') : ('取消失败：'+(j.error||'')));
+      loadTasks();
+    }}).catch(function(e){{ alert('请求失败 '+e); }});
+}}
+
+function taskRerun(id){{
+  if(!confirm('按原参数重新发起一次抓取？')) return;
+  fetch('/api/tasks/'+encodeURIComponent(id)+'/rerun', {{method:'POST'}})
+    .then(r=>r.json()).then(function(j){{
+      if(j.ok){{ alert('已重新发起：'+j.start+' ~ '+j.end); loadTasks(); }}
+      else alert('重跑失败：'+(j.error||''));
+    }}).catch(function(e){{ alert('请求失败 '+e); }});
+}}
+
+function clearTasks(){{
+  if(!confirm('清空已结束的历史任务？（正在运行的任务会保留）')) return;
+  fetch('/api/tasks/clear', {{method:'POST'}}).then(r=>r.json()).then(function(j){{
+    TASK_OPEN = [];
+    loadTasks();
+  }});
+}}
 </script>
 </body></html>""")
 
@@ -416,26 +670,51 @@ def api_run(start: str | None = None, end: str | None = None,
             days: int | None = None, force: int = 0, accounts: str | None = None):
     s, e = resolve_range(start, end, days)
     accs = account_list(accounts)
-    if scrape_day.is_running():
-        return {"ok": False, "error": "已有抓取任务在运行"}
-    if not scrape_day.acquire():
-        return {"ok": False, "error": "已有抓取任务在运行"}
-
-    def _work():
-        try:
-            scrape_day.scrape(accs, s, e, force=bool(force), log=_log_progress,
-                              acquire_lock=False)
-        except Exception:  # noqa: BLE001
-            scrape_day._RUNNING.update({"active": False, "error": traceback.format_exc()[-500:]})
-            scrape_day.release()
-
-    threading.Thread(target=_work, name="scrape", daemon=True).start()
+    res = scrape_day.run_background(accs, s, e, force=bool(force),
+                                     log=_log_progress, name="scrape")
+    if not res.get("ok"):
+        return res
     return {"ok": True, "start": s, "end": e, "accounts": [a["key"] for a in accs],
             "force": bool(force)}
 
 
+@app.post("/api/run/cancel")
+def api_run_cancel(force: int = 0):
+    """有任务 → 请求取消；锁被卡死（无存活持有者）→ 直接解锁。"""
+    return {"ok": True, **scrape_day.cancel_running(force=bool(force))}
+
+
+# ---------------------------------------------------------------- 任务中心
+@app.post("/api/tasks/clear")
+def api_tasks_clear():
+    return {"ok": True, "removed": scrape_day.clear_history()}
+
+
+@app.get("/api/tasks")
+def api_tasks(limit: int = 50):
+    return {"ok": True, **scrape_day.task_list(limit)}
+
+
+@app.get("/api/tasks/{task_id}")
+def api_task_detail(task_id: str):
+    rec = scrape_day.get_task(task_id)
+    if rec is None:
+        return JSONResponse({"ok": False, "error": "任务不存在"}, status_code=404)
+    return {"ok": True, "task": rec}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def api_task_cancel(task_id: str):
+    return scrape_day.cancel_task(task_id)
+
+
+@app.post("/api/tasks/{task_id}/rerun")
+def api_task_rerun(task_id: str, force: int | None = None):
+    return scrape_day.rerun_task(task_id, force=None if force is None else bool(force))
+
+
 def _log_progress(msg: str) -> None:
-    scrape_day._RUNNING["progress"] = msg
+    scrape_day.append_log(msg)
 
 
 @app.get("/healthz", response_class=PlainTextResponse)
@@ -950,19 +1229,11 @@ def _nightly_job():
     start, end = rng
     newest = scrape_day.newest_day()
     _log_progress(f"定时任务 {start} ~ {end}（库内最新 {newest or '无'}）")
-    if scrape_day.is_running():
-        return
-    if not scrape_day.acquire():
-        return
-
-    def _work():
-        try:
-            scrape_day.scrape(settings.ACCOUNTS, start, end, force=False,
-                              log=_log_progress, acquire_lock=False)
-        except Exception:  # noqa: BLE001
-            scrape_day._RUNNING.update({"active": False, "error": traceback.format_exc()[-500:]})
-            scrape_day.release()
-    threading.Thread(target=_work, name="nightly", daemon=True).start()
+    res = scrape_day.run_background(settings.ACCOUNTS, start, end, force=False,
+                                     log=_log_progress, name="nightly",
+                                     trigger="schedule")
+    if not res.get("ok"):
+        _log_progress(f"定时任务未启动：{res.get('error')}")
 
 
 @app.on_event("startup")

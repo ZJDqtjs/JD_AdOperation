@@ -296,8 +296,39 @@ def main() -> int:
     code, body = http("/")
     check("GET / 状态", code, 200)
     check_true("控制台含数据覆盖", "数据覆盖" in body)
+    check_true("控制台含任务中心入口", "openTasks()" in body)
     code, body = http("/healthz")
     check("GET /healthz", body.strip(), "ok")
+
+    # ---------- 6) 任务中心 HTTP ----------
+    print("")
+    print("[6] 任务中心 HTTP")
+    code, body = http("/api/tasks")
+    check("GET /api/tasks 状态", code, 200)
+    tl = json.loads(body)
+    check_true("返回运行中字段", "running" in tl)
+    check_true("有历史任务", tl["count"] >= 1)
+    tid = tl["items"][0]["id"]
+    check("最新任务是成功状态", tl["items"][0]["status"], "done")
+    code, body = http("/api/tasks/" + tid)
+    check("GET /api/tasks/{id} 状态", code, 200)
+    check_true("详情带日志", len(json.loads(body)["task"]["log"]) > 1)
+    code, body = http("/api/tasks/" + tid + "/rerun", method="POST")
+    check("POST rerun 状态", code, 200)
+    rerun = json.loads(body)
+    check_true("重跑受理", rerun.get("ok") is True)
+    for _ in range(120):
+        if not scrape_day.is_running() and not scrape_day.is_locked():
+            break
+        time.sleep(0.5)
+    code, body = http("/api/tasks")
+    check("重跑后最新任务触发方式",
+          json.loads(body)["items"][0]["trigger"], "rerun")
+    code, body = http("/api/tasks/nope/cancel", method="POST")
+    check("取消未知任务被拒", json.loads(body)["ok"], False)
+    code, body = http("/api/tasks/clear", method="POST")
+    check("清空历史状态", code, 200)
+    check_true("历史已清空", json.loads(body)["removed"] >= 1)
 
     server.should_exit = True
     time.sleep(1)

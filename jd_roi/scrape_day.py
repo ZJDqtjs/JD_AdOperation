@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sys
 import threading
 import time
+import traceback
 
 from . import dailystore as ds
 from . import settings
@@ -32,10 +34,14 @@ _JST_KEY = {"jst_campaign": "campaign", "jst_sku": "sku", "jst_searchword": "sea
 # 允许直接传接口短名（campaign/sku/searchword），避免调用方传错 key 时静默失败
 _JST_KEY.update({v: v for v in ("campaign", "sku", "searchword")})
 
-_SCRAPE_LOCK = threading.Lock()
+_GUARD = threading.Lock()
+_LOCKED = False
+_LOCK_THREAD: "threading.Thread | None" = None
+_LOCK_OWNER: dict = {"name": None, "acquiredAt": None, "thread": None, "pid": None}
+_CANCEL = threading.Event()
 _RUNNING: dict = {"active": False, "account": None, "day": None, "kind": None,
                   "startedAt": None, "progress": "", "finishedAt": None, "error": None,
-                  "result": None}
+                  "cancelled": False, "result": None}
 
 
 def is_running() -> bool:
@@ -43,18 +49,330 @@ def is_running() -> bool:
 
 
 def runtime_status() -> dict:
-    return dict(_RUNNING)
+    d = dict(_RUNNING)
+    d["lock"] = lock_info()
+    d["cancelRequested"] = _CANCEL.is_set()
+    d["taskId"] = (_CURRENT or {}).get("id")
+    return d
 
 
-def acquire(timeout: float = 0) -> bool:
-    return _SCRAPE_LOCK.acquire(timeout=timeout) if timeout else _SCRAPE_LOCK.acquire(blocking=False)
+def acquire(timeout: float = 0, name: str = "") -> bool:
+    """占用抓取锁；已被占用时返回 False。"""
+    global _LOCKED, _LOCK_THREAD
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    while True:
+        with _GUARD:
+            if not _LOCKED:
+                _LOCKED = True
+                _LOCK_THREAD = threading.current_thread()
+                _LOCK_OWNER.update({"name": name or _LOCK_THREAD.name,
+                                    "acquiredAt": dt.datetime.now().isoformat(timespec="seconds"),
+                                    "thread": _LOCK_THREAD.name, "pid": os.getpid()})
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
 
 
 def release() -> None:
+    """释放抓取锁（幂等，未持有时静默返回）。"""
+    global _LOCKED, _LOCK_THREAD
+    with _GUARD:
+        if not _LOCKED:
+            return
+        _LOCKED = False
+        _LOCK_THREAD = None
+        _LOCK_OWNER.update({"name": None, "acquiredAt": None, "thread": None, "pid": None})
+
+
+def is_locked() -> bool:
+    with _GUARD:
+        return _LOCKED
+
+
+def lock_info() -> dict:
+    """锁的持有者信息。
+
+    stale=True 表示「锁被占着，但持有它的线程已经不在了」——这正是以前
+    网页触发抓取成功后忘记 release 造成的死锁状态，可以安全强制解锁。
+    """
+    with _GUARD:
+        locked = _LOCKED
+        info = dict(_LOCK_OWNER)
+        th = _LOCK_THREAD
+    alive = bool(th is not None and th.is_alive())
+    if locked and not alive and is_running():
+        alive = True  # 同步执行（CLI / 测试）时以 active 为准
+    info["locked"] = locked
+    info["alive"] = alive
+    info["stale"] = bool(locked and not alive)
+    return info
+
+
+def reset_lock(force: bool = False) -> bool:
+    """解锁卡死的锁。默认只在持有者已死（stale）时解；force=True 无条件解。"""
+    info = lock_info()
+    if not info["locked"] or (not force and not info["stale"]):
+        return False
+    release()
+    _RUNNING.update({"active": False, "cancelled": False,
+                     "progress": "已强制解锁卡死的抓取锁", "finishedAt":
+                         dt.datetime.now().isoformat(timespec="seconds")})
+    return True
+
+
+def request_cancel() -> None:
+    """请求当前抓取在最近一个检查点停下。"""
+    _CANCEL.set()
+    _RUNNING["cancelRequested"] = True
+
+
+def cancel_running(force: bool = False) -> dict:
+    """网页「取消/解锁」入口：有任务就请求取消，卡死的锁顺手解开。"""
+    running = is_running()
+    if running:
+        request_cancel()
+    else:
+        _CANCEL.clear()
+    released = reset_lock(force=bool(force))
+    return {"running": running, "cancelRequested": _CANCEL.is_set(),
+            "lockReleased": released, "status": runtime_status()}
+
+
+def run_background(accounts=None, start: str | None = None, end: str | None = None,
+                   force: bool = False, kinds=None, log=None, name: str = "scrape",
+                   trigger: str = "manual") -> dict:
+    """占锁 + 起后台线程抓取，**无论成功、失败、线程起不来，都保证释放锁**。
+
+    以前网页/定时两条路径都是「在 except 里 release」，抓取成功就漏解，
+    导致第一次抓完之后锁被永久占住，之后点抓取永远提示「已有抓取任务在运行」。
+    """
+    if not acquire(name=name):
+        return {"ok": False, "error": "已有抓取任务在运行"}
+    gen = _TASK_GEN
+
+    def _work():
+        try:
+            scrape(accounts, start, end, force=force, kinds=kinds,
+                   log=log or (lambda m: None), acquire_lock=False,
+                   trigger=trigger, name=name)
+        except Exception:  # noqa: BLE001
+            tb = traceback.format_exc()[-500:]
+            _RUNNING.update({"active": False, "error": tb})
+            if _TASK_GEN == gen:
+                # scrape 还没走到登记就崩了（例如调用签名不对）：也要在任务中心留下记录
+                d_end = ds.norm_day(end or (ds.today() - dt.timedelta(days=1)))
+                d_start = ds.norm_day(start or d_end)
+                start_task(trigger, name, d_start, d_end,
+                           [a.get("key") for a in (accounts or [])], force, kinds)
+                finish_task("failed", None, tb)
+        finally:
+            release()  # 关键：成功路径也必须解锁
+
+    th = threading.Thread(target=_work, name=name, daemon=True)
     try:
-        _SCRAPE_LOCK.release()
-    except RuntimeError:
+        th.start()
+    except Exception:  # noqa: BLE001
+        release()
+        raise
+    return {"ok": True, "start": start, "end": end, "force": bool(force),
+            "accounts": [a.get("key") for a in (accounts or [])], "name": name,
+            "trigger": trigger}
+
+
+# ---------------------------------------------------------------- 任务中心
+# 「当前任务 + 历史任务」注册表：供控制台的任务面板查看与操作。
+# 历史落盘到 <DATA_DIR>/tasks.json（Web 进程与 CLI 进程都可能写，写前会与磁盘合并）。
+_TASK_LOCK = threading.RLock()
+_CURRENT: "dict | None" = None
+_HISTORY: list = []
+_HISTORY_LOADED = False
+_TASK_GEN = 0          # 任务登记次数，用于判断「异常发生在登记之前」
+_HISTORY_MAX = 200
+_LOG_MAX = 400
+_TASKS_FILE = settings.DATA_DIR / "tasks.json"
+
+
+def _now() -> str:
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def _read_tasks_file() -> list:
+    try:
+        data = json.loads(_TASKS_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    items = data.get("tasks") if isinstance(data, dict) else data
+    return [t for t in (items or []) if isinstance(t, dict) and t.get("id")]
+
+
+def _flush_history() -> None:
+    """把内存历史与磁盘历史合并后落盘（CLI 与 Web 各自的写入互不覆盖）。
+
+    顺序按 seq（毫秒时间戳）倒序：同一秒内起的多个任务不能靠 id 里的随机后缀比大小，
+    否则「最新一条」会随机跳动。
+    """
+    merged: dict = {}
+    for t in _read_tasks_file():
+        merged[t["id"]] = t
+    for t in _HISTORY:
+        merged[t["id"]] = t
+    items = sorted(merged.values(),
+                   key=lambda t: (t.get("seq") or 0, t.get("startedAt") or ""),
+                   reverse=True)[:_HISTORY_MAX]
+    _HISTORY[:] = items
+    try:
+        _TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _TASKS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"tasks": items}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_TASKS_FILE)
+    except Exception:  # noqa: BLE001
         pass
+
+
+def _ensure_history() -> None:
+    global _HISTORY_LOADED
+    if _HISTORY_LOADED:
+        return
+    _HISTORY[:] = _read_tasks_file()[:_HISTORY_MAX]
+    _HISTORY_LOADED = True
+
+
+def _new_task_id() -> str:
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
+
+
+def start_task(trigger: str, name: str | None, start: str, end: str,
+               accounts: list, force: bool, kinds) -> dict:
+    """登记一个正在运行的任务。"""
+    global _CURRENT, _TASK_GEN
+    _TASK_GEN += 1
+    rec = {"id": _new_task_id(), "name": name or "scrape", "trigger": trigger,
+           "seq": int(time.time() * 1000), "status": "running", "start": start, "end": end,
+           "days": len(ds.day_span(start, end)), "accounts": list(accounts or []),
+           "force": bool(force), "kinds": list(kinds or []),
+           "startedAt": _now(), "finishedAt": None, "elapsedSec": None,
+           "progress": "starting", "error": None, "summary": None, "log": []}
+    with _TASK_LOCK:
+        _ensure_history()
+        _CURRENT = rec
+    return rec
+
+
+def append_log(msg: str) -> None:
+    """任务日志：既进环形缓冲，也作为当前进度展示。"""
+    _RUNNING["progress"] = msg
+    with _TASK_LOCK:
+        if _CURRENT is None:
+            return
+        _CURRENT["progress"] = msg
+        log = _CURRENT["log"]
+        log.append(f"{dt.datetime.now().strftime('%H:%M:%S')} {msg}")
+        if len(log) > _LOG_MAX:
+            del log[:len(log) - _LOG_MAX]
+
+
+def finish_task(status: str, summary=None, error: str | None = None) -> dict | None:
+    """结束当前任务并落到历史。"""
+    global _CURRENT
+    with _TASK_LOCK:
+        rec = _CURRENT
+        if rec is None:
+            return None
+        rec.update({"status": status, "finishedAt": _now(), "error": error,
+                    "summary": summary})
+        started = rec.get("startedAt")
+        try:
+            rec["elapsedSec"] = int((dt.datetime.now()
+                                     - dt.datetime.fromisoformat(started)).total_seconds())
+        except Exception:  # noqa: BLE001
+            rec["elapsedSec"] = None
+        _ensure_history()
+        _HISTORY.insert(0, rec)
+        del _HISTORY[_HISTORY_MAX:]
+        _CURRENT = None
+        _flush_history()
+    return rec
+
+
+def _trim(rec: dict, log_n: int) -> dict:
+    out = dict(rec)
+    log = out.get("log") or []
+    out["logCount"] = len(log)
+    out["log"] = log[-log_n:]
+    # 运行中的任务由服务端算耗时：浏览器和服务器可能不在同一时区，
+    # 让前端拿时间字符串自己相减会算出 8 小时的误差。
+    if out.get("status") == "running":
+        try:
+            out["elapsedSec"] = int((dt.datetime.now()
+                                     - dt.datetime.fromisoformat(out["startedAt"])).total_seconds())
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def task_list(limit: int = 50) -> dict:
+    """任务中心数据源：运行中的任务 + 历史任务（最新在前）。"""
+    limit = max(1, min(int(limit or 50), _HISTORY_MAX))
+    with _TASK_LOCK:
+        _ensure_history()
+        cur = _trim(_CURRENT, 12) if _CURRENT else None
+        items = [_trim(t, 6) for t in _HISTORY[:limit]]
+    return {"running": cur, "items": items, "count": len(items),
+            "lock": lock_info(), "cancelRequested": _CANCEL.is_set()}
+
+
+def get_task(task_id: str) -> dict | None:
+    with _TASK_LOCK:
+        if _CURRENT and _CURRENT.get("id") == task_id:
+            return json.loads(json.dumps(_trim(_CURRENT, _LOG_MAX)))
+        _ensure_history()
+        for t in _HISTORY:
+            if t.get("id") == task_id:
+                return json.loads(json.dumps(t))
+    return None
+
+
+def cancel_task(task_id: str) -> dict:
+    """取消指定任务（只对正在运行的那个生效）。"""
+    with _TASK_LOCK:
+        cur = dict(_CURRENT) if _CURRENT else None
+    if not cur or cur.get("id") != task_id:
+        return {"ok": False, "error": "该任务不在运行中，无需取消"}
+    request_cancel()
+    return {"ok": True, "taskId": task_id, "cancelRequested": True,
+            "message": "已请求取消，任务会在当前这一天结束后停止"}
+
+
+def rerun_task(task_id: str, force: bool | None = None) -> dict:
+    """按历史任务的原参数重新发起一次抓取。"""
+    rec = get_task(task_id)
+    if rec is None:
+        return {"ok": False, "error": "任务不存在"}
+    if is_running():
+        return {"ok": False, "error": "已有抓取任务在运行"}
+    keys = rec.get("accounts") or []
+    accs = [a for a in settings.ACCOUNTS if a["key"] in keys] or settings.ACCOUNTS
+    return run_background(accs, rec.get("start"), rec.get("end"),
+                          force=bool(rec.get("force") if force is None else force),
+                          log=None, name="scrape", trigger="rerun")
+
+
+def clear_history() -> int:
+    """清掉已结束任务的历史（正在运行的任务保留）。"""
+    global _HISTORY
+    with _TASK_LOCK:
+        _ensure_history()
+        n = len(_HISTORY)
+        _HISTORY.clear()
+        try:
+            _TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _TASKS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"tasks": []}, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(_TASKS_FILE)
+        except Exception:  # noqa: BLE001
+            pass
+    return n
 
 
 _JZT_FETCH = """
@@ -326,7 +644,8 @@ def fetch_oplog_range(page, acct_key: str, start: str, end: str) -> dict:
 # ---------------------------------------------------------------- 主流程
 def scrape(accounts=None, start: str | None = None, end: str | None = None,
            force: bool = False, kinds=None, log=lambda m: None,
-           acquire_lock: bool = True) -> dict:
+           acquire_lock: bool = True, trigger: str = "cli",
+           name: str | None = None) -> dict:
     """抓取 [start, end]（含）每天的数据。已存在的天默认跳过。"""
     settings.ensure_dirs()
     accounts = accounts or settings.ACCOUNTS
@@ -335,13 +654,35 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
     days = ds.day_span(start, end)
     kinds = kinds or ds.KINDS
 
-    if acquire_lock and not acquire():
+    if acquire_lock and not acquire(name="scrape"):
         raise RuntimeError("已有抓取任务在运行")
+    _CANCEL.clear()
     _RUNNING.update({"active": True, "startedAt": dt.datetime.now().isoformat(timespec="seconds"),
-                     "finishedAt": None, "error": None, "result": None, "progress": "starting"})
-    summary = {"start": start, "end": end, "accounts": {}, "startedAt": _RUNNING["startedAt"]}
+                     "finishedAt": None, "error": None, "result": None,
+                     "cancelled": False, "progress": "starting"})
+    start_task(trigger, name, start, end, [a.get("key") for a in accounts], force, kinds)
+    summary = {"start": start, "end": end, "accounts": {}, "startedAt": _RUNNING["startedAt"],
+               "cancelled": False}
+
+    raw_log = log
+
+    def log(msg):  # noqa: F811  统一走「任务日志 + 调用方回调」两条路
+        append_log(msg)
+        raw_log(msg)
+
+    def _stopped() -> bool:
+        """是否收到了取消请求（在账号之间、每天之间检查）。"""
+        if _CANCEL.is_set():
+            summary["cancelled"] = True
+            log("收到取消请求，已停止抓取")
+            return True
+        return False
+
+    err: str | None = None
     try:
         for acct in accounts:
+            if _stopped():
+                break
             key = acct["key"]
             label = acct.get("label") or key
             acc_sum = {"label": label, "days": {}, "errors": []}
@@ -393,6 +734,8 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
 
                 sz = {}
                 for day in todo:
+                    if _stopped():
+                        break
                     _RUNNING["day"] = day
                     got = []
                     for kind, fn in (("jzt_campaign", lambda: fetch_jzt_day(p_jzt, day)),
@@ -452,12 +795,20 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                 except Exception:  # noqa: BLE001
                     pass
             ds.invalidate_cache(key)
+    except BaseException as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
-        _RUNNING.update({"active": False, "finishedAt": dt.datetime.now().isoformat(timespec="seconds"),
-                         "result": summary})
+        finished = dt.datetime.now().isoformat(timespec="seconds")
+        cancelled = bool(summary.get("cancelled"))
+        status = "failed" if err else ("cancelled" if cancelled else "done")
+        _RUNNING.update({"active": False, "finishedAt": finished, "cancelled": cancelled,
+                         "error": err, "result": summary})
+        _CANCEL.clear()
+        finish_task(status, summary, err)
         if acquire_lock:
             release()
-    ds.write_state(lastRun=summary, lastRunAt=_RUNNING["finishedAt"])
+    ds.write_state(lastRun=summary, lastRunAt=finished)
     return summary
 
 
