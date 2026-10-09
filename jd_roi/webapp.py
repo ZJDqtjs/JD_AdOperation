@@ -303,7 +303,7 @@ def dashboard(request: Request):
 <style>{report2.UI_CSS}</style></head><body>
 <header class="top"><div class="wrap">
   <h1>京东广告运营分析服务</h1>
-  <div class="metaline">按天自动入库 · 任意区间聚合分析 · 每天 {settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d}（{_e(settings.TZ)}）抓取前一天</div>
+  <div class="metaline">按天自动入库 · 任意区间聚合分析 · 每天 {settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d}（±{settings.SCHEDULE_JITTER_MIN} 分钟浮动，{_e(settings.TZ)}）抓取前一天</div>
   {_range_bar(start, end, keys, "/report")}
 </div></header>
 <div class="wrap">
@@ -723,6 +723,9 @@ def api_status():
                       "ageSec": (None if not cached.get("_fetched_at")
                                  else round(settings.time_ago(cached.get("_fetched_at"))))},
             "schedule": {"hour": settings.SCHEDULE_HOUR, "minute": settings.SCHEDULE_MINUTE,
+                         "jitterMin": settings.SCHEDULE_JITTER_MIN,
+                         "todayAt": _schedule_target()[0].strftime("%Y-%m-%d %H:%M"),
+                         "todayOffset": _schedule_target()[1],
                          "refreshDays": settings.REFRESH_DAYS},
             "accounts": [{"key": a["key"], "label": a.get("label")} for a in settings.ACCOUNTS],
             "scrape": scrape_day.runtime_status(),
@@ -1685,7 +1688,7 @@ def api_login_qr():
 
 # ================================================================ 调度
 def _nightly_job():
-    """每天 0 点后回刷最近 REFRESH_DAYS 天，并补齐停机期间的空洞。"""
+    """回刷最近 REFRESH_DAYS 天，并补齐停机期间的空洞。"""
     rng = scrape_day.catchup_range()
     if rng is None:
         _log_progress("数据已是最新，无需抓取")
@@ -1700,6 +1703,59 @@ def _nightly_job():
         _log_progress(f"定时任务未启动：{res.get('error')}")
 
 
+def _schedule_target(dt=None):
+    """算出「今天的抓取时刻」= 基准时间 ± SCHEDULE_JITTER_MIN 分钟（每天一个固定随机值）。
+
+    同一天内多次调用返回同一时刻（用日期做随机种子），保证「检查型调度」不会
+    重复触发或错过；跨天重新抽一次随机偏移。
+    """
+    from datetime import timedelta
+    import random
+    dt = dt or dt_now()
+    rnd = random.Random(f"jdsched-{dt.date().isoformat()}")
+    jit = max(settings.SCHEDULE_JITTER_MIN, 0)
+    offset = rnd.randint(-jit, jit)
+    base = dt.replace(hour=settings.SCHEDULE_HOUR,
+                      minute=settings.SCHEDULE_MINUTE,
+                      second=0, microsecond=0)
+    return base + timedelta(minutes=offset), offset
+
+
+def dt_now():
+    """带时区的当前时间（用 settings.TZ）。"""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(settings.TZ))
+    except Exception:  # noqa: BLE001
+        from datetime import timezone, timedelta
+        return datetime.now(timezone(timedelta(hours=8)))
+
+
+def _scheduler_tick():
+    """每分钟检查：是否已到今天的抓取时刻（含随机浮动），到了就触发一次。"""
+    now = dt_now()
+    target, offset = _schedule_target(now)
+    today = now.date().isoformat()
+    with _sched_lock:
+        if _sched_state.get("ran_date") == today:
+            return                      # 今天已跑过
+        if now < target:
+            return                      # 还没到点
+        _sched_state["ran_date"] = today
+    _log_progress(f"定时调度触发（基准 {settings.SCHEDULE_HOUR:02d}:"
+                  f"{settings.SCHEDULE_MINUTE:02d}，本次浮动 {offset:+d} 分钟，"
+                  f"实际 {target.strftime('%H:%M')}）")
+    try:
+        _nightly_job()
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"定时任务异常：{type(exc).__name__}: {exc}")
+
+
+_sched_lock = threading.Lock()
+_sched_state = {}
+
+
 @app.on_event("startup")
 def _startup():
     settings.ensure_dirs()
@@ -1710,16 +1766,19 @@ def _startup():
     if settings.ENABLE_SCHEDULER:
         try:
             from apscheduler.schedulers.background import BackgroundScheduler
-            from apscheduler.triggers.cron import CronTrigger
+            from apscheduler.triggers.interval import IntervalTrigger
             sch = BackgroundScheduler(timezone=settings.TZ)
-            sch.add_job(_nightly_job, CronTrigger(hour=settings.SCHEDULE_HOUR,
-                                                  minute=settings.SCHEDULE_MINUTE,
-                                                  timezone=settings.TZ),
-                        id="nightly", replace_existing=True, misfire_grace_time=3600)
+            # 每分钟检查一次：是否已到「今天的基准时间 ± 随机浮动」那一刻。
+            # 用检查型而非固定 cron，才能实现每天不同的浮动时刻。
+            sch.add_job(_scheduler_tick, IntervalTrigger(minutes=1, timezone=settings.TZ),
+                        id="nightly", replace_existing=True,
+                        max_instances=1, coalesce=True, misfire_grace_time=120)
             sch.start()
             app.state.scheduler = sch
-            print(f"[webapp] 调度已启动：每天 {settings.SCHEDULE_HOUR:02d}:"
-                  f"{settings.SCHEDULE_MINUTE:02d} ({settings.TZ})", flush=True)
+            _t, _off = _schedule_target()
+            print(f"[webapp] 调度已启动：基准 {settings.SCHEDULE_HOUR:02d}:"
+                  f"{settings.SCHEDULE_MINUTE:02d} ± {settings.SCHEDULE_JITTER_MIN} 分钟"
+                  f"（{settings.TZ}）｜今天实际 { _t.strftime('%H:%M') }", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[webapp] 调度启动失败：{exc}", flush=True)
     if settings.RUN_ON_START:

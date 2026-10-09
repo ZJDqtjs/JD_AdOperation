@@ -127,8 +127,11 @@ STATE_FILE = DATA_DIR / "state.json"
 
 # ---------------- 调度 ----------------
 TZ = _env("JD_TZ", _env("TZ", "Asia/Shanghai")) or "Asia/Shanghai"
-SCHEDULE_HOUR = _env_int("JD_SCHEDULE_HOUR", 0)
-SCHEDULE_MINUTE = _env_int("JD_SCHEDULE_MINUTE", 5)
+# 抓取的「基准时间」（本地时区）。默认凌晨 1:00 开始（等商智前一日数据结算完）。
+SCHEDULE_HOUR = _env_int("JD_SCHEDULE_HOUR", 1)
+SCHEDULE_MINUTE = _env_int("JD_SCHEDULE_MINUTE", 0)
+# 在基准时间上随机浮动 ±N 分钟（默认 30）。避免每天精确同一秒抓取被风控识别为机器行为。
+SCHEDULE_JITTER_MIN = _env_int("JD_SCHEDULE_JITTER", 30)
 # 每晚回刷最近 N 天：京准通是「点击后15天归因」，昨天的数据后面还会长，必须反复刷新
 REFRESH_DAYS = _env_int("JD_REFRESH_DAYS", 15)
 RUN_ON_START = _env_bool("JD_RUN_ON_START", True)
