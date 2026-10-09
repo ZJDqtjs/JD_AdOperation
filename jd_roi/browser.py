@@ -39,22 +39,19 @@ def launch_persistent(headless: bool | None = None, account: str | None = None):
     return pw, context
 
 
-def launch_with_state(headless: bool | None = None):
-    """使用已保存的 storage_state 启动（抓取/复跑用）。"""
+def launch_with_state(headless: bool | None = None, account: str | None = None):
+    """按账号打开**持久化 Profile**（凭据唯一权威来源）。
+
+    历史说明：早期版本用 storage_state(jd_state.json) 起临时上下文，但那份快照
+    会独立过期、且与实际在用的 Profile 不同步，是「登录态误判」的来源之一。
+    现在抓取/复跑一律走持久化 Profile（含 cookies + localStorage，最稳），
+    本函数保留签名以兼容旧调用，内部已改为委托给 launch_persistent()。
+
+    返回 (playwright, context)；不再返回 browser（持久化上下文自带）。
+    """
     _ensure_dirs()
-    if not config.STORAGE_STATE.exists():
-        raise FileNotFoundError(
-            f"未找到登录态文件 {config.STORAGE_STATE}，请先运行登录脚本。"
-        )
-    headless = config.HEADLESS if headless is None else headless
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=headless)
-    context = browser.new_context(
-        storage_state=str(config.STORAGE_STATE),
-        viewport={"width": 1440, "height": 900},
-        locale="zh-CN",
-    )
-    return pw, browser, context
+    pw, context = launch_persistent(headless=headless, account=account)
+    return pw, context
 
 
 def has_login(context: BrowserContext) -> bool:

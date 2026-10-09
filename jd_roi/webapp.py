@@ -317,8 +317,10 @@ def dashboard(request: Request):
   <div class="kpi"><div class="lbl">登录状态</div>
     <div class="val" style="font-size:16px" id="loginVal"><span class="badge b-idle">未检查</span></div>
     <div class="hint" id="loginHint">点击「检查登录」确认落盘登录态是否有效</div>
+    <div class="hint" id="keepHint" style="color:#6b7280">保活：—</div>
     <div class="hint" style="margin-top:6px">
       <button class="btn sec mini" onclick="checkLogin()">检查登录</button>
+      <button class="btn sec mini" onclick="keepNow()">立即续期</button>
       <a href="/login" style="margin-left:6px">扫码 / 账号密码登录 →</a>
     </div></div>
   <div class="kpi"><div class="lbl">抓取回刷窗口</div><div class="val" style="font-size:16px">最近 {settings.REFRESH_DAYS} 天</div>
@@ -430,7 +432,35 @@ function checkLogin(){{
     setTimeout(loadLogin, 1500);
   }}).catch(function(e){{ if(hint) hint.textContent='请求失败 '+e; }});
 }}
+function fmtAgo(ts){{
+  if(!ts) return '—';
+  var s=Math.max(0, Math.floor(Date.now()/1000 - ts));
+  if(s<60) return s+' 秒前';
+  if(s<3600) return Math.floor(s/60)+' 分钟前';
+  return Math.floor(s/3600)+' 小时前';
+}}
+function renderKeep(j){{
+  var el=document.getElementById('keepHint');
+  if(!el) return;
+  if(!j.enabled){{ el.textContent='保活：已关闭（JD_KEEPALIVE=0）'; return; }}
+  var mins=Math.round((j.intervalSec||0)/60);
+  var st={{running:'运行中', stopped:'已停止', error:'异常'}}[j.state]||j.state;
+  el.textContent='保活：'+st+' · 每 '+mins+' 分钟自动续期 · 上次 '+fmtAgo(j.lastAt)
+    + (j.count? ' · 已续 '+j.count+' 次':'');
+}}
+function loadKeep(){{
+  fetch('/api/login/keepalive').then(r=>r.json()).then(renderKeep).catch(function(e){{}});
+}}
+function keepNow(){{
+  var el=document.getElementById('keepHint');
+  if(el) el.textContent='正在续期…（需打开浏览器，约 10~40 秒）';
+  fetch('/api/login/keepalive/now', {{method:'POST'}}).then(r=>r.json()).then(function(j){{
+    renderKeep(j); loadLogin();
+  }}).catch(function(e){{ if(el) el.textContent='续期失败 '+e; }});
+}}
 loadLogin();
+loadKeep();
+setInterval(loadKeep, 30000);
 function doRun(force, s, e){{
   var qs = new URLSearchParams();
   qs.set('start', s || document.getElementById('runStart').value);
@@ -806,6 +836,18 @@ class LoginSession:
         self.check_state = "idle"         # idle | checking | done | error
         self.check_message = ""
         self.check_updated_at = 0.0
+        # 登录态保活（京准通的 sdtoken 只有 ~30 分钟，必须定时「用一下」才不被踢）
+        self._keep_thread = None
+        self._keep_stop = threading.Event()
+        self.keep_state = "idle"          # idle | running | stopped | error
+        self.keep_message = ""
+        self.keep_last_at = 0.0           # 最近一次保活时间
+        self.keep_last_ok = {}            # {accountKey: bool}
+        self.keep_last_requests = {}      # {accountKey: [保活类请求 URL]} 用于确认模仿生效
+        self.keep_count = 0               # 累计保活次数
+        # Profile 占用锁：同一个 user_data_dir 不能被两个上下文同时打开
+        # （登录/检查/保活/导出都会启动浏览器，必须串行，否则报 Profile 被占用）
+        self._profile_lock = threading.Lock()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -855,6 +897,10 @@ class LoginSession:
                 if self._check_stop.is_set():
                     break
                 self._set_account_state(key, "checking", "检查中…")
+                # 串行化浏览器启动，避免与保活/登录抢同一个 Profile
+                if not self._profile_lock.acquire(timeout=180):
+                    self._set_account_state(key, "error", "浏览器占用中，请稍后重试")
+                    continue
                 pw = ctx = None
                 try:
                     pw, ctx = launch_persistent(headless=True, account=key)
@@ -885,6 +931,10 @@ class LoginSession:
                         pw and pw.stop()
                     except Exception:  # noqa: BLE001
                         pass
+                    try:
+                        self._profile_lock.release()
+                    except Exception:  # noqa: BLE001
+                        pass
             if self._check_stop.is_set():
                 self._set_check(check_state="done", check_message="检查已取消")
             else:
@@ -892,6 +942,217 @@ class LoginSession:
                                 check_message=f"检查完成：{n_ok}/{len(keys)} 个账号登录有效")
         except Exception as exc:  # noqa: BLE001
             self._set_check(check_state="error", check_message=f"检查出错：{type(exc).__name__}")
+
+    # ---------------- 登录态保活（方案 A） ----------------
+    # 京准通会话凭据 sdtoken 约 30 分钟失效。京麦客户端不掉线的做法就是「后台定时轮询」，
+    # 不断向服务端发请求把会话续上；无人值守的后台进程同理，必须主动「用一下」。
+    # 这里每 KEEPALIVE_INTERVAL 秒（默认 20 分钟，< 30 分钟账期）逐个账号访问一次京准通，
+    # 触发服务端下发新的 sdtoken，从而把登录态一直保持住。
+    def keepalive_snapshot(self) -> dict:
+        with self._lock:
+            return {"enabled": settings.KEEPALIVE_ENABLED,
+                    "state": self.keep_state, "message": self.keep_message,
+                    "intervalSec": settings.KEEPALIVE_INTERVAL,
+                    "lastAt": self.keep_last_at, "count": self.keep_count,
+                    "pages": list(settings.KEEPALIVE_PAGES) or ["（默认：京准通首页）"],
+                    "accounts": {k: bool(v) for k, v in self.keep_last_ok.items()},
+                    "requests": {k: list(v) for k, v in self.keep_last_requests.items()}}
+
+    def start_keepalive(self) -> bool:
+        """启动保活线程（幂等：已在跑则不重复启动）。"""
+        if not settings.KEEPALIVE_ENABLED:
+            self._set_keep(state="stopped", message="保活已关闭（JD_KEEPALIVE=0）")
+            return False
+        with self._lock:
+            if self._keep_thread is not None and self._keep_thread.is_alive():
+                return False
+            self.keep_state = "running"
+            self.keep_message = "保活已启动"
+            self.keep_last_at = time.time()
+        self._keep_stop.clear()
+        self._keep_thread = threading.Thread(target=self._loop_keepalive,
+                                             name="login-keepalive", daemon=True)
+        self._keep_thread.start()
+        return True
+
+    def stop_keepalive(self) -> None:
+        self._keep_stop.set()
+        self._set_keep(state="stopped", message="保活已停止")
+
+    def _set_keep(self, **kv):
+        with self._lock:
+            self.__dict__.update(kv)
+
+    def _loop_keepalive(self) -> None:
+        import random
+        interval = max(settings.KEEPALIVE_INTERVAL, 60)
+        jitter = max(settings.KEEPALIVE_JITTER, 0)
+        # 启动时先等一小会儿，避免和启动补跑/调度抢资源
+        if self._keep_stop.wait(30):
+            return
+        while not self._keep_stop.is_set():
+            n_ok = self._keepalive_once()
+            with self._lock:
+                self.keep_count += 1
+                self.keep_last_at = time.time()
+                self.keep_message = f"最近一次保活：{n_ok} 个账号会话有效"
+            wait = interval + random.randint(0, jitter) if jitter else interval
+            if self._keep_stop.wait(wait):
+                break
+
+    def _keepalive_pages(self) -> list:
+        """保活时依次访问的页面。默认用京准通首页；可用 JD_KEEPALIVE_PAGES 覆盖。
+
+        模仿京麦的关键：打开**真实业务页**后停留几秒，页面前端脚本会自动发出
+        三层心跳 —— sso.jd.com/sso/rac（续期，带 SET-COOKIE flash）、
+        blackhole bypass（风控）、sgm-w/h5（埋点）。我们只需"真的打开页面"，
+        续期签名由页面 JS 自己生成，无需手搓。
+        """
+        from . import config
+        pages = list(settings.KEEPALIVE_PAGES) or [config.JZT_HOME]
+        return pages
+
+    def _keepalive_once(self) -> int:
+        """逐个账号「像真人一样」打开业务页并停留，让页面自发心跳续期会话。
+
+        返回仍有效的账号数。同时把本次实际发出的保活类请求记进 last_requests，
+        便于在控制台确认模仿是否生效。
+        """
+        from . import config
+        from .browser import has_login, launch_persistent, session_ok
+        pages = self._keepalive_pages()
+        dwell = max(int(settings.KEEPALIVE_DWELL_MS), 1500)
+        n_ok = 0
+        keys = [a["key"] for a in settings.ACCOUNTS]
+        for key in keys:
+            if self._keep_stop.is_set():
+                break
+            # 有别的登录流程在跑（扫码/密码）就别抢同一个 Profile
+            with self._lock:
+                busy = self.state in ("starting", "waiting")
+            if busy:
+                time.sleep(2)
+                continue
+            # 串行化浏览器启动，避免与「检查登录 / 导出」抢同一个 user_data_dir
+            if not self._profile_lock.acquire(timeout=120):
+                with self._lock:
+                    self.keep_last_ok[key] = False
+                continue
+            pw = ctx = None
+            seen = []          # 本次观察到的保活类请求
+            try:
+                pw, ctx = launch_persistent(headless=True, account=key)
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+                def _on_req(req, seen=seen):
+                    u = req.url
+                    if any(k in u for k in ("sso.jd.com/sso/rac", "blackhole.m.jd.com/bypass",
+                                             "sgm-w.jd.com/h5", "sgm-m.jd.com/h5/init")):
+                        seen.append(u.split("?")[0])
+                try:
+                    page.on("request", _on_req)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                if not has_login(ctx):
+                    with self._lock:
+                        self.keep_last_ok[key] = False
+                    continue
+                # 依次打开业务页并停留，让页面 JS 把三层心跳都发完（模仿京麦）
+                for purl in pages:
+                    if self._keep_stop.is_set():
+                        break
+                    try:
+                        page.goto(purl, wait_until="domcontentloaded", timeout=60000)
+                        page.wait_for_timeout(dwell)
+                    except Exception:  # noqa: BLE001  单页失败不影响整体
+                        pass
+                ok = session_ok(page)
+                with self._lock:
+                    self.keep_last_ok[key] = bool(ok)
+                    self.keep_last_requests[key] = seen[:20]
+                if ok:
+                    n_ok += 1
+                    if settings.KEEPALIVE_EXPORT_STATE:
+                        self._save_state_snapshot(ctx, key)
+            except Exception:  # noqa: BLE001  单账号失败不影响其他账号与后续循环
+                with self._lock:
+                    self.keep_last_ok[key] = False
+                    self.keep_last_requests[key] = seen[:20]
+            finally:
+                try:
+                    ctx and ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    pw and pw.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self._profile_lock.release()
+                except Exception:  # noqa: BLE001
+                    pass
+        return n_ok
+
+    # ---------------- 统一凭据源（方案 B） ----------------
+    # 以前登录成功时同时写 Profile（cookies）和 auth/jd_state.json（storage_state），
+    # 两份各自过期、互不同步，是「状态误判」的来源之一。
+    # 现在 Profile 作为唯一权威来源；jd_state.json 只在需要时从 Profile 导出快照，
+    # 保证它永远和 Profile 一致（不再是独立的一份登录态）。
+    @staticmethod
+    def _state_target(account: str):
+        """主账号沿用 jd_state.json；其他账号用 jd_state_<key>.json。"""
+        from . import config
+        return (config.STORAGE_STATE if account == settings.MAIN_ACCOUNT
+                else config.AUTH_DIR / f"jd_state_{account}.json")
+
+    def _save_state_snapshot(self, ctx, account: str) -> None:
+        """把当前持久化上下文导出为 storage_state 快照（备份用，Profile 仍是权威源）。
+
+        仅作离线备份/迁移用途；抓取一律直接读 Profile，不再依赖这份 json。
+        导出失败不影响登录成功判定。
+        """
+        try:
+            target = self._state_target(account)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            ctx.storage_state(path=str(target))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def export_state_from_profiles(self) -> dict:
+        """把每个账号落盘 Profile 的当前 storage_state 导出到 jd_state.json（供迁移/备份）。"""
+        from .browser import has_login, launch_persistent
+        result = {}
+        for a in settings.ACCOUNTS:
+            key = a["key"]
+            if not self._profile_lock.acquire(timeout=180):
+                result[key] = "busy"
+                continue
+            pw = ctx = None
+            try:
+                pw, ctx = launch_persistent(headless=True, account=key)
+                if not has_login(ctx):
+                    result[key] = "no-login"
+                    continue
+                target = self._state_target(key)
+                ctx.storage_state(path=str(target))
+                result[key] = str(target)
+            except Exception as exc:  # noqa: BLE001
+                result[key] = f"error:{type(exc).__name__}"
+            finally:
+                try:
+                    ctx and ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    pw and pw.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self._profile_lock.release()
+                except Exception:  # noqa: BLE001
+                    pass
+        return result
 
     def _set(self, **kv):
         with self._lock:
@@ -903,12 +1164,16 @@ class LoginSession:
 
         同一个 user_data_dir 不能被两个持久化上下文同时打开，所以「换一种方式重新登录」
         必须先等旧线程退出、把旧浏览器关掉，否则新上下文会因 Profile 被占用而启动失败。
+        另外，保活线程也会周期性地打开 Profile，登录前必须先把它停掉并拿住占用锁。
         """
         t = self._thread
         if t is not None and t.is_alive():
             self._stop.set()
             t.join(timeout)
         self._stop.clear()
+        # 等保活当前这一轮结束并释放 Profile 锁（保活线程随后会自己跳过 busy 的账号）
+        self._profile_lock.acquire(timeout=180)
+        self._profile_lock.release()
 
     def start(self, account: str | None = None, replace: bool = False) -> bool:
         with self._lock:
@@ -1159,7 +1424,7 @@ class LoginSession:
             while time.time() < deadline and not self._stop.is_set():
                 # 必须由服务端确认：cookie 还在但会话过期时 has_login 会误判
                 if has_login(ctx) and session_ok(page):
-                    ctx.storage_state(path=str(config.STORAGE_STATE))
+                    self._save_state_snapshot(ctx, account)
                     self._set(state="logged_in", message="登录成功，登录态已保存", qr_png=None)
                     return
                 if not told_verify and self._needs_verify(page):
@@ -1206,7 +1471,7 @@ class LoginSession:
             while time.time() < deadline and not self._stop.is_set():
                 # 必须由服务端确认：只看 cookie 会在会话过期时误判为「已登录」
                 if has_login(ctx) and session_ok(page):
-                    ctx.storage_state(path=str(config.STORAGE_STATE))
+                    self._save_state_snapshot(ctx, account)
                     self._set(state="logged_in", message="登录成功，登录态已保存", qr_png=None)
                     return
                 if time.time() - last_shot > 20:
@@ -1364,6 +1629,40 @@ def api_login_accounts():
     return {"ok": True, **snap}
 
 
+@app.get("/api/login/keepalive")
+def api_login_keepalive():
+    """登录态保活状态（每 N 分钟自动续一次会话）。"""
+    return {"ok": True, **_login.keepalive_snapshot()}
+
+
+@app.post("/api/login/keepalive/start")
+def api_login_keepalive_start():
+    ok = _login.start_keepalive()
+    return {"ok": ok, "error": None if ok else "保活已在运行或已关闭"}
+
+
+@app.post("/api/login/keepalive/stop")
+def api_login_keepalive_stop():
+    _login.stop_keepalive()
+    return {"ok": True}
+
+
+@app.post("/api/login/keepalive/now")
+def api_login_keepalive_now():
+    """立刻续一次（不想等下一个周期时用），同步执行、可能耗时数十秒。"""
+    n = _login._keepalive_once()
+    with _login._lock:
+        _login.keep_last_at = time.time()
+        _login.keep_message = f"手动续期：{n} 个账号会话有效"
+    return {"ok": True, "alive": n, **_login.keepalive_snapshot()}
+
+
+@app.post("/api/login/export-state")
+def api_login_export_state():
+    """把 Profile 的登录态导出成 storage_state（统一凭据源，方案 B）。"""
+    return {"ok": True, "result": _login.export_state_from_profiles()}
+
+
 @app.post("/api/login/cancel")
 def api_login_cancel():
     _login.cancel()
@@ -1404,6 +1703,10 @@ def _nightly_job():
 @app.on_event("startup")
 def _startup():
     settings.ensure_dirs()
+    if settings.KEEPALIVE_ENABLED:
+        _login.start_keepalive()
+        print(f"[webapp] 登录态保活已启动：每 {settings.KEEPALIVE_INTERVAL // 60} 分钟续一次会话",
+              flush=True)
     if settings.ENABLE_SCHEDULER:
         try:
             from apscheduler.schedulers.background import BackgroundScheduler
@@ -1434,6 +1737,10 @@ def _startup():
 
 @app.on_event("shutdown")
 def _shutdown():
+    try:
+        _login.stop_keepalive()
+    except Exception:  # noqa: BLE001
+        pass
     sch = getattr(app.state, "scheduler", None)
     if sch:
         try:

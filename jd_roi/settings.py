@@ -71,6 +71,23 @@ COSTS_TOKEN = (_env("JD_COSTS_TOKEN", "") or "").strip()
 COSTS_TIMEOUT = _env_int("JD_COSTS_TIMEOUT", 20)
 COSTS_TTL = _env_int("JD_COSTS_TTL", 6 * 3600)          # 拉到的结果本地缓存 6 小时
 COSTS_CACHE_FILE = Path(_env("JD_COSTS_CACHE", str(DATA_DIR / "costs_cache.json")) or ".")
+# ---- 登录态保活 ----
+# 京准通的会话凭据 sdtoken 只有约 30 分钟有效期，无人操作的后台进程必须定时「用一下」
+# 才能续期（京麦客户端就是这么做的）。这里让 Web 服务常驻时按固定间隔访问京准通首页，
+# 由服务端下发新的 sdtoken，从而避免「过一天就要重新登录」。
+KEEPALIVE_ENABLED = _env_bool("JD_KEEPALIVE", True)
+KEEPALIVE_INTERVAL = _env_int("JD_KEEPALIVE_INTERVAL", 20 * 60)   # 秒；默认 20 分钟（< 30 分钟账期）
+KEEPALIVE_JITTER = _env_int("JD_KEEPALIVE_JITTER", 120)           # 每次随机抖动，避免固定节奏被风控
+# 保活时依次访问的页面（逗号分隔）。模仿京麦：打开真实业务页 → 页面 JS 会自发
+# 三层心跳（sso/rac 续期、bypass 风控、sgm 埋点），比只访问首页更接近真人使用。
+# 顺序访问 + 每页停留数秒，让前端脚本有时间把心跳发出去。
+KEEPALIVE_PAGES = [
+    p.strip() for p in (_env("JD_KEEPALIVE_PAGES", "") or "").split(",") if p.strip()
+]
+KEEPALIVE_DWELL_MS = _env_int("JD_KEEPALIVE_DWELL", 8000)         # 每个页停留毫秒（等 JS 发心跳）
+# 是否在保活时顺带把 Profile 导出成 storage_state 快照（备份；默认不写，省 IO）
+KEEPALIVE_EXPORT_STATE = _env_bool("JD_KEEPALIVE_EXPORT_STATE", False)
+
 # 1 = 按所选区间向接口要均值（会带 date_from/date_to）；0 = 用供货方默认（近 30 天）
 COSTS_FOLLOW_WINDOW = _env_bool("JD_COSTS_FOLLOW_WINDOW", True)
 # 本次报表实际用的成本口径来源，供报表展示（不入库）

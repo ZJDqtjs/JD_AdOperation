@@ -72,3 +72,6 @@ Desktop.ini
 
 # ---- agent 本地记忆（含真实 SKU / 经营数字，不入库）----
 .workbuddy/
+
+# ---- 报表产物（含真实商品别名/经营数据/隐私账号，不入库）----
+account_b_plan_review.html
