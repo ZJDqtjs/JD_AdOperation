@@ -262,4 +262,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _code = main()
+    import shutil
+    shutil.rmtree(TMP, ignore_errors=True)
+    sys.exit(_code)
