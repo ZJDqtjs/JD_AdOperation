@@ -167,6 +167,14 @@ function applyAcct(btn){
     tr.style.display=(val==='all'||t.indexOf(val)>=0)?'':'none';
   });
 }
+function applyWordType(btn){
+  var val=btn.dataset.w; var card=btn.closest('.card');
+  card.querySelectorAll('.toolbar .chip').forEach(function(c){c.classList.remove('on');});
+  btn.classList.add('on');
+  card.querySelectorAll('[data-wtype]').forEach(function(b){
+    b.style.display=(val==='all'||b.dataset.wtype===val)?'':'none';
+  });
+}
 function toggleWords(btn){
   var d=btn.nextElementSibling;
   if(!d) return;
@@ -907,8 +915,35 @@ def _word_pills(items, kind) -> str:
     return "".join(out)
 
 
+WLABEL = {"kw": "关键词推广", "smart": "智能化推广", "other": "其他推广"}
+
+
+def _wtype_of(name, t):
+    """把搜索词分组按推广类型归类：关键词推广 / 智能化推广 / 其他。
+
+    智能化(61)与全站智能推广(153)的词由系统自动调控、人工改不了，必须与关键词计划分开看。
+    搜索词接口只回计划名（没有 campaignType），所以先拿计划名回查 d["plans"]，
+    查不到再按计划名里的「智能 / 关键词 / 快车」兜底判断。
+    """
+    if t == 2:
+        return "kw"
+    if t in (61, 153):
+        return "smart"
+    nm = name or ""
+    if "智能" in nm:
+        return "smart"
+    if "关键词" in nm or "快车" in nm:
+        return "kw"
+    return "other"
+
+
 def page_word(d) -> str:
-    pmap = {}
+    # 搜索词接口只有计划名、没有 campaignType，用 d["plans"] 的 (账号, 计划名) 回查推广类型
+    tmap = {}
+    for p in (d.get("plans") or []):
+        nm = (p.get("name") or "").strip()
+        if nm:
+            tmap[(p.get("account"), nm)] = p.get("type")
     out = []
     for a in d["accounts"]:
         k = a["key"]
@@ -917,10 +952,13 @@ def page_word(d) -> str:
         per = wins.get(wk) or {}
         agg = {"good": [], "waste": [], "low": []}
         blocks = []
+        counts = {"kw": 0, "smart": 0, "other": 0}
         for cid, v in sorted(per.items(), key=lambda x: -sum(w["cost"] for w in x[1]["sw"]))[:14]:
             sw = v.get("sw") or []
             if not sw:
                 continue
+            wt = _wtype_of(cid, tmap.get((k, (cid or "").strip())))
+            counts[wt] += 1
             g = [w for w in sw if w["kind"] == "good"][:12]
             wa = [w for w in sw if w["kind"] == "waste"][:12]
             lo = [w for w in sw if w["kind"] == "low"][:8]
@@ -930,9 +968,9 @@ def page_word(d) -> str:
             cost = sum(w["cost"] for w in sw)
             roi = sum(w["amt"] for w in sw) / cost if cost else 0
             blocks.append(f"""
-<div style="border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px">
+<div data-wtype="{wt}" style="border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px">
   <div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap">
-    <b>{_e(cid)}</b>
+    <b>{_e(cid)}</b> <span class="pill">{WLABEL[wt]}</span>
     <span class="mini">搜索词下：花费 ¥{_money(cost)} · ROI {roi:.2f} · 高效 {len(g)} / 废词 {len(wa)} / 低效 {len(lo)}</span>
   </div>
   <div style="margin-top:8px"><span class="mini">✅ 高效词（提价/加词）</span><br>{_word_pills(g, "good")}</div>
@@ -941,6 +979,12 @@ def page_word(d) -> str:
 </div>""")
         wa_cost = sum(w["cost"] for w in agg["waste"])
         wa_top = sorted(agg["waste"], key=lambda x: -x["cost"])[:8]
+        chips = "".join(
+            f'<div class="chip{" on" if ck == "all" else ""}" data-w="{ck}" onclick="applyWordType(this)">{_e(cv)}</div>'
+            for ck, cv in [("all", f"全部 {sum(counts.values())}"),
+                           ("kw", f"关键词 {counts['kw']}"),
+                           ("smart", f"智能化 {counts['smart']}"),
+                           ("other", f"其他 {counts['other']}")])
         out.append(f"""
 <div class="card">
   <h2>{_e(a["label"])} · 搜索词诊断 <span class="tagline">{_e(wk)} 窗口，按花费排序前 14 个计划</span></h2>
@@ -948,6 +992,8 @@ def page_word(d) -> str:
     高效词 {len(agg["good"])} 个 · 0单废词 {len(agg["waste"])} 个（浪费 ¥{_money(wa_cost)}）· 低效词 {len(agg["low"])} 个。
     判定标准：高效=订单≥2 且 ROI&gt;4.00；废词=花费≥3 且 0 单；低效=花费≥10 且 ROI&lt;4.00。
   </p>
+  <div class="toolbar" style="margin:2px 0 6px">{chips}</div>
+  <p class="mini" style="margin:0 0 10px">智能化 / 全站智能推广计划的词由系统自动调控，<b>不能手工增删</b>；要调词请切到「关键词」。</p>
   <div class="dangerbox"><b>最该否定的词</b>：{'、'.join(f'{_e(w["word"])}(¥{_money(w["cost"])})' for w in wa_top) or '无'}</div>
   {''.join(blocks) or '<p class="hint">该账号本窗口没有搜索词数据。</p>'}
 </div>""")
