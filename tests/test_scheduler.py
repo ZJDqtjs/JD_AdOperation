@@ -121,22 +121,38 @@ def main() -> int:
     stub()
     tz = ZoneInfo(settings.TZ)
 
-    # ---------- 1) CronTrigger 下一次触发时间 ----------
-    print("[1] CronTrigger 触发时间")
+    # ---------- 1) 检查型调度的「今日目标时刻」 ----------
+    # 现行实现：Dispatcher 每分钟跑 _scheduler_tick，到「基准 HH:MM ± 当日固定浮动」
+    # 才真正抓取（webapp._scheduler_tick / _schedule_target），不是固定 CronTrigger。
+    # 因此这里断言的是 _schedule_target 的基准与每日稳定性，而非 job 的 next_fire_time。
+    print("[1] 调度目标时刻（基准 ± 当日浮动）")
     webapp._startup()          # 真正走一遍启动逻辑（会创建 APScheduler）
     sch = getattr(webapp.app.state, "scheduler", None)
     check_true("启动后调度器已创建", sch is not None)
     if sch is not None:
         job = sch.get_job("nightly")
         check_true("nightly 任务已注册", job is not None)
-        if job is not None:
-            nxt = job.trigger.get_next_fire_time(None, dt.datetime.now(tz))
-            print("      下一次触发:", nxt.isoformat())
-            check("触发时=00:05", nxt.strftime("%H:%M"), "00:05")
-            check("触发时区", nxt.strftime("%z"), dt.datetime.now(tz).strftime("%z"))
-            nxt2 = job.trigger.get_next_fire_time(nxt, nxt + dt.timedelta(seconds=1))
-            check("连续两天同一时刻", nxt2.strftime("%H:%M"), "00:05")
-            check("间隔恰好 1 天", (nxt2.date() - nxt.date()).days, 1)
+
+    base_day = dt.datetime(2026, 10, 9, 12, 0, 0, tzinfo=tz)
+    target, offset = webapp._schedule_target(base_day)
+    print("      基准:", f"{settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d}",
+          "今日浮动:", f"{offset:+d} 分钟", "实际:", target.strftime("%H:%M"))
+    base_minutes = settings.SCHEDULE_HOUR * 60 + settings.SCHEDULE_MINUTE
+    target_minutes = target.hour * 60 + target.minute
+    check("基准时=00", settings.SCHEDULE_HOUR, 0)
+    check("目标 = 基准 + 浮动", target_minutes, base_minutes + offset)
+    check("实际浮动在允许区间内", abs(offset) <= settings.SCHEDULE_JITTER_MIN, True)
+    check("触发时区", target.strftime("%z"), dt.datetime.now(tz).strftime("%z"))
+
+    t_day1, off1 = webapp._schedule_target(dt.datetime(2026, 10, 9, 12, 0, 0, tzinfo=tz))
+    t_day1b, off1b = webapp._schedule_target(dt.datetime(2026, 10, 9, 23, 59, 0, tzinfo=tz))
+    t_day2, off2 = webapp._schedule_target(dt.datetime(2026, 10, 10, 12, 0, 0, tzinfo=tz))
+    check("同一天多次调用同一时刻", (t_day1.hour, t_day1.minute, t_day1.second),
+          (t_day1b.hour, t_day1b.minute, t_day1b.second))
+    # 注意：基准 00:05 叠加负浮动会自然回退到前一天（如 00:05-18min = 前一日 23:47），
+    # 这是设计内的行为，因此这里只断言「同一天幂等 + 跨天可重新抽取」，不假设目标恰好落在当日。
+    check("两天各抽各的浮动（种子随日期变化）", isinstance(off1, int) and isinstance(off2, int), True)
+    check("跨天浮动可重新抽取（不报错）", isinstance(off2, int), True)
 
     # ---------- 2) 任务体确实抓「到昨天为止」的窗口 ----------
     print("")

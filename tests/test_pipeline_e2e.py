@@ -31,6 +31,8 @@ os.environ["JD_CONFIG_DIR"] = str(TMP / "config")
 os.environ["JD_EXCEL_PATH"] = str(TMP / "config" / "missing.xlsx")
 os.environ["JD_ENABLE_SCHEDULER"] = "0"
 os.environ["JD_RUN_ON_START"] = "0"
+os.environ["JD_SCHEDULE_HOUR"] = "0"    # 与 test_scheduler 保持一致，断言 0:5
+os.environ["JD_SCHEDULE_MINUTE"] = "5"
 os.environ["JD_ACCOUNTS"] = json.dumps([
     {"key": "main", "label": "主账号", "account_id": 111},
     {"key": "b", "label": "账号B", "account_id": 222}])

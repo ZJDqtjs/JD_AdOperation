@@ -42,6 +42,13 @@ tmp/
 .tmp/
 *.log
 
+# ---- 测试残留的临时目录（tempfile.mkdtemp 应自行清理；此处兜底防误入库）----
+jdlock_*/
+jdtask_*/
+jdroi_e2e_*/
+jdroi_sku_costs_*/
+jdroi_*/
+
 # ---- 报告与 Excel（内联/存放经营数据：花费、成交、客单价、成本、扣点，一律不入库）----
 ad_roi_report*.html
 *.xls*
