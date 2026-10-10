@@ -38,11 +38,16 @@ def _load_dotenv() -> None:
     """本地直接跑脚本（不经 docker-compose）时也认仓库根的 .env。
 
     只填「进程环境里还没有」的键，已 export 的优先；解析失败就整体忽略。
+
+    例外：TZ / JD_TZ 例外处理——业务时区必须由项目 .env 说了算。宿主机（尤其是
+    Windows 上用 bash 启动的进程）常带 TZ=UTC，一旦它盖过 .env，整个应用会按 UTC
+    算「今天/昨天」，导致每晚抓错日期（少一天）。因此这两个键总是用 .env 覆盖。
     """
     root = Path(_env("JD_APP_DIR", str(Path(__file__).resolve().parent.parent)) or ".")
     f = root / ".env"
     if not f.exists():
         return
+    force = {"TZ", "JD_TZ"}          # 这两个键以 .env 为准，不被进程环境污染
     try:
         for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
             s = line.strip()
@@ -50,7 +55,9 @@ def _load_dotenv() -> None:
                 continue
             k, _, v = s.partition("=")
             k, v = k.strip(), v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
+            if not k or not v:
+                continue
+            if k in force or k not in os.environ:
                 os.environ[k] = v
     except OSError:
         return
@@ -370,3 +377,48 @@ def time_ago(ts) -> float:
         return max(0.0, time.time() - float(ts))
     except (TypeError, ValueError):
         return float("inf")
+
+
+# ---------------- 统一时间源（必须走 TZ，绝不能用裸 datetime.now()） ----------------
+# 血泪教训：Windows 上 Python 的 datetime.now() 由「进程本地时区」决定，而进程时区
+# 可能被环境变量 TZ（如 UTC）污染；Windows CRT 又未必认 TZ=Asia/Shanghai 这种 IANA 名。
+# 结果：容器/后台进程跑到 UTC 时区 → today() 比真实日期少一天 → 每晚抓的是「前天」。
+# 因此所有「业务日期」计算一律走本模块的 now()/today()，显式用 ZoneInfo(TZ)。
+def _tzinfo():
+    """解析 settings.TZ 得到 tzinfo；失败退回固定 +08:00。"""
+    from datetime import timezone, timedelta
+    name = TZ or "Asia/Shanghai"
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001
+        # 常见别名兜底，最后退回北京时间
+        if name in ("Asia/Shanghai", "PRC", "CTT", "Asia/Chongqing", "Asia/Chungking"):
+            return timezone(timedelta(hours=8))
+        return timezone(timedelta(hours=8))
+
+
+_TZINFO = None
+
+
+def now():
+    """带目标时区的当前时间（aware）。业务上一切「现在」都用它。"""
+    global _TZINFO
+    from datetime import datetime
+    if _TZINFO is None:
+        _TZINFO = _tzinfo()
+    return datetime.now(_TZINFO)
+
+
+def today():
+    """目标时区下的当前日期（date）。"""
+    return now().date()
+
+
+def now_iso(timespec: str = "seconds") -> str:
+    """目标时区当前时间 ISO 字符串（不带 offset，保持与既有落盘格式兼容）。"""
+    return now().replace(tzinfo=None).isoformat(timespec=timespec)
+
+
+def now_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    return now().strftime(fmt)

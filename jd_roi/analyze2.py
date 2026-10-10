@@ -1288,7 +1288,7 @@ def build(start=None, end=None, windows=None, accounts=None):
             "caliber": ("广告=京准通概览(点击15天/成交订单口径)；智能投放=智能投放报表；"
                         "商智=各店铺成交口径；商智客单价为真实值，产品成本按 Excel 成本率等比推算"),
             "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"]} for a in active],
-            "generatedAt": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "generatedAt": settings.now_str("%Y-%m-%d %H:%M"),
         },
         "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"],
                       "totals": totals[a["key"]]} for a in active],
@@ -1301,7 +1301,7 @@ def build(start=None, end=None, windows=None, accounts=None):
         "words": {a["key"]: {wk: {cid: {"sw": v["sw"][:60], "kw": v["kw"][:40]}
                                    for cid, v in (words[a["key"]].get(wk) or {}).items()}
                             for wk in WKEYS} for a in active},
-        "runtime": {"generatedAt": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+        "runtime": {"generatedAt": settings.now_str("%Y-%m-%d %H:%M:%S")},
         "advice": advice,
     }
 

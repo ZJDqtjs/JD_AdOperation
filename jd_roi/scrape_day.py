@@ -66,7 +66,7 @@ def acquire(timeout: float = 0, name: str = "") -> bool:
                 _LOCKED = True
                 _LOCK_THREAD = threading.current_thread()
                 _LOCK_OWNER.update({"name": name or _LOCK_THREAD.name,
-                                    "acquiredAt": dt.datetime.now().isoformat(timespec="seconds"),
+                                    "acquiredAt": settings.now_iso(),
                                     "thread": _LOCK_THREAD.name, "pid": os.getpid()})
                 return True
         if time.monotonic() >= deadline:
@@ -116,8 +116,8 @@ def reset_lock(force: bool = False) -> bool:
         return False
     release()
     _RUNNING.update({"active": False, "cancelled": False,
-                     "progress": "已强制解锁卡死的抓取锁", "finishedAt":
-                         dt.datetime.now().isoformat(timespec="seconds")})
+                     "progress": "已强制解锁卡死的抓取锁",
+                     "finishedAt": settings.now_iso()})
     return True
 
 
@@ -194,7 +194,8 @@ _TASKS_FILE = settings.DATA_DIR / "tasks.json"
 
 
 def _now() -> str:
-    return dt.datetime.now().isoformat(timespec="seconds")
+    # 必须走 settings（目标时区），裸 now() 会在进程时区为 UTC 时错 8 小时
+    return settings.now_iso()
 
 
 def _read_tasks_file() -> list:
@@ -239,7 +240,7 @@ def _ensure_history() -> None:
 
 
 def _new_task_id() -> str:
-    return dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
+    return settings.now_str("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
 
 
 def start_task(trigger: str, name: str | None, start: str, end: str,
@@ -267,7 +268,7 @@ def append_log(msg: str) -> None:
             return
         _CURRENT["progress"] = msg
         log = _CURRENT["log"]
-        log.append(f"{dt.datetime.now().strftime('%H:%M:%S')} {msg}")
+        log.append(f"{settings.now_str('%H:%M:%S')} {msg}")
         if len(log) > _LOG_MAX:
             del log[:len(log) - _LOG_MAX]
 
@@ -283,7 +284,7 @@ def finish_task(status: str, summary=None, error: str | None = None) -> dict | N
                     "summary": summary})
         started = rec.get("startedAt")
         try:
-            rec["elapsedSec"] = int((dt.datetime.now()
+            rec["elapsedSec"] = int((settings.now()
                                      - dt.datetime.fromisoformat(started)).total_seconds())
         except Exception:  # noqa: BLE001
             rec["elapsedSec"] = None
@@ -304,7 +305,7 @@ def _trim(rec: dict, log_n: int) -> dict:
     # 让前端拿时间字符串自己相减会算出 8 小时的误差。
     if out.get("status") == "running":
         try:
-            out["elapsedSec"] = int((dt.datetime.now()
+            out["elapsedSec"] = int((settings.now()
                                      - dt.datetime.fromisoformat(out["startedAt"])).total_seconds())
         except Exception:  # noqa: BLE001
             pass
@@ -657,7 +658,7 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
     if acquire_lock and not acquire(name="scrape"):
         raise RuntimeError("已有抓取任务在运行")
     _CANCEL.clear()
-    _RUNNING.update({"active": True, "startedAt": dt.datetime.now().isoformat(timespec="seconds"),
+    _RUNNING.update({"active": True, "startedAt": settings.now_iso(),
                      "finishedAt": None, "error": None, "result": None,
                      "cancelled": False, "progress": "starting"})
     start_task(trigger, name, start, end, [a.get("key") for a in accounts], force, kinds)
@@ -799,7 +800,7 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
         err = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        finished = dt.datetime.now().isoformat(timespec="seconds")
+        finished = settings.now_iso()
         cancelled = bool(summary.get("cancelled"))
         status = "failed" if err else ("cancelled" if cancelled else "done")
         _RUNNING.update({"active": False, "finishedAt": finished, "cancelled": cancelled,

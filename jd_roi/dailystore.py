@@ -56,7 +56,11 @@ def _f(v, d=0.0) -> float:
 
 
 def today() -> dt.date:
-    return dt.datetime.now().date()
+    """当前日期。**必须**走 settings 的目标时区，不能用裸 datetime.now()。
+
+    裸 now() 在进程时区被污染成 UTC 时会少一天，导致每晚抓「前天」而非「昨天」。
+    """
+    return settings.today()
 
 
 def norm_day(day) -> str:

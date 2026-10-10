@@ -57,7 +57,8 @@ def _e(s) -> str:
 
 
 def _today() -> dt.date:
-    return dt.datetime.now().date()
+    # 走 settings 的目标时区；裸 now() 在进程时区被污染成 UTC 时会少一天
+    return settings.today()
 
 
 def _yesterday() -> dt.date:
@@ -711,7 +712,7 @@ def report(request: Request):
 def api_status():
     cached = settings._costs_cache_read() or {}
     return {"ok": True,
-            "server": dt.datetime.now().isoformat(timespec="seconds"),
+            "server": settings.now_iso(),
             "tz": settings.TZ,
             "costs": {"apiConfigured": bool(settings.COSTS_URL),
                       "intendedSource": ("供货方接口" if settings.COSTS_URL else
@@ -1722,14 +1723,8 @@ def _schedule_target(dt=None):
 
 
 def dt_now():
-    """带时区的当前时间（用 settings.TZ）。"""
-    from datetime import datetime
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo(settings.TZ))
-    except Exception:  # noqa: BLE001
-        from datetime import timezone, timedelta
-        return datetime.now(timezone(timedelta(hours=8)))
+    """带时区的当前时间。统一走 settings.now()（显式 ZoneInfo(TZ)）。"""
+    return settings.now()
 
 
 def _scheduler_tick():

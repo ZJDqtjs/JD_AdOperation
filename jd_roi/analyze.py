@@ -16,7 +16,7 @@ import json
 import re
 from collections import defaultdict
 
-from . import config, store
+from . import config, settings, store
 
 # ---- 成本默认值（可被 Excel「计算公式」sheet 覆盖）----
 DEFAULT_COST = {"price": 180.0, "product": 120.0, "platform": 0.0, "package": 0.0, "shipping": 5.0}
@@ -625,7 +625,7 @@ def build_analysis() -> dict:
             "accounts": [{"key": a["key"], "label": a["label"]} for a in accts],
             "szShops": [a["label"] for a in accts_all if a["ds"]["sz_c"]],
             "scope": config.SCOPE_ACCOUNTS,
-            "generatedAt": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "generatedAt": settings.now_str("%Y-%m-%d %H:%M"),
         },
         "szFlows": sz_flows,
         "shops": shops,
