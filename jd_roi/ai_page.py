@@ -102,6 +102,10 @@ AI_PAGE_CSS = report2.CSS + report2.UI_CSS + report2.AI_CSS + """
   max-height:180px;overflow:auto;color:#475569}
 .agenthint{font-size:11.5px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;
   border-radius:7px;padding:5px 9px;margin-bottom:8px}
+.jumpbtn{position:absolute;right:14px;bottom:118px;z-index:6;border:1px solid #c7d2fe;background:#fff;
+  color:#185fa5;border-radius:20px;padding:4px 12px;font-size:12px;cursor:pointer;
+  box-shadow:0 3px 10px rgba(16,24,40,.14)}
+.jumpbtn:hover{background:#185fa5;color:#fff}
 """
 
 
@@ -125,6 +129,34 @@ function setAgent(v){
   if(t) t.textContent = AGENT_MODE ? '（能查数据 / 抓数 / 写并跑脚本）' : '（基于当前区间数据问答）';
 }
 function toggleAgent(cb){ setAgent(cb.checked); }
+
+/* ---------------- 粘底滚动：用户往上翻时**不许**被拽回去 ----------------
+   做法：给可滚动容器绑定「是否贴底」标记；新内容到达时，
+   只有它本来就在底部（或显式 force）才自动滚到底。 */
+function bindStick(el, onchange){
+  if(!el || el.__bound) return el;
+  el.__bound = true; el.__stick = true;
+  el.addEventListener('scroll', function(){
+    el.__stick = (el.scrollHeight - el.scrollTop - el.clientHeight) <= 28;
+    if(onchange) onchange(el.__stick);
+  });
+  return el;
+}
+function stickScroll(el, force){
+  if(!el) return;
+  if(force || el.__stick !== false) el.scrollTop = el.scrollHeight;
+}
+function chatLog(){ return document.getElementById('chatlog'); }
+function toggleJump(){
+  var b = document.getElementById('jumpBtn'); if(!b) return;
+  var log = chatLog();
+  var off = log && log.__stick === false;
+  b.style.display = off ? 'block' : 'none';
+}
+function jumpBottom(){
+  var log = chatLog(); if(!log) return;
+  log.scrollTop = log.scrollHeight; log.__stick = true; toggleJump();
+}
 
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function mdInline(s){
@@ -179,18 +211,23 @@ function msgHTML(m){
   h += '<div class="bub">'+(m.role==='user'? esc(m.content) : mdBlock(m.content))+'</div></div>';
   return h;
 }
-function renderChat(){
+function renderChat(force){
   var log=document.getElementById('chatlog'); var arr=loadChat();
-  elThink=elThinkBody=elBub=null;
+  var wasStick = (log.__stick !== false), keepTop = log.scrollTop;
+  elThink=elThinkBody=elBub=null; elSteps=null;
+  bindStick(log, toggleJump);
   if(!arr.length){
     log.innerHTML='<div class="chatempty">就当前区间向 AI 追问，例如：<br>'
       + '· 定向人群（DMP 人群包）到底要不要做？先怎么做？<br>'
       + '· 哪些地域该屏蔽、哪些该加价？<br>'
       + '· 这周只改三件事，先改哪三件？</div>';
-    return;
+    log.__stick = true; toggleJump(); return;
   }
   log.innerHTML = arr.map(msgHTML).join('');
-  log.scrollTop = log.scrollHeight;
+  var goBottom = (force === undefined) ? wasStick : !!force;
+  if(goBottom) log.scrollTop = log.scrollHeight; else log.scrollTop = keepTop;
+  log.__stick = goBottom;
+  toggleJump();
 }
 function pushMsg(role, content, reasoning, steps){
   var a=loadChat(); a.push({role:role,content:content,reasoning:reasoning||'',steps:steps||[]}); saveChat(a);
@@ -215,7 +252,7 @@ function startThinkingBar(){
   timerId=setInterval(function(){
     var e=document.getElementById('tbEl'); if(e) e.textContent=Math.round((Date.now()-tStart)/1000)+'s';
   },500);
-  log.scrollTop=log.scrollHeight;
+  bindStick(log, toggleJump); stickScroll(log, true);
 }
 function setBarText(t){ var el=document.getElementById('tbTxt'); if(el) el.textContent=t; }
 
@@ -233,8 +270,9 @@ function beginStreamMsg(){
   elThinkBody=wrap.querySelector('.think .tbody');
   elBub=wrap.querySelector('.bub');
   elThink.querySelector('summary').addEventListener('click',function(){ thinkTouched=true; });
+  bindStick(elThinkBody);
   curReasoning=''; curContent=''; curSteps=[];
-  log.scrollTop=log.scrollHeight;
+  bindStick(log, toggleJump); stickScroll(log, true);
 }
 function addStep(s){
   curSteps.push(s);
@@ -242,18 +280,25 @@ function addStep(s){
   var d=document.createElement('div');
   d.innerHTML=stepHTML(s);
   elSteps.appendChild(d.firstChild);
-  var log=document.getElementById('chatlog');
-  if(log) log.scrollTop=log.scrollHeight;
+  stickScroll(chatLog());
 }
 function paintChunk(){
   if(elThinkBody){
     elThinkBody.textContent = curReasoning;
     var c=elThink.querySelector('.tst'); if(c) c.textContent = curReasoning.length+' 字';
-    elThinkBody.scrollTop = elThinkBody.scrollHeight;
+    stickScroll(elThinkBody);          // 思考框也只在你自己没往上翻时才跟到底
   }
   if(elBub) elBub.innerHTML = mdBlock(curContent);
-  var log=document.getElementById('chatlog');
-  if(log) log.scrollTop = log.scrollHeight;
+  stickScroll(chatLog());               // ← 关键：不再无条件拽到底部
+}
+/* 分片很密（一次生成常有几百片），按帧合并重绘，滑动更跟手 */
+var _paintPending = false;
+function paintSoon(){
+  if(_paintPending) return;
+  _paintPending = true;
+  (window.requestAnimationFrame || function(f){ setTimeout(f, 16); })(function(){
+    _paintPending = false; paintChunk();
+  });
 }
 
 /* 挂载事件流：断开不影响服务端生成；重挂从 0 回放，重建完整内容。 */
@@ -284,13 +329,13 @@ function attach(jobId){
   });
   es.addEventListener('reasoning', function(ev){
     var d={}; try{d=JSON.parse(ev.data||'{}');}catch(e){}
-    curReasoning += (d.t||''); paintChunk();
+    curReasoning += (d.t||''); paintSoon();
   });
   es.addEventListener('content', function(ev){
     var d={}; try{d=JSON.parse(ev.data||'{}');}catch(e){}
     curContent += (d.t||'');
     if(curContent && elThink && elThink.open && !thinkTouched) elThink.open=false;   // 出正文后自动收起思考
-    paintChunk();
+    paintSoon();
   });
   es.addEventListener('error', function(ev){
     var d = {}; try{ d=JSON.parse(ev.data||'{}'); }catch(e){}
@@ -360,6 +405,7 @@ function rptPanel(){
     + '<div class="pg" id="rptPg">准备中…</div>'
     + '<div class="tbody" id="rptBody"></div>';
   rptBody=document.getElementById('rptBody'); rptTxt=document.getElementById('rptPg'); rptEl=document.getElementById('rptEl');
+  bindStick(rptBody);
   rptStart=Date.now();
   if(rptTimer) clearInterval(rptTimer);
   rptTimer=setInterval(function(){ if(rptEl) rptEl.textContent=Math.round((Date.now()-rptStart)/1000)+'s'; },1000);
@@ -372,7 +418,7 @@ function rptAttach(jobId){
   rptEs.addEventListener('phase', function(ev){ var d={}; try{d=JSON.parse(ev.data||'{}');}catch(e){} if(rptTxt) rptTxt.textContent=d.t||''; });
   rptEs.addEventListener('reset', function(){ if(rptBody) rptBody.textContent=''; });
   rptEs.addEventListener('reasoning', function(ev){ var d={}; try{d=JSON.parse(ev.data||'{}');}catch(e){}
-    if(rptBody){ rptBody.textContent += (d.t||''); rptBody.scrollTop=rptBody.scrollHeight; } });
+    if(rptBody){ rptBody.textContent += (d.t||''); stickScroll(rptBody); } });
   rptEs.addEventListener('done', function(){ rptDone(false); });
   rptEs.addEventListener('error', function(ev){ var d={}; try{d=JSON.parse(ev.data||'{}');}catch(e){}
     if(rptTxt) rptTxt.textContent='生成失败：'+(d.t||'未知'); rptDone(true); });
@@ -493,6 +539,7 @@ def render(ai, d, ui: str = "", title: str = "AI 运营分析台") -> str:
       </div>
       <div class="chatlog" id="chatlog"></div>
       <div class="chips">{chips}</div>
+      <button id="jumpBtn" class="jumpbtn" style="display:none" type="button" onclick="jumpBottom()">↓ 回到底部</button>
       <div class="chatbox">
         <textarea id="chatq" placeholder="例如：定向人群要不要开？开的话怎么设溢价？（Ctrl/⌘+Enter 发送）"
           onkeydown="chatKeydown(event)"></textarea>
