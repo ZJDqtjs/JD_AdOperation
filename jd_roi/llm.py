@@ -79,57 +79,15 @@ def _timeout(read: float) -> httpx.Timeout:
     return httpx.Timeout(connect=30.0, read=read, write=60.0, pool=30.0)
 
 
-def _chat_stream(url: str, headers: dict, payload: dict, read_timeout: float) -> str:
-    content: list[str] = []
-    with httpx.Client(timeout=_timeout(read_timeout)) as client:
-        with client.stream("POST", url, json=payload, headers=headers) as r:
-            if r.status_code >= 500:
-                raise LlmCallError(f"HTTP {r.status_code}: {r.read()[:200]}")
-            r.raise_for_status()
-            for line in r.iter_lines():
-                if not line:
-                    continue
-                if line.startswith("data:"):
-                    line = line[5:].strip()
-                if line == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(line)
-                except Exception:  # noqa: BLE001
-                    continue
-                ch = (obj.get("choices") or [{}])[0]
-                delta = ch.get("delta") or {}
-                piece = delta.get("content")
-                if piece:
-                    content.append(piece)
-    text = "".join(content)
-    if not text.strip():
-        raise LlmCallError("流式返回为空（可能该端点不支持 stream）")
-    return text
+def _iter_sse(url: str, headers: dict, payload: dict, read_timeout: float):
+    """逐分片 yield `(kind, text)`；kind ∈ {"reasoning","content"}。
 
-
-def chat_stream_iter(messages: list[dict], *, model: str | None = None,
-                     temperature: float = 0.4, max_tokens: int | None = None,
-                     timeout: float = 180.0):
-    """逐分片 yield 助手文本（给网页对话框做「打字机」用）。
-
-    与 chat() 不同：不聚合、不重试整轮（重试会让前端收到重复内容），
-    只把 SSE 的每个 delta 原样吐出来。出错抛 LlmCallError。
+    推理型模型（如本项目用的 qwen 系）会在 delta 里同时给
+    `reasoning_content`（思考过程）与 `content`（正式回答）——
+    把两者都透出来，前端就能边等边看「思考过程」，而不是干等。
     """
-    cfg = resolve_config()
-    url = cfg["base_url"] + "/chat/completions"
-    mt = max_tokens or int(os.getenv("LLM_MAX_TOKENS", "6000"))
-    payload = {
-        "model": model or cfg["model"],
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": mt,
-        "stream": True,
-    }
-    headers = {"Authorization": f"Bearer {cfg['api_key']}",
-               "Content-Type": "application/json"}
-    got_any = False
-    with httpx.Client(timeout=_timeout(timeout)) as client:
+    got = False
+    with httpx.Client(timeout=_timeout(read_timeout)) as client:
         with client.stream("POST", url, json=payload, headers=headers) as r:
             if r.status_code >= 400:
                 body = b"".join(r.iter_bytes()).decode("utf-8", "ignore")[:300]
@@ -146,12 +104,61 @@ def chat_stream_iter(messages: list[dict], *, model: str | None = None,
                 except Exception:  # noqa: BLE001
                     continue
                 ch = (obj.get("choices") or [{}])[0]
-                piece = (ch.get("delta") or {}).get("content")
+                delta = ch.get("delta") or {}
+                rz = delta.get("reasoning_content") or delta.get("reasoning")
+                if rz:
+                    got = True
+                    yield ("reasoning", rz)
+                piece = delta.get("content")
                 if piece:
-                    got_any = True
-                    yield piece
-    if not got_any:
+                    got = True
+                    yield ("content", piece)
+    if not got:
         raise LlmCallError("流式返回为空（可能该端点不支持 stream）")
+
+
+def chat_stream_events(messages: list[dict], *, model: str | None = None,
+                       temperature: float = 0.4, max_tokens: int | None = None,
+                       timeout: float = 180.0):
+    """逐分片 yield `(kind, text)`（思考过程 + 正式回答）。不做整轮重试。
+
+    给网页对话框/报告生成做「思考过程流式展示」用。
+    """
+    cfg = resolve_config()
+    url = cfg["base_url"] + "/chat/completions"
+    mt = max_tokens or int(os.getenv("LLM_MAX_TOKENS", "6000"))
+    payload = {
+        "model": model or cfg["model"],
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": mt,
+        "stream": True,
+    }
+    headers = {"Authorization": f"Bearer {cfg['api_key']}",
+               "Content-Type": "application/json"}
+    yield from _iter_sse(url, headers, payload, timeout)
+
+
+def _chat_stream(url: str, headers: dict, payload: dict, read_timeout: float,
+                 on_event=None) -> str:
+    """聚合流式内容；给了 on_event 就顺带把每个分片 (kind, text) 回调出去。"""
+    content: list[str] = []
+    for kind, text in _iter_sse(url, headers, payload, read_timeout):
+        if kind == "content":
+            content.append(text)
+        if on_event is not None:
+            on_event(kind, text)
+    text = "".join(content)
+    if not text.strip():
+        raise LlmCallError("流式返回为空（可能该端点不支持 stream）")
+    return text
+
+
+def chat_stream_iter(messages: list[dict], **kw):
+    """兼容旧接口：逐分片 yield **正式回答**文本（丢掉思考过程）。"""
+    for kind, text in chat_stream_events(messages, **kw):
+        if kind == "content":
+            yield text
 
 
 def _chat_once(url: str, headers: dict, payload: dict, read_timeout: float) -> str:
@@ -169,11 +176,16 @@ def _chat_once(url: str, headers: dict, payload: dict, read_timeout: float) -> s
 
 def chat(messages: list[dict], *, model: str | None = None,
          temperature: float = 0.2, max_tokens: int | None = None,
-         timeout: float = 180.0, retries: int = 2, stream: bool = True) -> str:
+         timeout: float = 180.0, retries: int = 2, stream: bool = True,
+         on_event=None) -> str:
     """调用 chat/completions，返回助手文本。
 
     stream=True（默认）走 SSE；timeout 是**分片间隔**上限（非总时长），
     慢模型长文不会因总耗时超限被掐断。
+
+    on_event(kind, text)：给了就把每个分片回调出去（kind ∈ reasoning/content），
+    并在**每次尝试开始前**回调一次 `("reset", "")` —— 调用方收到 reset 就清空已累积内容，
+    这样重试不会产生重复文本（网页端可据此重放思考过程）。
     """
     cfg = resolve_config()
     url = cfg["base_url"] + "/chat/completions"
@@ -191,7 +203,11 @@ def chat(messages: list[dict], *, model: str | None = None,
     for attempt in range(max(1, retries + 1)):
         try:
             if stream:
-                return _chat_stream(url, headers, payload, timeout)
+                if on_event is not None and attempt > 0:
+                    # 只在**重试**时发 reset：调用方据此清空已累积内容，避免重复；
+                    # 首次尝试前不发，否则会把调用方之前累积的思考/正文误清掉。
+                    on_event("reset", "")
+                return _chat_stream(url, headers, payload, timeout, on_event=on_event)
             return _chat_once(url, headers, payload, timeout)
         except Exception as exc:  # noqa: BLE001
             last = exc

@@ -7,6 +7,7 @@
 页面：
     /            控制台（区间选择、数据覆盖、立即抓取、扫码登录）
     /report      任意区间的聚合分析报表（自带区间选择器）
+    /ai          独立 AI 分析台：每日 AI 报告 + 可追问对话框（含思考过程流式展示）
     /login       扫码登录
 
 API：
@@ -16,6 +17,11 @@ API：
     GET  /api/run/status        抓取进度 + 抓取锁状态
     POST /api/run               触发抓取（后台线程）
     POST /api/run/cancel        取消当前抓取 / 解锁卡死的抓取锁
+    GET  /api/ai/status         AI 生成状态（含当前 job 的思考/成文进度）
+    POST /api/ai/run            生成整份 AI 报告（后台线程，返回 jobId）
+    POST /api/ai/chat           对话框追问（后台线程，返回 jobId，**立即返回**）
+    GET  /api/ai/stream         SSE：某 job 的 phase/reasoning/content/done 事件流（可续传）
+    GET  /api/ai/jobs           最近 AI 任务快照（刷新后找回未完成生成）
     GET  /api/tasks             任务中心：运行中 + 历史任务
     GET  /api/tasks/{id}        单个任务详情（含完整日志）
     POST /api/tasks/{id}/cancel 取消该任务（仅运行中的可取消）
@@ -41,7 +47,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                Response, StreamingResponse)
 
-from . import ai_page, analyze2, analyze_ai, dailystore as ds, report2, scrape_day, settings
+from . import aijobs, ai_page, analyze2, analyze_ai, dailystore as ds, report2, scrape_day, settings
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -844,7 +850,9 @@ def api_run_cancel(force: int = 0):
 def api_ai_status():
     st = _ai.snapshot()
     cur = analyze_ai.load_latest()
+    job = aijobs.JOBS.get(st.get("jobId")) if st.get("jobId") else None
     return {"ok": True, "enabled": settings.AI_ENABLED, **st,
+            "job": job.to_dict() if job else None,
             "cached": (None if not cur else {
                 "range": cur.get("range"), "accounts": cur.get("accounts"),
                 "generatedAt": cur.get("generatedAt"), "model": cur.get("model")})}
@@ -891,10 +899,12 @@ def _chat_context(start: str, end: str, accs):
 
 @app.post("/api/ai/chat")
 async def api_ai_chat(request: Request):
-    """对话框追问：流式返回纯文本（前端边收边渲染）。
+    """对话框追问：**立即返回 jobId**，生成在后台线程里跑。
+
+    这样用户切走页面/刷新/断网都不会中断生成；回来后用 jobId 挂
+    `GET /api/ai/stream?job=...` 即可续看（含思考过程）。
 
     请求体 JSON：{start, end, accounts, question, history:[{role,content}]}
-    accounts 为逗号串；start/end 缺省时贴本地已抓取区间。
     """
     if not settings.AI_ENABLED:
         return JSONResponse({"ok": False, "error": "AI 解读已禁用（JD_AI_ENABLED=0）"},
@@ -915,26 +925,124 @@ async def api_ai_chat(request: Request):
                                 status_code=400)
         start, end = rng
     history = body.get("history") or []
+    keys = [a["key"] for a in accs]
 
-    try:
-        digest, methodology = _chat_context(start, end, accs)
-    except FileNotFoundError as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
-                            status_code=500)
+    job = aijobs.JOBS.new("chat", {"start": start, "end": end, "accounts": keys,
+                                   "question": question[:120]})
 
-    def _gen():
+    def _work():
         try:
-            for piece in analyze_ai.chat_stream_ctx(digest, methodology, history, question):
-                yield piece
+            job.emit("phase", f"正在读取本地已抓取数据（{start} ~ {end}）…")
+            digest, methodology = _chat_context(start, end, accs)
+            job.emit("phase", "上下文就绪，正在思考…")
+            last_exc = None
+            for attempt in range(2):          # 中途断流重试一次；重试前发 reset，前端清空重画
+                try:
+                    if attempt:
+                        job.emit("reset", "")
+                        job.emit("phase", "重试中…")
+                    for kind, text in analyze_ai.chat_stream_events_ctx(digest, methodology,
+                                                                       history, question):
+                        job.emit(kind, text)
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+            if last_exc is not None:
+                raise last_exc
+            job.finish(result={"answer": job.content})
         except Exception as exc:  # noqa: BLE001
-            yield f"\n\n[对话失败] {type(exc).__name__}: {exc}\n（可检查 AI 配置或稍后重试）"
+            job.finish(error=f"{type(exc).__name__}: {exc}")
             _log_progress(f"AI 对话失败：{type(exc).__name__}: {exc}")
 
-    return StreamingResponse(_gen(), media_type="text/plain; charset=utf-8",
+    threading.Thread(target=_work, name=f"ai-chat-{job.id}", daemon=True).start()
+    return {"ok": True, "jobId": job.id, "start": start, "end": end, "accounts": keys}
+
+
+@app.post("/api/ai/agent")
+async def api_ai_agent(request: Request):
+    """**自主执行**：把任务交给内部 Agent（可调内部接口 / 抓数据 / 写并运行脚本）。
+
+    与 /api/ai/chat 一样**立即返回 jobId**，事件走 `GET /api/ai/stream?job=`；
+    新增事件类型：`plan`（本轮打算做什么）、`tool`（调用的工具）、`obs`（工具返回摘要）。
+    请求体 JSON：{start, end, accounts, task}
+    """
+    if not settings.AI_ENABLED:
+        return JSONResponse({"ok": False, "error": "AI 解读已禁用（JD_AI_ENABLED=0）"},
+                            status_code=400)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    task = (body.get("task") or body.get("question") or "").strip()
+    if not task:
+        return JSONResponse({"ok": False, "error": "任务为空"}, status_code=400)
+    accs = account_list([body.get("accounts")] if body.get("accounts") else None)
+    start, end = body.get("start"), body.get("end")
+    keys = [a["key"] for a in accs]
+    job = aijobs.JOBS.new("agent", {"start": start, "end": end, "accounts": keys,
+                                    "task": task[:160]})
+
+    def _work():
+        try:
+            from . import agent as agent_mod
+            agent_mod.run(job, task, accounts=accs, start=start, end=end)
+            if job.status == "running":
+                job.finish(result={"answer": job.content})
+        except Exception as exc:  # noqa: BLE001
+            job.finish(error=f"{type(exc).__name__}: {exc}")
+            _log_progress(f"Agent 执行失败：{type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_work, name=f"ai-agent-{job.id}", daemon=True).start()
+    return {"ok": True, "jobId": job.id, "start": start, "end": end, "accounts": keys}
+
+
+@app.get("/api/ai/stream")
+def api_ai_stream(request: Request, job: str, after: int = 0):
+    """把某个 AI 任务的「思考过程 + 正式回答」以 SSE 推给浏览器。
+
+    - 与生成解耦：只读 job，断开不影响生成；
+    - 支持续传：`?after=<已收到的序号>`，或浏览器 SSE 自动带的 `Last-Event-ID`；
+    - 事件类型：phase / plan / tool / obs / reasoning / content / reset / error / done / state。
+    """
+    j = aijobs.JOBS.get(job)
+    if not j:
+        return JSONResponse({"ok": False, "error": "任务不存在或已过期（服务可能重启过）"},
+                            status_code=404)
+    cursor = max(int(after or 0), 0)
+    lei = request.headers.get("last-event-id")
+    if lei:
+        try:
+            cursor = max(cursor, int(lei))
+        except ValueError:
+            pass
+
+    def _gen():
+        nonlocal cursor
+        while True:
+            evs = j.wait(cursor, timeout=15.0)
+            if not evs:
+                if j.status == "running":
+                    yield ": ping\n\n"       # 心跳，防中间层掐连接
+                    continue
+                break
+            for seq, kind, text in evs:
+                cursor = seq
+                data = json.dumps({"t": text, "seq": seq}, ensure_ascii=False)
+                yield f"id: {seq}\nevent: {kind}\ndata: {data}\n\n"
+        yield ("event: state\ndata: "
+               + json.dumps(j.to_dict(), ensure_ascii=False) + "\n\n")
+
+    return StreamingResponse(_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
+                                      "Connection": "keep-alive",
                                       "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/ai/jobs")
+def api_ai_jobs():
+    """最近 AI 任务快照（含运行中的），供页面在刷新后找回未完成的生成。"""
+    return {"ok": True, "jobs": aijobs.JOBS.snapshot()}
 
 
 # ---------------------------------------------------------------- 任务中心
@@ -1658,12 +1766,17 @@ _login = LoginSession()
 
 
 class AiRunner:
-    """后台生成 AI 运营解读（单线程串行，防重复触发）。"""
+    """后台生成 AI 运营解读（单线程串行，防重复触发）。
+
+    生成过程通过内存 job 暴露「思考过程」事件流（`GET /api/ai/stream?job=`），
+    页面可以随时挂上/离开/回来续看，**离开页面不会中断生成**。
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._state = {"running": False, "startedAt": None, "finishedAt": None,
-                       "error": None, "range": None, "accounts": None, "ok": True}
+                       "error": None, "range": None, "accounts": None, "ok": True,
+                       "jobId": None}
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1673,29 +1786,41 @@ class AiRunner:
         with self._lock:
             if self._state.get("running"):
                 return {"ok": False, "error": "已有 AI 生成任务在运行"}
+            keys = [a.get("key") for a in (accounts or settings.ACCOUNTS)]
+            job = aijobs.JOBS.new("report", {"start": start, "end": end, "accounts": keys})
             self._state.update({"running": True, "startedAt": settings.now_iso(),
                                 "finishedAt": None, "error": None, "ok": True,
-                                "range": [start, end],
-                                "accounts": [a.get("key") for a in (accounts or settings.ACCOUNTS)]})
+                                "range": [start, end], "accounts": keys,
+                                "jobId": job.id})
 
         def _work():
             try:
-                out = analyze_ai.run_for(start, end, accounts)
+                job.emit("phase", f"正在读取本地按天库（{start} ~ {end}）…")
+                data = analyze2.build(start=start, end=end,
+                                      accounts=[a for a in settings.ACCOUNTS if a["key"] in keys])
+                job.emit("phase", "数据就绪（保本线 / 词分层 / 定向缺口已算好），交给模型套方法论判断…")
+                out = analyze_ai.analyze_data(data, None, on_event=job.emit)
+                job.emit("phase", "生成完成，正在落盘…")
                 path, md = analyze_ai.save(out)
                 ok = not (out.get("validation") or {}).get("issues")
                 with self._lock:
                     self._state.update({"running": False, "ok": ok,
                                         "finishedAt": settings.now_iso()})
+                job.finish(result={"range": out.get("range"),
+                                   "generatedAt": out.get("generatedAt"), "ok": ok,
+                                   "validation": out.get("validation"),
+                                   "accounts": out.get("accounts")})
                 _log_progress(f"AI 解读已生成：{start} ~ {end} -> {path.name}")
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     self._state.update({"running": False,
                                         "error": f"{type(exc).__name__}: {exc}",
                                         "finishedAt": settings.now_iso()})
+                job.finish(error=f"{type(exc).__name__}: {exc}")
                 _log_progress(f"AI 解读生成失败：{type(exc).__name__}: {exc}")
 
         threading.Thread(target=_work, name="ai-advice", daemon=True).start()
-        return {"ok": True, "range": [start, end]}
+        return {"ok": True, "range": [start, end], "jobId": job.id}
 
 
 _ai = AiRunner()

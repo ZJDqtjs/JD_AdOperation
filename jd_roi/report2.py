@@ -1415,13 +1415,16 @@ def _ai_block(ai, d, link: bool = True) -> str:
 AI_JS = """
 function genAi(btn, start, end, keys){
   if(btn.disabled) return;
-  btn.disabled=true; var old=btn.textContent; btn.textContent='生成中…（约1~2分钟）';
+  btn.disabled=true; var old=btn.textContent; btn.textContent='生成中…';
   var qs='start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end)+'&accounts='+encodeURIComponent(keys);
   fetch('/api/ai/run?'+qs,{method:'POST'}).then(function(r){return r.json();}).then(function(j){
     if(!j.ok){ btn.disabled=false; btn.textContent=old; alert('生成失败：'+(j.error||'未知')); return; }
     var t=setInterval(function(){
       fetch('/api/ai/status').then(function(r){return r.json();}).then(function(s){
-        if(!s.running){ clearInterval(t); location.reload(); }
+        if(!s.running){ clearInterval(t); location.reload(); return; }
+        // 生成中：显示「思考过程」已产出多少字，用户不空等（生成在服务端跑，离开页面也不中断）
+        var jb=s.job||{};
+        btn.textContent='思考中… '+(jb.reasoningChars||0)+' 字 / 成文 '+(jb.contentChars||0)+' 字';
       }).catch(function(){ clearInterval(t); btn.disabled=false; btn.textContent=old; });
     }, 4000);
   }).catch(function(e){ btn.disabled=false; btn.textContent=old; alert('请求失败：'+e); });

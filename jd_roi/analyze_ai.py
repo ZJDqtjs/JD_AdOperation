@@ -460,8 +460,12 @@ def validate(advice: dict, digest: dict) -> dict:
 
 # ---------------- 主流程 ----------------
 def analyze_data(data: dict, account: str | None = None, *, model: str | None = None,
-                 dry_run: bool = False) -> dict:
-    """对已在内存里的 analysis2 结构做 AI 解读（网页/夜间任务复用）。"""
+                 dry_run: bool = False, on_event=None) -> dict:
+    """对已在内存里的 analysis2 结构做 AI 解读（网页/夜间任务复用）。
+
+    on_event(kind, text)：可选。给了就把模型流式分片（reasoning/content/reset）
+    实时回调出去 —— 网页据此展示「思考过程」，不必干等。
+    """
     digest = build_digest(data, account)
     methodology, src = load_methodology()
     messages = build_messages(digest, methodology)
@@ -471,7 +475,7 @@ def analyze_data(data: dict, account: str | None = None, *, model: str | None = 
         return {"dry_run": True, "methodology_source": src,
                 "digest": digest, "messages": messages, "est_tokens": est}
 
-    advice, raw = llm.chat_json(messages, model=model)
+    advice, raw = llm.chat_json(messages, model=model, on_event=on_event)
     advice = normalize(advice)
     report = validate(advice, digest)
     dmeta = digest.get("meta", {})
@@ -548,9 +552,16 @@ def build_chat_messages(digest: dict, methodology: str, history, question: str) 
 
 def chat_stream_ctx(digest: dict, methodology: str, history, question: str, *,
                     model: str | None = None, temperature: float = 0.4):
-    """用已备好的上下文流式回答一个追问（yield 文本分片）。"""
+    """用已备好的上下文流式回答一个追问（yield 文本分片，含思考过程）。"""
     msgs = build_chat_messages(digest, methodology, history, question)
     return llm.chat_stream_iter(msgs, model=model, temperature=temperature)
+
+
+def chat_stream_events_ctx(digest: dict, methodology: str, history, question: str, *,
+                           model: str | None = None, temperature: float = 0.4):
+    """同 chat_stream_ctx，但 yield `(kind, text)`（reasoning/content），供前端分流展示。"""
+    msgs = build_chat_messages(digest, methodology, history, question)
+    return llm.chat_stream_events(msgs, model=model, temperature=temperature)
 
 
 # ---------------- 缓存读写（供网页读取） ----------------
