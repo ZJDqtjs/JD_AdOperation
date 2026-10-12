@@ -26,10 +26,15 @@ from . import settings
 from .indicators import FLOW_SUM, PRODUCT_SUM, SRC_AMT, SRC_UV, SZ_AMT, SZ_ORDN, SZ_UV
 
 KINDS = ["jzt_campaign", "jst_campaign", "jst_sku", "jst_searchword", "kw",
-         "sz_product", "sz_flow", "oplog"]
+         "sz_product", "sz_flow", "oplog", "crowd", "area"]
 
 # 广告类报表可相加的字段
 AD_SUM = ["impressions", "clicks", "cost", "totalOrderCnt", "totalOrderSum", "totalCartCnt"]
+# 人群报表额外可加的字段（DMP 人群包效果）
+CROWD_EXTRA_SUM = ["newCustomersCnt", "newCustomersOrderCnt", "newCustomersGMV",
+                   "dealUserCnt", "shopAttentionCnt", "goodsAttentionCnt", "visitorCnt"]
+# 地域报表额外可加的字段
+AREA_EXTRA_SUM = ["totalPresaleOrderCnt", "totalPresaleOrderSum"]
 
 AGG = {
     "jzt_campaign": {"key": ["campaignId"], "sum": AD_SUM,
@@ -40,6 +45,12 @@ AGG = {
                        "keep": ["campaignName", "searchTerm"]},
     "kw": {"key": ["campaignId", "groupId", "keywordName", "targetingType"], "sum": AD_SUM,
            "keep": ["campaignName", "groupName", "keywordName", "targetingType"]},
+    # 人群：按 DMP 人群包 × 计划 汇总（人群包名挂在 dmpName）
+    "crowd": {"key": ["crowdId", "campaignId"], "sum": AD_SUM + CROWD_EXTRA_SUM,
+              "keep": ["dmpName", "campaignName"]},
+    # 地域：按投放地域汇总（mappedAreaName）
+    "area": {"key": ["mappedAreaName"], "sum": AD_SUM + AREA_EXTRA_SUM,
+             "keep": ["mappedAreaName"]},
 }
 
 _lock = threading.RLock()

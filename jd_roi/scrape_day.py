@@ -29,6 +29,7 @@ from .scrape_jst_report import API as JST_API, COLS_ACCOUNT, COLS_SW
 from .scrape_jzt import CAMPAIGN_API, CUSTOM_COLUMNS
 from .scrape_keyword import COLUMNS as KW_COLS, KEYWORD_API
 from .scrape_sz import INDICATORS, SzSession, URL_CORE, URL_FLOWSRC, URL_PRODUCT, _base
+from .scrape_target import fetch_area_days, fetch_crowd_days
 
 _JST_KEY = {"jst_campaign": "campaign", "jst_sku": "sku", "jst_searchword": "searchword"}
 # 允许直接传接口短名（campaign/sku/searchword），避免调用方传错 key 时静默失败
@@ -141,7 +142,7 @@ def cancel_running(force: bool = False) -> dict:
 
 def run_background(accounts=None, start: str | None = None, end: str | None = None,
                    force: bool = False, kinds=None, log=None, name: str = "scrape",
-                   trigger: str = "manual") -> dict:
+                   trigger: str = "manual", after=None) -> dict:
     """占锁 + 起后台线程抓取，**无论成功、失败、线程起不来，都保证释放锁**。
 
     以前网页/定时两条路径都是「在 except 里 release」，抓取成功就漏解，
@@ -155,7 +156,7 @@ def run_background(accounts=None, start: str | None = None, end: str | None = No
         try:
             scrape(accounts, start, end, force=force, kinds=kinds,
                    log=log or (lambda m: None), acquire_lock=False,
-                   trigger=trigger, name=name)
+                   trigger=trigger, name=name, after=after)
         except Exception:  # noqa: BLE001
             tb = traceback.format_exc()[-500:]
             _RUNNING.update({"active": False, "error": tb})
@@ -646,8 +647,11 @@ def fetch_oplog_range(page, acct_key: str, start: str, end: str) -> dict:
 def scrape(accounts=None, start: str | None = None, end: str | None = None,
            force: bool = False, kinds=None, log=lambda m: None,
            acquire_lock: bool = True, trigger: str = "cli",
-           name: str | None = None) -> dict:
-    """抓取 [start, end]（含）每天的数据。已存在的天默认跳过。"""
+           name: str | None = None, after=None) -> dict:
+    """抓取 [start, end]（含）每天的数据。已存在的天默认跳过。
+
+    after: 可选后置回调 after(summary)，仅在**成功**完成时调用（用于触发 AI 解读等）。
+    """
     settings.ensure_dirs()
     accounts = accounts or settings.ACCOUNTS
     end = ds.norm_day(end or (ds.today() - dt.timedelta(days=1)))
@@ -698,6 +702,7 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
             try:
                 p_jzt = context.new_page()
                 p_kw = context.new_page()
+                p_tgt = context.new_page()   # 人群/地域等定向类报表
                 # 必须先访问京准通首页建立 SSO，否则 atoms-api/jzt-api 直接返回 -100 登录失败
                 p_jzt.goto("https://jzt.jd.com/msa/#/list/tab/plan?objective=overview",
                            wait_until="domcontentloaded", timeout=90000)
@@ -786,6 +791,39 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                     except Exception as exc:  # noqa: BLE001
                         acc_sum["errors"].append(f"oplog: {exc}")
                         log(f"[{label}] 操作日志失败：{exc}")
+
+                # --- 定向类：人群（DMP 人群包）/ 地域（自定义报表）---
+                # 一次区间查询覆盖整段，再按天落盘 —— 避免每天一次请求。
+                for kind in ("crowd", "area"):
+                    if kind not in kinds:
+                        continue
+                    todo_k = [d for d in days if force or not ds.has_day(key, d, kind)]
+                    if not todo_k:
+                        log(f"[{label}] {kind} 全部已存在，跳过")
+                        continue
+                    r_start, r_end = todo_k[0], todo_k[-1]
+                    try:
+                        if kind == "crowd":
+                            p_tgt.goto("https://jzt.jd.com/report/index.html/#/rtb/basic/crowd?hideNav=1",
+                                       wait_until="domcontentloaded", timeout=90000)
+                            p_tgt.wait_for_timeout(9000)
+                            by_day = fetch_crowd_days(p_tgt, r_start, r_end,
+                                                      acct.get("account_id") or 0)
+                        else:
+                            p_tgt.goto("https://jzt.jd.com/custom-report/#/create?specificType=41",
+                                       wait_until="domcontentloaded", timeout=90000)
+                            p_tgt.wait_for_timeout(13000)
+                            by_day = fetch_area_days(p_tgt, r_start, r_end,
+                                                     account_id=acct.get("account_id") or 0)
+                        for day in todo_k:
+                            ds.save_day(key, day, kind,
+                                        {"rows": by_day.get(day, []),
+                                         "dateStart": day, "dateEnd": day})
+                        log(f"[{label}] {kind} 完成：{r_start}~{r_end} "
+                            f"{sum(len(by_day.get(d, [])) for d in todo_k)} 行 / {len(todo_k)} 天")
+                    except Exception as exc:  # noqa: BLE001
+                        acc_sum["errors"].append(f"{kind}: {exc}")
+                        log(f"[{label}] {kind} 失败：{exc}")
             finally:
                 try:
                     context.close()
@@ -809,6 +847,11 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
         finish_task(status, summary, err)
         if acquire_lock:
             release()
+    if after:
+        try:
+            after(summary)
+        except Exception as exc:  # noqa: BLE001  后置任务失败不影响抓取结果
+            append_log(f"[after] 后置任务失败：{type(exc).__name__}: {exc}")
     ds.write_state(lastRun=summary, lastRunAt=finished)
     return summary
 
@@ -867,6 +910,7 @@ def main() -> int:
     account = None
     force = False
     days = None
+    kinds = None
     rest = []
     for a in argv:
         if a.startswith("--account="):
@@ -875,6 +919,8 @@ def main() -> int:
             force = True
         elif a.startswith("--days="):
             days = int(a.split("=", 1)[1])
+        elif a.startswith("--kinds="):
+            kinds = [k.strip() for k in a.split("=", 1)[1].split(",") if k.strip()]
         else:
             rest.append(a)
     accs = [settings.get_account(account)] if account else settings.ACCOUNTS
@@ -882,8 +928,9 @@ def main() -> int:
         start, end = rest[0], rest[1]
     else:
         start, end = default_range(days)
-    print(f"[scrape_day] {start} ~ {end} accounts={[a['key'] for a in accs]} force={force}", flush=True)
-    res = scrape(accs, start, end, force=force, log=lambda m: print(m, flush=True))
+    print(f"[scrape_day] {start} ~ {end} accounts={[a['key'] for a in accs]} "
+          f"force={force} kinds={kinds or 'all'}", flush=True)
+    res = scrape(accs, start, end, force=force, kinds=kinds, log=lambda m: print(m, flush=True))
     for k, v in res["accounts"].items():
         print(f"  {v['label']}: 天数 {len(v['days'])} 错误 {len(v['errors'])}")
         for e in v["errors"][:8]:

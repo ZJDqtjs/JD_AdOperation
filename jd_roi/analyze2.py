@@ -755,6 +755,10 @@ def plan_rows(accts, model, skus=None):
                 cid = str(r.get("campaignId"))
                 e = ids.setdefault(cid, {"campaignId": cid, "name": r.get("campaignName"),
                                          "type": None, "wins": {}})
+                # 快车关键词计划兜底认类型（targetingType=2=关键词），
+                # 免得概览(jzt) 缺 campaignType 时被归进「其他」
+                if e.get("type") is None and _i(r.get("targetingType")) == 2:
+                    e["type"] = 2
         for cid, e in ids.items():
             for wk in WKEYS:
                 e["wins"].setdefault(wk, _empty())
@@ -1133,6 +1137,102 @@ def _coverage_block(active, wins):
     return out
 
 
+# ---------------- 定向类（人群 / 地域）----------------
+def _num(v, d=0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return d
+
+
+def targeting_rows(active, wins):
+    """人群（DMP 人群包）与地域的按窗口聚合。
+
+    返回 {"crowd": {account: {wk: [{...}]}}, "area": {account: {wk: [{...}]}}}。
+    这两个维度是「有没有在用定向」的直接证据：
+      * 人群包只有「默认浏览/购买人群」→ 说明没建自定义 DMP 人群；
+      * 地域只有少数几个省有花费 → 说明没做地域屏蔽/分层。
+    """
+    from . import dailystore as dstore
+    out = {"crowd": {}, "area": {}}
+    for a in active:
+        key = a["key"]
+        out["crowd"][key] = {}
+        out["area"][key] = {}
+        for kind in ("crowd", "area"):
+            for wk, s, e, _lab in wins:
+                w = dstore.load_window(key, kind, s, e)
+                rows = (w or {}).get("rows") or []
+                items = []
+                for r in rows:
+                    cost = _num(r.get("cost"))
+                    amt = _num(r.get("totalOrderSum"))
+                    ordv = _num(r.get("totalOrderCnt"))
+                    imp = _num(r.get("impressions"))
+                    clk = _num(r.get("clicks"))
+                    if cost <= 0 and imp <= 0:
+                        continue
+                    if kind == "crowd":
+                        items.append({
+                            "name": r.get("dmpName") or "—",
+                            "crowdId": r.get("crowdId"),
+                            "plan": r.get("campaignName"),
+                            "cost": round(cost, 1), "amt": round(amt, 1), "ord": int(ordv),
+                            "roi": round(amt / cost, 2) if cost else 0.0,
+                            "ctr": round(clk / imp * 100, 2) if imp else 0.0,
+                            "imp": int(imp), "clk": int(clk),
+                            "newCustomers": int(_num(r.get("newCustomersCnt"))),
+                            "newGmv": round(_num(r.get("newCustomersGMV")), 1),
+                            "dealUsers": int(_num(r.get("dealUserCnt"))),
+                        })
+                    else:
+                        items.append({
+                            "name": r.get("mappedAreaName") or "其他",
+                            "cost": round(cost, 1), "amt": round(amt, 1), "ord": int(ordv),
+                            "roi": round(amt / cost, 2) if cost else 0.0,
+                            "ctr": round(clk / imp * 100, 2) if imp else 0.0,
+                            "imp": int(imp), "clk": int(clk),
+                        })
+                items.sort(key=lambda x: -x["cost"])
+                out[kind][key][wk] = items
+    return out
+
+
+def targeting_gaps(targeting, accts):
+    """由代码先算出「定向是否在用」的客观缺口，供 AI 引用（不臆测）。"""
+    gaps = []
+    for a in accts:
+        key = a["key"]
+        label = a.get("label") or key
+        crowd_w2 = (targeting["crowd"].get(key) or {}).get("w2") or []
+        names = {c["name"] for c in crowd_w2 if c.get("name") and c["name"] != "—"}
+        custom = {n for n in names if "默认" not in n}
+        if not crowd_w2:
+            gaps.append({"account": key, "label": label, "type": "crowd",
+                         "finding": "本期没有任何人群维度花费：说明未启用人群定向（或全部计划都没有人群包）。",
+                         "suggest": "对吃人群的品（高客单/小众精准）加 DMP 人群定向并做低出高溢。"})
+        elif not custom:
+            gaps.append({"account": key, "label": label, "type": "crowd",
+                         "finding": f"本期人群花费全部来自系统默认人群（{ '、'.join(sorted(names)) }），"
+                                    "没有自定义 DMP 人群包。",
+                         "suggest": "用 DMP 建「竞品人群 / 店铺行为人群 / 八大人群」并单开计划测试。"})
+        area_w2 = (targeting["area"].get(key) or {}).get("w2") or []
+        if area_w2:
+            total_cost = sum(x["cost"] for x in area_w2) or 1.0
+            bad = [x for x in area_w2 if x["cost"] >= 50 and x["roi"] <= 0]
+            heavy = sorted(area_w2, key=lambda x: -x["cost"])[:5]
+            gaps.append({"account": key, "label": label, "type": "area",
+                         "finding": f"本期覆盖 {len(area_w2)} 个地域；花费前五："
+                                    + "、".join(f"{x['name']}({x['cost']}元/ROI{x['roi']})" for x in heavy)
+                                    + (f"；其中有 {len(bad)} 个地域花费≥50 且 0 成交。" if bad else "。"),
+                         "suggest": "对高花费低投产的地域考虑降价或屏蔽；对高投产地域提高出价比例。"})
+        else:
+            gaps.append({"account": key, "label": label, "type": "area",
+                         "finding": "本期没有地域维度数据（该账号本轮未抓到或该产品线不支持）。",
+                         "suggest": "核对是否开启了只投目标地域的设置。"})
+    return gaps
+
+
 # ---------------- 决策建议 ----------------
 def _acct_label(accts) -> str:
     """按实际参与分析的账号生成措辞，避免只选一个账号时还写「两账号」。"""
@@ -1269,6 +1369,8 @@ def build(start=None, end=None, windows=None, accounts=None):
     words = word_rows(active, model, beByName)
     adj = adjustments(active, ops, plans, wins, span_from=win2[1], span_to=win2[2])
     advice = build_advice(active, totals, skus, plans, ops, words, adj)
+    targeting = targeting_rows(active, wins)
+    t_gaps = targeting_gaps(targeting, active)
     # 整店一条「加权保本线」：按本期各 SKU 成交额加权毛利率取倒数，
     # 用它替代「全店一条线」做汇总文案，才不会把高毛利 SKU 的花费算成打平
     beBlend, marginBlend = blended_breakeven(
@@ -1296,6 +1398,8 @@ def build(start=None, end=None, windows=None, accounts=None):
         "skus": skus,
         "noAd": no_ad,
         "typeSplit": type_split(active),
+        "targeting": targeting,
+        "targetingGaps": t_gaps,
         "ops": ops,
         "adjustments": adj,
         "words": {a["key"]: {wk: {cid: {"sw": v["sw"][:60], "kw": v["kw"][:40]}

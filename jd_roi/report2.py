@@ -16,100 +16,113 @@ from . import config
 ASSETS = Path(__file__).resolve().parent / "assets" / "echarts.min.js"
 
 CSS = """:root{
-  --bg:#f5f7fa; --card:#fff; --ink:#111827; --sub:#6b7280; --line:#e5e7eb;
-  --green:#16a34a; --greenbg:#ecfdf5; --amber:#d97706; --amberbg:#fffbeb;
-  --red:#dc2626; --redbg:#fef2f2; --blue:#2563eb; --bluebg:#eff6ff; --purple:#7c3aed;
+  --canvas:#faf9f5; --soft:#f5f0e8; --surface-card:#efe9de; --cream:#e8e0d2;
+  --ink:#141413; --body:#3d3d3a; --strong:#252523; --muted:#6c6a64; --muted2:#8e8b82;
+  --hair:#e6dfd8; --hair2:#ebe6df;
+  --primary:#cc785c; --primary-a:#a9583e; --on-primary:#ffffff;
+  --dark:#181715; --dark-elev:#252320; --dark-soft:#1f1e1b; --on-dark:#faf9f5; --on-dark-soft:#a09d96;
+  --green:#5db872; --greenbg:#e8f2ea; --amber:#d4a017; --amberbg:#f6efda;
+  --red:#c64545; --redbg:#f6e6e3; --blue:#cc785c; --bluebg:#f4e9e3; --purple:#5db8a6;
+  --teal:#5db8a6; --tealbg:#e4f1ee;
+  --bg:var(--canvas); --card:#faf9f5; --sub:var(--muted); --line:var(--hair);
+  --serif:Georgia,"Songti SC","STSong","SimSun","Noto Serif SC","Source Han Serif SC",serif;
+  --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
-  font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+body{margin:0;background:var(--canvas);color:var(--body);
+  font-family:var(--sans);
   font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
 .wrap{max-width:1560px;margin:0 auto;padding:0 20px 60px}
-header.top{background:linear-gradient(120deg,#0f172a,#1e3a8a);color:#fff;padding:26px 0 20px;margin-bottom:18px}
+header.top{background:var(--soft);border-bottom:1px solid var(--hair);color:var(--ink);padding:34px 0 0;margin-bottom:22px}
 header.top .wrap{padding-bottom:0}
-h1{margin:0 0 6px;font-size:24px;font-weight:700;letter-spacing:.5px}
-.metaline{color:#c7d2fe;font-size:13px}
-.tabs{display:flex;gap:6px;margin-top:16px;flex-wrap:wrap}
-.tab{padding:9px 18px;border-radius:9px 9px 0 0;background:rgba(255,255,255,.12);color:#e0e7ff;
-  cursor:pointer;font-weight:600;font-size:14px;border:1px solid transparent;border-bottom:none;user-select:none}
-.tab:hover{background:rgba(255,255,255,.22)}
-.tab.active{background:var(--bg);color:#1e3a8a}
+h1{margin:0 0 8px;font-size:32px;font-weight:400;font-family:var(--serif);letter-spacing:-.5px;color:var(--ink);
+  display:flex;align-items:center;gap:12px}
+.metaline{color:var(--muted);font-size:13px}
+.tabs{display:flex;gap:6px;margin-top:20px;flex-wrap:wrap}
+.tab{padding:9px 18px;border-radius:8px 8px 0 0;background:transparent;color:var(--muted);
+  cursor:pointer;font-weight:500;font-size:14px;border:1px solid transparent;border-bottom:none;user-select:none}
+.tab:hover{background:var(--cream)}
+.tab.active{background:var(--surface-card);color:var(--ink)}
 section.page{display:none}
 section.page.active{display:block}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:16px;
-  box-shadow:0 1px 3px rgba(16,24,40,.04)}
-.card h2{margin:0 0 4px;font-size:17px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.card h2 .tagline{font-size:12px;font-weight:400;color:var(--sub)}
-.card h3{margin:18px 0 8px;font-size:15px;font-weight:700}
-.hint{color:var(--sub);font-size:12.5px;margin:2px 0 12px}
+.card{background:var(--canvas);border:1px solid var(--hair);border-radius:12px;padding:20px 22px;margin-bottom:16px}
+.card h2{margin:0 0 4px;font-size:22px;font-weight:400;font-family:var(--serif);letter-spacing:-.3px;
+  color:var(--ink);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h2 .tagline{font-size:12px;font-weight:400;color:var(--muted);font-family:var(--sans);letter-spacing:0}
+.card h3{margin:18px 0 8px;font-size:16px;font-weight:500;color:var(--strong)}
+.hint{color:var(--muted);font-size:12.5px;margin:2px 0 12px}
 .grid{display:grid;gap:14px}
 .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
 .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
 .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
 @media(max-width:1100px){.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:720px){.g2,.g3,.g4{grid-template-columns:1fr}}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.kpi .lbl{font-size:12.5px;color:var(--sub);margin-bottom:6px;display:flex;justify-content:space-between;gap:8px}
-.kpi .val{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
-.kpi .sub{font-size:12px;color:var(--sub);margin-top:5px;font-variant-numeric:tabular-nums}
-.up{color:var(--green)} .down{color:var(--red)} .flat{color:var(--sub)}
-.badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap}
-.b-grow{background:var(--greenbg);color:var(--green)}
-.b-opt{background:var(--amberbg);color:var(--amber)}
-.b-stop{background:var(--redbg);color:var(--red)}
-.b-bad{background:#fde8e8;color:#991b1b}
-.b-idle{background:#f3f4f6;color:var(--sub)}
-.b-ok{background:var(--greenbg);color:var(--green)}
-.b-warn{background:var(--amberbg);color:var(--amber)}
-.b-info{background:var(--bluebg);color:var(--blue)}
-.b-vio{background:#f5f3ff;color:var(--purple)}
+.kpi{background:var(--surface-card);border:1px solid var(--hair);border-radius:12px;padding:16px 18px}
+.kpi .lbl{font-size:12.5px;color:var(--muted);margin-bottom:6px;display:flex;justify-content:space-between;gap:8px}
+.kpi .val{font-size:26px;font-weight:400;font-family:var(--serif);color:var(--ink);
+  font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.kpi .sub{font-size:12px;color:var(--muted);margin-top:5px;font-variant-numeric:tabular-nums}
+.up{color:#3e7d55} .down{color:#b8433a} .flat{color:var(--muted)}
+.badge{display:inline-block;padding:2px 10px;border-radius:9999px;font-size:12px;font-weight:600;white-space:nowrap}
+.b-grow{background:var(--greenbg);color:#3e7d55}
+.b-opt{background:var(--amberbg);color:#8a6a1e}
+.b-stop{background:var(--redbg);color:#a5382f}
+.b-bad{background:var(--redbg);color:#a5382f}
+.b-idle{background:var(--surface-card);color:var(--muted)}
+.b-ok{background:var(--greenbg);color:#3e7d55}
+.b-warn{background:var(--amberbg);color:#8a6a1e}
+.b-info{background:var(--bluebg);color:var(--primary-a)}
+.b-vio{background:var(--tealbg);color:#3d7d72}
 table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
-th,td{padding:8px 9px;border-bottom:1px solid var(--line);text-align:right;vertical-align:middle}
-th{background:#f9fafb;font-weight:700;color:#374151;position:sticky;top:0;z-index:2;
+th,td{padding:8px 9px;border-bottom:1px solid var(--hair);text-align:right;vertical-align:middle}
+th{background:var(--soft);font-weight:600;color:var(--strong);position:sticky;top:0;z-index:2;
   cursor:pointer;white-space:nowrap;font-size:12.5px}
 th.noSort{cursor:default}
-th:hover{background:#f3f4f6}
-.sortmark{font-size:10px;color:#94a3b8;margin-left:2px}
+th:hover{background:var(--cream)}
+.sortmark{font-size:10px;color:var(--muted2);margin-left:2px}
 td.l,th.l{text-align:left}
-td.mono,th.mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas,monospace}
-tbody tr:hover{background:#f8fafc}
-.tblwrap{overflow:auto;max-height:720px;border:1px solid var(--line);border-radius:10px}
+td.mono,th.mono{font-variant-numeric:tabular-nums;font-family:var(--mono)}
+tbody tr:hover{background:var(--soft)}
+.tblwrap{overflow:auto;max-height:720px;border:1px solid var(--hair);border-radius:10px}
 .tblwrap.short{max-height:460px}
 .prod{display:flex;align-items:center;gap:9px;min-width:250px}
-.prod img{width:36px;height:36px;border-radius:7px;object-fit:cover;background:#f3f4f6;flex:none}
+.prod img{width:36px;height:36px;border-radius:8px;object-fit:cover;background:var(--soft);flex:none}
 .prod .nm{font-weight:600;font-size:12.5px;line-height:1.35;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.prod .sid{font-size:11px;color:var(--sub);font-family:ui-monospace,monospace}
+.prod .sid{font-size:11px;color:var(--muted);font-family:var(--mono)}
 .chart{width:100%;height:330px}
 .chart.tall{height:430px}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-.chip{padding:6px 13px;border-radius:20px;border:1px solid var(--line);background:#fff;cursor:pointer;
-  font-size:12.5px;font-weight:600;color:#374151}
-.chip:hover{border-color:#94a3b8}
-.chip.on{background:#1e3a8a;color:#fff;border-color:#1e3a8a}
-.note{background:var(--bluebg);border-left:3px solid var(--blue);padding:10px 14px;border-radius:0 8px 8px 0;
-  font-size:12.5px;color:#1e40af;margin:10px 0}
+.chip{padding:6px 14px;border-radius:9999px;border:1px solid var(--hair);background:var(--canvas);cursor:pointer;
+  font-size:12.5px;font-weight:500;color:var(--muted)}
+.chip:hover{border-color:var(--primary);color:var(--ink)}
+.chip.on{background:var(--surface-card);color:var(--ink);border-color:var(--hair)}
+.note{background:var(--soft);border-left:3px solid var(--hair);padding:10px 14px;border-radius:0 8px 8px 0;
+  font-size:12.5px;color:var(--body);margin:10px 0}
 .warnbox{background:var(--amberbg);border-left:3px solid var(--amber);padding:10px 14px;border-radius:0 8px 8px 0;
-  font-size:12.5px;color:#92400e;margin:10px 0}
+  font-size:12.5px;color:#8a6a1e;margin:10px 0}
 .dangerbox{background:var(--redbg);border-left:3px solid var(--red);padding:10px 14px;border-radius:0 8px 8px 0;
-  font-size:12.5px;color:#991b1b;margin:10px 0}
+  font-size:12.5px;color:#a5382f;margin:10px 0}
 ul.sum{margin:6px 0 0;padding-left:20px}
 ul.sum li{margin:5px 0}
-.opDetail{font-size:11.5px;color:#475569;max-width:560px;word-break:break-word}
-.evt{border-left:3px solid var(--line);padding:8px 0 8px 14px;position:relative;margin-left:6px}
+.opDetail{font-size:11.5px;color:var(--muted);max-width:560px;word-break:break-word}
+.evt{border-left:3px solid var(--hair);padding:8px 0 8px 14px;position:relative;margin-left:6px}
 .evt:before{content:"";position:absolute;left:-6.5px;top:14px;width:10px;height:10px;border-radius:50%;
-  background:#cbd5e1;border:2px solid #fff}
+  background:var(--muted2);border:2px solid var(--canvas)}
 .evt.ok{border-left-color:var(--green)} .evt.ok:before{background:var(--green)}
 .evt.bad{border-left-color:var(--red)} .evt.bad:before{background:var(--red)}
 .evt.warn{border-left-color:var(--amber)} .evt.warn:before{background:var(--amber)}
 .evt .h{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
-.evt .t{font-family:ui-monospace,monospace;font-size:12px;color:var(--sub);flex:none}
-.evt .a{font-weight:700}
-.mini{font-size:12px;color:var(--sub)}
-.qtysub{display:block;font-size:11px;color:#94a3b8;font-weight:400;line-height:1.2}
-.pill{display:inline-block;background:#f1f5f9;border-radius:6px;padding:1px 7px;font-size:11.5px;color:#475569;margin-right:4px}
-.foot{color:var(--sub);font-size:12px;text-align:center;margin-top:26px;line-height:1.9}
-a.lk{color:var(--blue);text-decoration:none}
+.evt .t{font-family:var(--mono);font-size:12px;color:var(--muted);flex:none}
+.evt .a{font-weight:600;color:var(--ink)}
+.mini{font-size:12px;color:var(--muted)}
+.qtysub{display:block;font-size:11px;color:var(--muted2);font-weight:400;line-height:1.2}
+.pill{display:inline-block;background:var(--soft);border-radius:6px;padding:1px 7px;font-size:11.5px;color:var(--muted);margin-right:4px}
+.foot{background:var(--dark);color:var(--on-dark-soft);font-size:12px;text-align:center;margin-top:26px;
+  line-height:1.9;border-radius:12px;padding:28px 24px}
+.foot b{color:var(--on-dark)}
+a.lk{color:var(--primary);text-decoration:none}
 a.lk:hover{text-decoration:underline}
 """
 
@@ -186,12 +199,13 @@ function initCharts(){
   initSort();
   if(typeof echarts==='undefined'){
     document.querySelectorAll('.chart').forEach(function(d){
-      d.innerHTML='<div style="padding:20px;color:#6b7280">ECharts 未内联</div>';});
+      d.innerHTML='<div style="padding:20px;color:var(--muted)">ECharts 未内联</div>';});
     return;
   }
   (window.__CHARTS||[]).forEach(function(c){
     var el=document.getElementById(c.id); if(!el) return;
-    var ch=echarts.init(el); ch.setOption(c.option); window.__CH[c.id]=ch;
+    var opt=c.option||{}; opt.textStyle={fontFamily:'-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif',color:'#3d3d3a'};
+    var ch=echarts.init(el); ch.setOption(opt); window.__CH[c.id]=ch;
   });
   window.addEventListener('resize',function(){
     Object.keys(window.__CH).forEach(function(k){try{window.__CH[k].resize();}catch(e){}});});
@@ -310,7 +324,7 @@ def _plan_advice(p) -> str:
     return "本周无花费"
 
 # ---------------------------------------------------------------- 图表
-_PALETTE = ["#2563eb", "#16a34a", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#db2777", "#65a30d"]
+_PALETTE = ["#cc785c", "#5db8a6", "#e8a55a", "#a9583e", "#5db872", "#8e8b82", "#c64545", "#181715"]
 
 
 def _win_labels(d):
@@ -334,14 +348,14 @@ def build_charts(d):
             {"type": "value", "name": "ROI", "splitLine": {"show": False}}],
         "series": [
             {"name": "花费", "type": "bar", "data": [round(_n(comb[k]["cost"]), 0) for k in wkeys],
-             "itemStyle": {"color": "#f59e0b", "borderRadius": [4, 4, 0, 0]}, "barMaxWidth": 46,
+             "itemStyle": {"color": "#e8a55a", "borderRadius": [4, 4, 0, 0]}, "barMaxWidth": 46,
              "label": {"show": True, "position": "top", "fontSize": 11}},
             {"name": "成交", "type": "bar", "data": [round(_n(comb[k]["amt"]), 0) for k in wkeys],
-             "itemStyle": {"color": "#2563eb", "borderRadius": [4, 4, 0, 0]}, "barMaxWidth": 46,
+             "itemStyle": {"color": "#cc785c", "borderRadius": [4, 4, 0, 0]}, "barMaxWidth": 46,
              "label": {"show": True, "position": "top", "fontSize": 11}},
             {"name": "ROI", "type": "line", "yAxisIndex": 1, "smooth": True, "symbolSize": 10,
              "data": [round(_n(comb[k]["roi"]), 2) for k in wkeys],
-             "itemStyle": {"color": "#16a34a"}, "lineStyle": {"width": 3},
+             "itemStyle": {"color": "#5db872"}, "lineStyle": {"width": 3},
              "label": {"show": True, "fontSize": 12, "fontWeight": "bold"}}]}})
 
     # 2) 分账号 花费 & ROI
@@ -370,7 +384,7 @@ def build_charts(d):
     names = [(s["name"] or s["skuId"])[:16] for s in skus][::-1]
     roi = [round(_n(_latest(s)["roi"]), 2) for s in skus][::-1]
     be = [round(_n(s["breakeven"]), 2) for s in skus][::-1]
-    colors = ["#16a34a" if _n(_latest(s)["roi"]) >= _n(s["breakeven"]) else "#dc2626" for s in skus][::-1]
+    colors = ["#5db872" if _n(_latest(s)["roi"]) >= _n(s["breakeven"]) else "#c64545" for s in skus][::-1]
     charts.append({"id": "chSkuRoi", "option": {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
         "legend": {"data": ["实际ROI", "保本ROI"], "top": 0},
@@ -382,7 +396,7 @@ def build_charts(d):
                                                         for v, c in zip(roi, colors)],
              "barMaxWidth": 16, "label": {"show": True, "position": "right", "fontSize": 11}},
             {"name": "保本ROI", "type": "bar", "data": be, "barMaxWidth": 16,
-             "itemStyle": {"color": "#cbd5e1"},
+             "itemStyle": {"color": "#d9d2c7"},
              "label": {"show": True, "position": "right", "fontSize": 11}}]}})
 
     # 4) 广告渗透率
@@ -395,10 +409,10 @@ def build_charts(d):
         "xAxis": {"type": "value", "name": "广告成交/店铺成交 %", "max": 100},
         "yAxis": {"type": "category", "data": pnames, "axisLabel": {"fontSize": 11}},
         "series": [{"type": "bar", "data": pval, "barMaxWidth": 16,
-                    "itemStyle": {"color": "#7c3aed", "borderRadius": [0, 4, 4, 0]},
+                    "itemStyle": {"color": "#5db8a6", "borderRadius": [0, 4, 4, 0]},
                     "label": {"show": True, "position": "right", "fontSize": 11, "formatter": "{c}%"},
                     "markLine": {"silent": True, "symbol": "none",
-                                 "lineStyle": {"color": "#dc2626", "type": "dashed"},
+                                 "lineStyle": {"color": "#c64545", "type": "dashed"},
                                  "data": [{"xAxis": 100, "label": {"formatter": "广告=自然"}}]}}]}})
 
     # 5) 人工调整前后 ROI
@@ -425,9 +439,9 @@ def build_charts(d):
             "yAxis": {"type": "category", "data": an, "axisLabel": {"fontSize": 11}},
             "series": [
                 {"name": "调整前7天ROI", "type": "bar", "data": b, "barMaxWidth": 13,
-                 "itemStyle": {"color": "#94a3b8"}, "label": {"show": True, "position": "right", "fontSize": 10}},
+                 "itemStyle": {"color": "#b9b1a4"}, "label": {"show": True, "position": "right", "fontSize": 10}},
                 {"name": "调整后7天ROI", "type": "bar", "data": aft, "barMaxWidth": 13,
-                 "itemStyle": {"color": "#2563eb"}, "label": {"show": True, "position": "right", "fontSize": 10}}]}})
+                 "itemStyle": {"color": "#cc785c"}, "label": {"show": True, "position": "right", "fontSize": 10}}]}})
 
     # 6) 生意大盘：商智访客 / 广告点击 / 订单
     sv, sc, so = [], [], []
@@ -447,11 +461,11 @@ def build_charts(d):
         "yAxis": {"type": "value", "name": "数量"},
         "series": [
             {"name": "店铺访客", "type": "bar", "data": sv, "barMaxWidth": 44,
-             "itemStyle": {"color": "#0891b2", "borderRadius": [4, 4, 0, 0]}},
+             "itemStyle": {"color": "#5db8a6", "borderRadius": [4, 4, 0, 0]}},
             {"name": "广告点击", "type": "bar", "data": sc, "barMaxWidth": 44,
-             "itemStyle": {"color": "#f59e0b", "borderRadius": [4, 4, 0, 0]}},
+             "itemStyle": {"color": "#e8a55a", "borderRadius": [4, 4, 0, 0]}},
             {"name": "广告订单", "type": "bar", "data": so, "barMaxWidth": 44,
-             "itemStyle": {"color": "#16a34a", "borderRadius": [4, 4, 0, 0]}}]}})
+             "itemStyle": {"color": "#5db872", "borderRadius": [4, 4, 0, 0]}}]}})
     return charts
 
 
@@ -621,7 +635,7 @@ def _supply_cell(s) -> str:
     rate = _n(cp.get("settleRate")) * 100
     return (f'<td class="mono" data-v="{_n(cp.get("supply"))}" title="{_e(_cost_tip(s))}">'
             f'{_money(cp.get("supply"), 1)}'
-            f'<span class="mini" style="color:#8a94a6"> {rate:.0f}%</span></td>')
+            f'<span class="mini" style="color:var(--muted)"> {rate:.0f}%</span></td>')
 
 
 def _roi_tip(s, roi, be) -> str:
@@ -778,7 +792,7 @@ def _adj_block(a) -> str:
             f'<span class="a">{_e(a["plan"])}</span>{_badge(a["verdict"])}'
             f'<span class="mini">{_e(a["accountLabel"])} · {_e(a["content"])} · {_e(a["operator"])}</span></div>'
             f'<div class="opDetail">{_e(a["detail"])}</div>{perf}'
-            f'<div class="mini" style="color:#1e40af">{_e(a["note"])}</div></div>')
+            f'<div class="mini" style="color:var(--primary)">{_e(a["note"])}</div></div>')
 
 
 def page_adj(d) -> str:
@@ -944,6 +958,13 @@ def page_word(d) -> str:
         nm = (p.get("name") or "").strip()
         if nm:
             tmap[(p.get("account"), nm)] = p.get("type")
+
+    def _picked(v):
+        """该计划要看的词：优先搜索词；快车关键词计划没有搜索词明细，改用关键词。"""
+        if v.get("sw"):
+            return v["sw"], "搜索词"
+        return (v.get("kw") or []), "关键词"
+
     out = []
     for a in d["accounts"]:
         k = a["key"]
@@ -953,29 +974,31 @@ def page_word(d) -> str:
         agg = {"good": [], "waste": [], "low": []}
         blocks = []
         counts = {"kw": 0, "smart": 0, "other": 0}
-        for cid, v in sorted(per.items(), key=lambda x: -sum(w["cost"] for w in x[1]["sw"]))[:14]:
-            sw = v.get("sw") or []
-            if not sw:
+        order = sorted(per.items(), key=lambda x: -sum(w["cost"] for w in _picked(x[1])[0]))[:14]
+        for cid, v in order:
+            ws, src = _picked(v)
+            if not ws:
                 continue
             wt = _wtype_of(cid, tmap.get((k, (cid or "").strip())))
             counts[wt] += 1
-            g = [w for w in sw if w["kind"] == "good"][:12]
-            wa = [w for w in sw if w["kind"] == "waste"][:12]
-            lo = [w for w in sw if w["kind"] == "low"][:8]
-            agg["good"] += [w for w in sw if w["kind"] == "good"]
-            agg["waste"] += [w for w in sw if w["kind"] == "waste"]
-            agg["low"] += [w for w in sw if w["kind"] == "low"]
-            cost = sum(w["cost"] for w in sw)
-            roi = sum(w["amt"] for w in sw) / cost if cost else 0
+            g = [w for w in ws if w["kind"] == "good"][:12]
+            wa = [w for w in ws if w["kind"] == "waste"][:12]
+            lo = [w for w in ws if w["kind"] == "low"][:8]
+            agg["good"] += [w for w in ws if w["kind"] == "good"]
+            agg["waste"] += [w for w in ws if w["kind"] == "waste"]
+            agg["low"] += [w for w in ws if w["kind"] == "low"]
+            cost = sum(w["cost"] for w in ws)
+            roi = sum(w["amt"] for w in ws) / cost if cost else 0
+            scope = "搜索词下" if src == "搜索词" else "关键词下"
             blocks.append(f"""
 <div data-wtype="{wt}" style="border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px">
   <div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap">
-    <b>{_e(cid)}</b> <span class="pill">{WLABEL[wt]}</span>
-    <span class="mini">搜索词下：花费 ¥{_money(cost)} · ROI {roi:.2f} · 高效 {len(g)} / 废词 {len(wa)} / 低效 {len(lo)}</span>
+    <b>{_e(cid)}</b> <span class="pill">{WLABEL[wt]} · {src}</span>
+    <span class="mini">{scope}：花费 ¥{_money(cost)} · ROI {roi:.2f} · 高效 {len(g)} / 废词 {len(wa)} / 低效 {len(lo)}</span>
   </div>
-  <div style="margin-top:8px"><span class="mini">✅ 高效词（提价/加词）</span><br>{_word_pills(g, "good")}</div>
-  <div style="margin-top:8px"><span class="mini">🚫 0单废词（直接否定）</span><br>{_word_pills(wa, "waste")}</div>
-  <div style="margin-top:8px"><span class="mini">⚠️ 低效词（降价或精准否定）</span><br>{_word_pills(lo, "low")}</div>
+  <div style="margin-top:8px"><span class="mini">✅ 高效（提价/加词）</span><br>{_word_pills(g, "good")}</div>
+  <div style="margin-top:8px"><span class="mini">🚫 0 单废词（直接否定）</span><br>{_word_pills(wa, "waste")}</div>
+  <div style="margin-top:8px"><span class="mini">⚠️ 低效（降价或精准否定）</span><br>{_word_pills(lo, "low")}</div>
 </div>""")
         wa_cost = sum(w["cost"] for w in agg["waste"])
         wa_top = sorted(agg["waste"], key=lambda x: -x["cost"])[:8]
@@ -989,13 +1012,14 @@ def page_word(d) -> str:
 <div class="card">
   <h2>{_e(a["label"])} · 搜索词诊断 <span class="tagline">{_e(wk)} 窗口，按花费排序前 14 个计划</span></h2>
   <p class="hint">
-    高效词 {len(agg["good"])} 个 · 0单废词 {len(agg["waste"])} 个（浪费 ¥{_money(wa_cost)}）· 低效词 {len(agg["low"])} 个。
+    高效 {len(agg["good"])} 个 · 0单废词 {len(agg["waste"])} 个（浪费 ¥{_money(wa_cost)}）· 低效 {len(agg["low"])} 个。
     判定标准：高效=订单≥2 且 ROI&gt;4.00；废词=花费≥3 且 0 单；低效=花费≥10 且 ROI&lt;4.00。
+    关键词推广计划看「关键词」，智能化 / 全站智能推广计划看「搜索词」。
   </p>
   <div class="toolbar" style="margin:2px 0 6px">{chips}</div>
   <p class="mini" style="margin:0 0 10px">智能化 / 全站智能推广计划的词由系统自动调控，<b>不能手工增删</b>；要调词请切到「关键词」。</p>
   <div class="dangerbox"><b>最该否定的词</b>：{'、'.join(f'{_e(w["word"])}(¥{_money(w["cost"])})' for w in wa_top) or '无'}</div>
-  {''.join(blocks) or '<p class="hint">该账号本窗口没有搜索词数据。</p>'}
+  {''.join(blocks) or '<p class="hint">该账号本窗口没有搜索词 / 关键词数据。</p>'}
 </div>""")
     return "".join(out)
 
@@ -1090,21 +1114,21 @@ def page_action(d) -> str:
 
 
 UI_CSS = """
-.rangebar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;
-  background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.18);border-radius:10px;padding:10px 12px}
-.rangebar label{font-size:12.5px;color:#e0e7ff;display:flex;align-items:center;gap:5px}
-.rangebar input[type=date]{background:#fff;border:none;border-radius:7px;padding:6px 8px;font-size:13px;color:#111827}
-.rangebar input[type=checkbox]{accent-color:#a5b4fc}
-.rangebar button[type=submit]{background:#22c55e;color:#052e16;border:none;border-radius:8px;padding:7px 16px;
-  font-weight:700;cursor:pointer;font-size:13px}
-.rangebar button[type=submit]:hover{background:#16a34a;color:#fff}
-.rangebar .pre{padding:5px 11px;border-radius:20px;border:1px solid rgba(255,255,255,.35);
-  background:transparent;color:#e0e7ff;cursor:pointer;font-size:12px}
-.rangebar .pre:hover{background:rgba(255,255,255,.18)}
-.rangebar a{color:#c7d2fe;font-size:12.5px;text-decoration:none;margin-left:6px}
+.rangebar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;
+  background:var(--canvas);border:1px solid var(--hair);border-radius:12px;padding:10px 12px}
+.rangebar label{font-size:12.5px;color:var(--muted);display:flex;align-items:center;gap:5px}
+.rangebar input[type=date]{background:var(--canvas);border:1px solid var(--hair);border-radius:8px;padding:6px 8px;font-size:13px;color:var(--ink)}
+.rangebar input[type=checkbox]{accent-color:var(--primary)}
+.rangebar button[type=submit]{background:var(--primary);color:var(--on-primary);border:none;border-radius:8px;padding:8px 16px;
+  font-weight:500;cursor:pointer;font-size:13px}
+.rangebar button[type=submit]:hover{background:var(--primary-a)}
+.rangebar .pre{padding:5px 12px;border-radius:9999px;border:1px solid var(--hair);
+  background:var(--canvas);color:var(--muted);cursor:pointer;font-size:12px}
+.rangebar .pre:hover{background:var(--surface-card);color:var(--ink)}
+.rangebar a{color:var(--primary);font-size:12.5px;text-decoration:none;margin-left:6px}
 .rangebar a:hover{text-decoration:underline}
-.covbox{background:#fffbeb;border-left:3px solid #d97706;padding:10px 14px;border-radius:0 8px 8px 0;
-  font-size:12.5px;color:#92400e;margin-bottom:14px}
+.covbox{background:var(--amberbg);border-left:3px solid var(--amber);padding:10px 14px;border-radius:0 8px 8px 0;
+  font-size:12.5px;color:#8a6a1e;margin-bottom:14px}
 """
 
 
@@ -1220,15 +1244,202 @@ def _echarts_src() -> str:
     return _ECHARTS_CACHE["src"]
 
 
-def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 × 按商品 × 调整复盘") -> str:
+AI_CSS = """
+.aicard{border:1px solid var(--hair);border-radius:12px;padding:16px 18px;margin:14px 0;background:var(--surface-card)}
+.aicard.empty{background:var(--soft);border-style:dashed}
+.aihd{display:flex;align-items:center;gap:9px;flex-wrap:wrap;font-size:16px;font-weight:400;font-family:var(--serif);color:var(--ink)}
+.aibadge{display:inline-block;background:var(--primary);color:var(--on-primary);border-radius:6px;padding:1px 8px;font-size:12px;font-weight:600;font-family:var(--sans)}
+.aibadge.off{background:var(--muted2)}
+.aimeta{font-size:12px;color:var(--muted);font-weight:400;font-family:var(--sans)}
+.aiov{margin:10px 0 12px;font-size:13.5px;line-height:1.7;color:var(--body)}
+.aigrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.aicol{background:var(--canvas);border:1px solid var(--hair);border-radius:9px;padding:10px 12px}
+.aicol h4{margin:0 0 7px;font-size:13px;color:var(--strong)}
+.aicol ul{margin:0;padding-left:17px}
+.aicol li{font-size:12.8px;margin:3px 0;line-height:1.6}
+.aipri{display:inline-block;border-radius:5px;padding:0 6px;font-size:11.5px;font-weight:600;margin-right:6px}
+.aipri.l1{background:var(--redbg);color:#a5382f}.aipri.l2{background:var(--amberbg);color:#8a6a1e}.aipri.l3{background:var(--greenbg);color:#3e7d55}
+.aibtn{margin-left:auto;border:1px solid var(--primary);background:var(--canvas);color:var(--primary);border-radius:8px;padding:5px 12px;font-size:12.5px;cursor:pointer}
+.aibtn:disabled{opacity:.55;cursor:default}
+.aibtn:hover:not(:disabled){background:var(--primary);color:var(--on-primary)}
+.aidisc{margin-top:10px;font-size:11.5px;color:var(--muted2)}
+.aidt{margin-top:10px}
+.aidt>summary{cursor:pointer;font-size:13px;font-weight:500;color:var(--primary)}
+.aip{margin:9px 0;padding:9px 11px;background:var(--canvas);border:1px solid var(--hair);border-radius:8px}
+.aip .t{font-size:13px;font-weight:600;color:var(--ink)}
+.aip .b{font-size:12.6px;color:var(--body);margin-top:4px;line-height:1.6}
+.aik{display:inline-block;border-radius:4px;padding:0 5px;margin:1px 3px 1px 0;font-size:11.5px;font-family:var(--mono)}
+.aik.neg{background:var(--redbg);color:#a5382f}.aik.boost{background:var(--greenbg);color:#3e7d55}
+.aihead{font-size:18px;font-weight:400;font-family:var(--serif);color:var(--ink);margin:8px 0 2px;line-height:1.5;letter-spacing:-.2px}
+.aivd{color:var(--primary);font-weight:600}
+.aiacts{margin:6px 0 0;padding-left:18px}
+.aiacts li{font-size:12.8px;margin:3px 0;line-height:1.6}
+"""
+
+
+def _ai_block(ai, d, link: bool = True) -> str:
+    meta = d.get("meta") or {}
+    rng = meta.get("range") or {}
+    start = rng.get("start") or ""
+    end = rng.get("end") or ""
+    keys = ",".join(a.get("key", "") for a in (meta.get("accounts") or []))
+    if not ai:
+        return f"""<div class="aicard empty">
+  <div class="aihd"><span class="aibadge off">AI</span> AI 运营解读
+    <span class="aimeta">当前区间（{_e(start)} ~ {_e(end)}）暂无 AI 解读</span>
+    <button class="aibtn" onclick="genAi(this, '{_e(start)}', '{_e(end)}', '{_e(keys)}')">生成本区间解读</button>
+  </div>
+  <div class="aidisc">每晚自动任务会**贴着本地已抓取的数据**生成 AI 解读（套用《京东快车底层逻辑》方法论）；
+也可点按钮即时生成（约 1~2 分钟）。</div>
+</div>"""
+
+    a = ai.get("advice") or {}
+    v = ai.get("validation") or {}
+    n_pj = v.get("n_plan_judgements", v.get("n_plan_actions", 0))
+    n_warn = len(v.get("warnings") or []) + len(v.get("issues") or [])
+    ok = "通过" if v.get("ok") else "有问题"
+    conf = str(a.get("confidence") or "")
+    head = (f'<div class="aihd"><span class="aibadge">AI</span> AI 运营解读'
+            f'<span class="aimeta">模型 {_e(str(ai.get("model")))} ｜ 生成 {_e(str(ai.get("generatedAt")))} ｜ '
+            f'方法论 {_e(str(ai.get("methodology_source")))} ｜ 校验 {ok}'
+            f'（{n_pj} 条计划判断/{n_warn} 告警'
+            + (f'/置信 {_e(conf)}' if conf else '') + '）</span>'
+            f'<button class="aibtn" onclick="genAi(this, \'{_e(start)}\', \'{_e(end)}\', \'{_e(keys)}\')">重新生成</button></div>')
+
+    hd = ""
+    if a.get("headline"):
+        hd = f'<div class="aihead">{_e(str(a.get("headline")))}</div>'
+    h = a.get("health") or {}
+    hl = ""
+    if h:
+        hl = (f'<div class="aiov"><b>健康度：{_e(str(h.get("verdict") or "—"))}'
+              f'（{_e(str(h.get("score") or "—"))}/100）</b> —— {_e(str(h.get("reason") or ""))}</div>')
+
+    diags = "".join(
+        f'<div class="aip"><div class="t">{_e(str(x.get("aspect") or ""))}</div>'
+        f'<div class="b"><b>现象：</b>{_e(str(x.get("finding") or ""))}</div>'
+        + (f'<div class="b"><b>方法论：</b>{_e(str(x.get("method") or ""))}</div>' if x.get("method") else "")
+        + (f'<div class="b"><b>影响：</b>{_e(str(x.get("impact") or ""))}</div>' if x.get("impact") else "")
+        + '</div>'
+        for x in (a.get("diagnosis") or []))
+    diag = (f'<details class="aidt" open><summary>诊断（套方法论，{len(a.get("diagnosis") or [])} 条）</summary>'
+            f'{diags}</details>' if diags else "")
+
+    reads = "".join(f'<li><b>{_e(str(x.get("account")))}</b>：{_e(str(x.get("read")))}</li>'
+                    for x in (a.get("account_reads") or []))
+    reads_block = (f'<div class="aicol" style="margin-top:12px"><h4>账号特征</h4><ul>{reads}</ul></div>'
+                   if reads else "")
+
+    # 未用起来 / 待优化的投放功能（定向人群、地域、时间折扣、测图测词…）
+    tpri = {"高": "l1", "中": "l2", "低": "l3"}
+    tas = []
+    for t in (a.get("targeting_advice") or []):
+        pr = tpri.get(str(t.get("priority") or ""), "l2")
+        st = str(t.get("status") or "")
+        tas.append(
+            f'<div class="aip"><div class="t"><span class="aipri {pr}">{_e(str(t.get("priority") or "中"))}</span>'
+            f'{_e(str(t.get("feature") or ""))}'
+            + (f' <span class="aimeta">· {_e(st)}</span>' if st else "") + '</div>'
+            f'<div class="b"><b>证据：</b>{_e(str(t.get("evidence") or ""))}</div>'
+            + (f'<div class="b"><b>方法论：</b>{_e(str(t.get("method") or ""))}</div>' if t.get("method") else "")
+            + (f'<div class="b"><b>建议：</b>{_e(str(t.get("suggest") or ""))}</div>' if t.get("suggest") else "")
+            + '</div>')
+    tgt_block = ""
+    if tas:
+        tgt_block = (f'<details class="aidt" open><summary>未用起来 / 待优化的投放功能'
+                     f'（{len(tas)} 条 · 定向人群/地域/时段等）</summary>{"".join(tas)}</details>')
+
+    ps = []
+    for p in (a.get("plan_judgements") or []):
+        acts = "".join(f'<li>{_e(str(t))}</li>' for t in (p.get("actions") or []))
+        ps.append(f'<div class="aip"><div class="t">{_e(str(p.get("name"))) }'
+                  f'（{_e(str(p.get("campaignId")))}） · {_e(str(p.get("stage") or ""))} → '
+                  f'<span class="aivd">{_e(str(p.get("verdict") or ""))}</span></div>'
+                  f'<div class="b"><b>依据：</b>{_e(str(p.get("why") or ""))}</div>'
+                  + (f'<ul class="aiacts">{acts}</ul>' if acts else "")
+                  + '</div>')
+    dt = (f'<details class="aidt"><summary>逐计划判断（{len(ps)} 条）</summary>{"".join(ps)}</details>'
+          if ps else "")
+
+    kws = []
+    for k in (a.get("keyword_plan") or []):
+        neg = "".join(f'<span class="aik neg" title="{_e(str(w.get("why") or ""))}">{_e(str(w.get("word") or w))}</span>'
+                      for w in (k.get("negate") or []))
+        boo = "".join(f'<span class="aik boost" title="{_e(str(w.get("why") or ""))}">{_e(str(w.get("word") or w))}</span>'
+                      for w in (k.get("boost") or []))
+        bits = []
+        if neg:
+            bits.append(f'<div class="b">否定：{neg}</div>')
+        if boo:
+            bits.append(f'<div class="b">提价：{boo}</div>')
+        if bits:
+            kws.append(f'<div class="aip"><div class="t">{_e(str(k.get("campaign") or ""))}</div>'
+                       + "".join(bits) + '</div>')
+    kw_block = (f'<details class="aidt"><summary>词级建议（候选，需人工确认 · {len(kws)} 个计划）</summary>'
+                f'{"".join(kws)}</details>' if kws else "")
+
+    ra = a.get("reallocation") or {}
+    ra_block = ""
+    if ra.get("logic"):
+        ra_block = ('<div class="aicol" style="margin-top:12px"><h4>预算再分配</h4><ul>'
+                    f'<li>从：{_e("、".join(str(x) for x in (ra.get("from") or [])))}</li>'
+                    f'<li>到：{_e("、".join(str(x) for x in (ra.get("to") or [])))}</li>'
+                    f'<li>{_e(str(ra.get("logic")))}</li></ul></div>')
+    seq_items = "".join(
+        f'<li><b>{_e(str(s.get("step", i + 1)))}</b>. {_e(str(s.get("do") or ""))}'
+        f' —— <span class="aimeta">{_e(str(s.get("because") or ""))}</span></li>'
+        for i, s in enumerate(a.get("sequence") or []))
+    seq_block = (f'<div class="aicol" style="margin-top:12px"><h4>执行顺序</h4><ul>{seq_items}</ul></div>'
+                 if seq_items else "")
+    watch = "".join(f'<li>{_e(str(x))}</li>' for x in (a.get("watchlist") or []))
+    watch_block = (f'<div class="aicol" style="margin-top:12px"><h4>观察清单</h4><ul>{watch}</ul></div>'
+                   if watch else "")
+    risks = "".join(f'<li>{_e(str(r))}</li>' for r in (a.get("risks") or []))
+    risk = f'<div class="aicol" style="margin-top:12px"><h4>风险提示</h4><ul>{risks}</ul></div>' if risks else ""
+
+    warns = (v.get("issues") or []) + (v.get("warnings") or [])
+    warn = ""
+    if warns:
+        warn = ('<div class="aicol" style="margin-top:12px;border-color:var(--amber);background:var(--amberbg)">'
+                '<h4>校验告警（需人工核对）</h4><ul>'
+                + "".join(f"<li>{_e(str(w))}</li>" for w in warns) + "</ul></div>")
+
+    return (f'<div class="aicard">{head}{hd}{hl}{diag}{reads_block}{tgt_block}'
+            f'<div>{ra_block}{seq_block}{risk}{watch_block}{warn}</div>{dt}{kw_block}'
+            f'<div class="aidisc">AI 套用《京东快车底层逻辑》方法论生成，<b>仅供参考</b>；'
+            f'算数与口径由规则层代码保证，执行前请人工复核。'
+            + (f'　<a href="/ai?start={_e(start)}&end={_e(end)}&accounts={_e(keys)}">'
+               f'打开 AI 分析台（可追问）→</a>' if link else '') + '</div></div>')
+
+
+AI_JS = """
+function genAi(btn, start, end, keys){
+  if(btn.disabled) return;
+  btn.disabled=true; var old=btn.textContent; btn.textContent='生成中…（约1~2分钟）';
+  var qs='start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end)+'&accounts='+encodeURIComponent(keys);
+  fetch('/api/ai/run?'+qs,{method:'POST'}).then(function(r){return r.json();}).then(function(j){
+    if(!j.ok){ btn.disabled=false; btn.textContent=old; alert('生成失败：'+(j.error||'未知')); return; }
+    var t=setInterval(function(){
+      fetch('/api/ai/status').then(function(r){return r.json();}).then(function(s){
+        if(!s.running){ clearInterval(t); location.reload(); }
+      }).catch(function(){ clearInterval(t); btn.disabled=false; btn.textContent=old; });
+    }, 4000);
+  }).catch(function(e){ btn.disabled=false; btn.textContent=old; alert('请求失败：'+e); });
+}
+"""
+
+
+def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 × 按商品 × 调整复盘",
+           ai=None) -> str:
     charts = build_charts(d)
     chart_json = json.dumps(charts, ensure_ascii=False).replace("</", "<\\/")
     echarts_src = _echarts_src()
     tabs = "".join(
         f'<div class="tab{" active" if i == 0 else ""}" onclick="showTab(\'{cid}\',this)">{_e(label)}</div>'
         for i, (cid, label) in enumerate(TABS))
+    ai_html = _ai_block(ai, d)
     pages = [
-        ("p-ov", page_overview(d)),
+        ("p-ov", ai_html + page_overview(d)),
         ("p-sku", page_sku(d)),
         ("p-adj", page_adj(d)),
         ("p-plan", page_plan(d)),
@@ -1243,7 +1454,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_e(title)}</title>
-<style>{CSS}{UI_CSS}</style>{echarts_src}</head>
+<style>{CSS}{UI_CSS}{AI_CSS}</style>{echarts_src}</head>
 <body>
 <header class="top"><div class="wrap">
   <h1>{_e(title)}</h1>
@@ -1267,6 +1478,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
   </div>
 </div>
 <script>{JS}</script>
+<script>{AI_JS}</script>
 <script>window.__CHARTS={chart_json};</script>
 </body></html>"""
 

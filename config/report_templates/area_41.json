@@ -1,0 +1,1385 @@
+{
+ "caliberSettings": [
+  {
+   "checked": true,
+   "desc": "转化周期设置",
+   "hidden": false,
+   "key": "clickOrOrderDay",
+   "options": [
+    {
+     "checked": false,
+     "desc": "当天",
+     "hidden": false,
+     "key": "today",
+     "value": "0"
+    },
+    {
+     "checked": false,
+     "desc": "1天",
+     "hidden": false,
+     "key": "oneDay",
+     "value": "1"
+    },
+    {
+     "checked": false,
+     "desc": "3天",
+     "hidden": false,
+     "key": "threeDays",
+     "value": "3"
+    },
+    {
+     "checked": false,
+     "desc": "7天",
+     "hidden": false,
+     "key": "sevenDays",
+     "value": "7"
+    },
+    {
+     "checked": true,
+     "desc": "15天",
+     "hidden": false,
+     "key": "fifteenDays",
+     "value": "15"
+    },
+    {
+     "checked": false,
+     "desc": "30天",
+     "hidden": false,
+     "key": "thirtyDays",
+     "value": "30"
+    }
+   ]
+  },
+  {
+   "checked": true,
+   "desc": "点击/下单口径",
+   "hidden": false,
+   "key": "clickOrOrderCaliber",
+   "options": [
+    {
+     "checked": true,
+     "desc": "点击",
+     "hidden": false,
+     "key": "click",
+     "value": "0"
+    },
+    {
+     "checked": false,
+     "desc": "下单",
+     "hidden": false,
+     "key": "order",
+     "value": "1"
+    }
+   ]
+  },
+  {
+   "checked": true,
+   "desc": "含赠品/不含赠品",
+   "hidden": false,
+   "key": "giftFlag",
+   "options": [
+    {
+     "checked": false,
+     "desc": "含赠品",
+     "hidden": false,
+     "key": "include"
+    },
+    {
+     "checked": true,
+     "desc": "不含赠品",
+     "hidden": false,
+     "key": "exclude",
+     "value": "0"
+    }
+   ]
+  },
+  {
+   "checked": true,
+   "desc": "下单订单/成交订单",
+   "hidden": false,
+   "key": "orderStatusCategory",
+   "options": [
+    {
+     "checked": false,
+     "desc": "下单订单",
+     "hidden": false,
+     "key": "place"
+    },
+    {
+     "checked": true,
+     "desc": "成交订单",
+     "hidden": false,
+     "key": "done"
+    }
+   ]
+  }
+ ],
+ "checkSum": 576460752304668700,
+ "customDimension": [
+  {
+   "checked": false,
+   "desc": "基础维度",
+   "hidden": false,
+   "key": "basicDimension",
+   "options": [
+    {
+     "checked": false,
+     "desc": "产品线",
+     "groupLabel": "basicDimension",
+     "hidden": false,
+     "key": "businessType"
+    },
+    {
+     "checked": false,
+     "desc": "推广计划",
+     "groupLabel": "basicDimension",
+     "hidden": false,
+     "key": "campaign"
+    },
+    {
+     "checked": false,
+     "desc": "推广单元/品类",
+     "groupLabel": "basicDimension",
+     "hidden": false,
+     "key": "group",
+     "tip": ""
+    },
+    {
+     "checked": false,
+     "desc": "推广创意/商品",
+     "groupLabel": "basicDimension",
+     "hidden": false,
+     "key": "ad",
+     "tip": "智能投放查询的是推广商品信息；其他产品线查询的是推广创意信息"
+    },
+    {
+     "checked": false,
+     "desc": "账户名称",
+     "groupLabel": "basicDimension",
+     "hidden": false,
+     "key": "pin"
+    }
+   ]
+  },
+  {
+   "checked": false,
+   "desc": "细分维度",
+   "hidden": false,
+   "key": "detailDimension",
+   "options": [
+    {
+     "checked": true,
+     "desc": "投放地域",
+     "hidden": false,
+     "key": "mappedAreaName",
+     "tip": "投放地域是指广告实际展现的地域，对于广告播放时无法识别的地域会归于”其他“中。站外广告暂不支持查询"
+    },
+    {
+     "checked": false,
+     "desc": "营销目标",
+     "hidden": false,
+     "key": "marketingObjectiveName"
+    },
+    {
+     "checked": false,
+     "desc": "营销场景",
+     "hidden": false,
+     "key": "marketingScenarioTypeName"
+    },
+    {
+     "checked": false,
+     "desc": "搜索词",
+     "hidden": false,
+     "key": "searchTerm",
+     "tip": "搜索词查询结果明细数据"
+    },
+    {
+     "checked": false,
+     "desc": "关键词",
+     "hidden": false,
+     "key": "keyword",
+     "tip": "关键词查询结果明细数据"
+    },
+    {
+     "checked": false,
+     "desc": "关键词购买类型",
+     "hidden": false,
+     "key": "targetingType"
+    },
+    {
+     "checked": false,
+     "desc": "商品定向细分类型",
+     "hidden": false,
+     "key": "productDeliveryMatchingType",
+     "tip": "商品定向细分类型包含：商品定向、类目定向、店铺定向、相似品定向、搭配品定向"
+    },
+    {
+     "checked": false,
+     "desc": "定向目标",
+     "hidden": false,
+     "key": "productDeliveryTriggerSkuId",
+     "tip": "定向目标为商品定向下触发广告的id，其触发条件可能是sku、店铺id等"
+    },
+    {
+     "checked": false,
+     "desc": "广告定向方式",
+     "hidden": false,
+     "key": "deliveryType",
+     "tip": "1.智能投放暂不支持关键词定向查询；2.人群定向类型指通过圈定特定人群，并向这部分特定人群进行广告展示的广告类型，如推荐广告、搜索快车等业务线；3.需注意搜索快车搜索溢价人群的数据不包含在人群定向类型中"
+    },
+    {
+     "checked": false,
+     "desc": "跟单SKU",
+     "hidden": false,
+     "key": "skuDocId",
+     "tip": "注意事项：                 1.对于落地页为活动页、店铺页类广告（京选店铺等），该维度对应于设置的跟单sku id；                 2.对于落地页为商详页的广告（搜索快车、推荐广告等），该维度除了同样表示设置的跟单sku id外，还代表实际投放的sku id；                 3.智能投放的推广商品id等同于跟单sku id；                 4.站外广告skuid维度数据仅支持查看23年1月14日后的数据                 5.”未知“类型数据主要是由于站外广告腾讯、百度媒体以及其他异常广告数据缺失导致，以上数据都将归类至”未知“中"
+    },
+    {
+     "checked": false,
+     "desc": "SPU ID",
+     "hidden": false,
+     "key": "spuId",
+     "tip": "注意事项： 1.SPU维度不是广告跟单所使用维度，因此在加工过程中可能会出现spu无法关联具体广告类型的情况，只能作为辅助参考指标，无法关联的SPU数据将统一被归为“其他SPU”，建议结合使用SKU ID维度进行分析 2.SPU维度仅支持23年9月15日之后的数据"
+    },
+    {
+     "checked": false,
+     "desc": "品牌",
+     "hidden": false,
+     "key": "promotedBrand",
+     "tip": "注意事项：         1.品牌是根据推广SKU或跟单SKU关联的信息；         2.直投品牌维度数据仅支持查看22年7月以后的数据         3.”未知“类型数据主要是由于站外广告腾讯、百度媒体以及其他异常广告数据缺失导致，以上数据都将归类至”未知“中"
+    },
+    {
+     "checked": false,
+     "desc": "类目",
+     "hidden": false,
+     "key": "promotedCid",
+     "tip": "注意事项：         1.类目是根据推广SKU或跟单SKU关联的三级类目信息；         2.直投类目维度数据仅支持查看22年7月以后的数据         3.”未知“类型数据主要是由于站外广告腾讯、百度媒体以及其他异常广告数据缺失导致，以上数据都将归类至”未知“中"
+    },
+    {
+     "checked": false,
+     "desc": "投放位置",
+     "hidden": false,
+     "key": "trafficPackage",
+     "tip": "推荐广告查询的是流量包信息；站外广告暂不支持资源位的查询"
+    },
+    {
+     "checked": false,
+     "desc": "人群名称",
+     "hidden": false,
+     "key": "crowdDimension",
+     "tip": "1.搜索快车所查询的是搜索人群明细；2.互动广告、推荐广告查的是定向人群明细；3.查询结果是人群复算后的数据；4.查询结果含已删除人群；5.站外广告仅京东定向支持查询人群"
+    }
+   ]
+  }
+ ],
+ "customDimensionOptions": [
+  {
+   "checked": false,
+   "desc": "账号范围",
+   "hidden": false,
+   "key": "pin",
+   "options": [
+    {
+     "checked": false,
+     "desc": "自有账户",
+     "hidden": false,
+     "key": "subUser",
+     "options": [
+      {
+       "checked": true,
+       "desc": "梓云茶雨润禾",
+       "flag": true,
+       "hidden": false,
+       "key": "99932681599",
+       "value": "梓云茶雨润禾"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "授权账户",
+     "hidden": false,
+     "key": "authUser"
+    }
+   ]
+  },
+  {
+   "checked": false,
+   "desc": "产品线",
+   "hidden": false,
+   "key": "businessType",
+   "options": [
+    {
+     "checked": false,
+     "desc": "快车",
+     "hidden": false,
+     "key": "kuaiche",
+     "value": "-4"
+    },
+    {
+     "checked": false,
+     "desc": "站外广告",
+     "hidden": false,
+     "key": "zhitou",
+     "tip": "站外广告数据包含原京东直投+京易投数据，其中京易投包含2023年3月及以后的数据",
+     "value": "256"
+    }
+   ]
+  },
+  {
+   "checked": false,
+   "desc": "营销目标",
+   "hidden": false,
+   "key": "marketingScenarioTypeOption",
+   "options": [
+    {
+     "checked": false,
+     "desc": "商品",
+     "hidden": false,
+     "key": "商品",
+     "options": [
+      {
+       "checked": false,
+       "desc": "常规推广-智能化",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-smart",
+       "value": "1001"
+      },
+      {
+       "checked": false,
+       "desc": "常规推广-关键词",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-keyword",
+       "value": "1002"
+      },
+      {
+       "checked": false,
+       "desc": "常规推广-人群-商品成交",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-crowd",
+       "value": "1004"
+      },
+      {
+       "checked": false,
+       "desc": "常规推广-人群-人群种草",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-grassCrowd",
+       "value": "1009"
+      },
+      {
+       "checked": false,
+       "desc": "常规推广-全站智能推广",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-smartMax",
+       "value": "1016"
+      },
+      {
+       "checked": false,
+       "desc": "全店商品推广",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-fullStore",
+       "value": "2000"
+      },
+      {
+       "checked": false,
+       "desc": "新品推广",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-newSku",
+       "value": "4000"
+      },
+      {
+       "checked": false,
+       "desc": "新客转化",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-newUser",
+       "value": "5000"
+      },
+      {
+       "checked": false,
+       "desc": "品牌追击-关键词",
+       "groupLabel": "商品",
+       "hidden": false,
+       "key": "scenarioType-competitorKeyword",
+       "value": "14000"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "店铺",
+     "hidden": false,
+     "key": "店铺",
+     "options": [
+      {
+       "checked": false,
+       "desc": "顶部店铺",
+       "groupLabel": "店铺",
+       "hidden": false,
+       "key": "scenarioType-headStore",
+       "value": "6000"
+      },
+      {
+       "checked": false,
+       "desc": "腰带店铺",
+       "groupLabel": "店铺",
+       "hidden": false,
+       "key": "scenarioType-beltStore",
+       "value": "8000"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "活动",
+     "hidden": false,
+     "key": "活动",
+     "options": [
+      {
+       "checked": false,
+       "desc": "常规活动",
+       "groupLabel": "活动",
+       "hidden": false,
+       "key": "scenarioType-normalActivity",
+       "value": "9000"
+      },
+      {
+       "checked": false,
+       "desc": "主题活动",
+       "groupLabel": "活动",
+       "hidden": false,
+       "key": "scenarioType-themeActivity",
+       "value": "11000"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "内容",
+     "hidden": false,
+     "key": "内容",
+     "options": [
+      {
+       "checked": false,
+       "desc": "直播引流",
+       "groupLabel": "内容",
+       "hidden": false,
+       "key": "scenarioType-live",
+       "value": "12000"
+      },
+      {
+       "checked": false,
+       "desc": "视频引流-点击引流",
+       "groupLabel": "内容",
+       "hidden": false,
+       "key": "scenarioType-video",
+       "value": "13000"
+      },
+      {
+       "checked": false,
+       "desc": "视频引流-人群种草",
+       "groupLabel": "内容",
+       "hidden": false,
+       "key": "scenarioType-videoGrowth",
+       "value": "17000"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "腾讯渠道",
+     "hidden": false,
+     "key": "腾讯渠道",
+     "options": [
+      {
+       "checked": false,
+       "desc": "腾讯渠道",
+       "groupLabel": "腾讯渠道",
+       "hidden": false,
+       "key": "tencent",
+       "value": "81000"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "头条渠道",
+     "hidden": false,
+     "key": "头条渠道",
+     "options": [
+      {
+       "checked": false,
+       "desc": "头条渠道",
+       "groupLabel": "头条渠道",
+       "hidden": false,
+       "key": "toutiao",
+       "value": "82000"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "百度渠道",
+     "hidden": false,
+     "key": "百度渠道",
+     "options": [
+      {
+       "checked": false,
+       "desc": "百度渠道",
+       "groupLabel": "百度渠道",
+       "hidden": false,
+       "key": "baidu",
+       "value": "83000"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "快手渠道",
+     "hidden": false,
+     "key": "快手渠道",
+     "options": [
+      {
+       "checked": false,
+       "desc": "快手渠道",
+       "groupLabel": "快手渠道",
+       "hidden": false,
+       "key": "kuaishou",
+       "value": "84000"
+      }
+     ]
+    },
+    {
+     "checked": false,
+     "desc": "京东定向",
+     "hidden": false,
+     "key": "京东定向",
+     "options": [
+      {
+       "checked": false,
+       "desc": "京东定向",
+       "groupLabel": "京东定向",
+       "hidden": false,
+       "key": "jingX",
+       "value": "85000"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "checked": false,
+   "desc": "广告定向类型",
+   "hidden": false,
+   "key": "deliveryType",
+   "options": [
+    {
+     "checked": false,
+     "desc": "关键词定向",
+     "hidden": false,
+     "key": "keyWordDeliveryType",
+     "value": "2"
+    },
+    {
+     "checked": false,
+     "desc": "人群定向",
+     "hidden": false,
+     "key": "dmpDeliveryType",
+     "value": "0,1"
+    },
+    {
+     "checked": false,
+     "desc": "商品定向",
+     "hidden": false,
+     "key": "skuDeliveryType",
+     "value": "3"
+    },
+    {
+     "checked": false,
+     "desc": "智能定向",
+     "hidden": false,
+     "key": "smartDeliveryType",
+     "value": "-1"
+    }
+   ]
+  }
+ ],
+ "customIndex": [
+  {
+   "checked": true,
+   "desc": "基础数据",
+   "hidden": false,
+   "key": "basicData",
+   "options": [
+    {
+     "checked": true,
+     "desc": "展现数",
+     "hidden": false,
+     "key": "impressions"
+    },
+    {
+     "checked": true,
+     "desc": "点击数",
+     "hidden": false,
+     "key": "clicks"
+    },
+    {
+     "checked": true,
+     "desc": "点击率(%)",
+     "hidden": false,
+     "key": "CTR"
+    },
+    {
+     "checked": true,
+     "desc": "花费",
+     "hidden": false,
+     "key": "cost"
+    },
+    {
+     "checked": true,
+     "desc": "千次展现成本",
+     "hidden": false,
+     "key": "CPM"
+    },
+    {
+     "checked": true,
+     "desc": "平均点击成本",
+     "hidden": false,
+     "key": "CPC"
+    }
+   ],
+   "tip": "为广告基础投放数据，用于分析广告投放的基础表现"
+  },
+  {
+   "checked": true,
+   "desc": "转化数据",
+   "hidden": false,
+   "key": "resultData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "直接订单行",
+     "hidden": false,
+     "key": "directOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "直接订单金额",
+     "hidden": false,
+     "key": "directOrderSum"
+    },
+    {
+     "checked": false,
+     "desc": "间接订单行",
+     "hidden": false,
+     "key": "indirectOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "间接订单金额",
+     "hidden": false,
+     "key": "indirectOrderSum"
+    },
+    {
+     "checked": true,
+     "desc": "总订单行",
+     "hidden": false,
+     "key": "totalOrderCnt"
+    },
+    {
+     "checked": true,
+     "desc": "总订单金额",
+     "hidden": false,
+     "key": "totalOrderSum"
+    },
+    {
+     "checked": false,
+     "desc": "直接加购数",
+     "hidden": false,
+     "key": "directCartCnt"
+    },
+    {
+     "checked": false,
+     "desc": "间接加购数",
+     "hidden": false,
+     "key": "indirectCartCnt"
+    },
+    {
+     "checked": false,
+     "desc": "总加购数",
+     "hidden": false,
+     "key": "totalCartCnt"
+    },
+    {
+     "checked": true,
+     "desc": "转化率(%)",
+     "hidden": false,
+     "key": "orderCVS"
+    },
+    {
+     "checked": false,
+     "desc": "平均订单成本",
+     "hidden": false,
+     "key": "orderCPA",
+     "tip": "直投的订单行成本就是CPA"
+    },
+    {
+     "checked": true,
+     "desc": "投产比",
+     "hidden": false,
+     "key": "orderROI"
+    },
+    {
+     "checked": true,
+     "desc": "预售订单行",
+     "hidden": false,
+     "key": "totalPresaleOrderCnt"
+    },
+    {
+     "checked": true,
+     "desc": "预售订单金额",
+     "hidden": false,
+     "key": "totalPresaleOrderSum"
+    }
+   ],
+   "tip": "为通过广告获得的用户后链路指标，包含了加购、下单等"
+  },
+  {
+   "checked": false,
+   "desc": "转化数据[媒]",
+   "hidden": false,
+   "key": "mediaResultData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "总订单行[媒]",
+     "hidden": false,
+     "key": "mediaTotalOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "总订单金额[媒]",
+     "hidden": false,
+     "key": "mediaTotalOrderSum"
+    },
+    {
+     "checked": false,
+     "desc": "转化率[媒](%)",
+     "hidden": false,
+     "key": "mediaOrderCVS"
+    },
+    {
+     "checked": false,
+     "desc": "投产比[媒]",
+     "hidden": false,
+     "key": "mediaOrderROI"
+    },
+    {
+     "checked": false,
+     "desc": "CPA[媒]",
+     "hidden": false,
+     "key": "mediaOrderCPA",
+     "tip": "订单行成本"
+    },
+    {
+     "checked": false,
+     "desc": "总加购数[媒]",
+     "hidden": false,
+     "key": "mediaTotalCartCnt"
+    },
+    {
+     "checked": false,
+     "desc": "加购成本[媒]",
+     "hidden": false,
+     "key": "mediaCartCost"
+    }
+   ],
+   "tip": "为站外广告专属指标，支持查询2022年9月27日以后的数据。（媒体口径数据介绍：归因范围为单一媒体渠道，即该媒体渠道通过展现/点击广告创意之后，一段时间周期内，为您引入的全部订单行量，与其他渠道不进行去重；一笔订单含多个SKU会记多个订单行；统计口径为您选择的订单查询口径。）"
+  },
+  {
+   "checked": false,
+   "desc": "直播数据",
+   "hidden": false,
+   "key": "liveData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "点赞数",
+     "hidden": false,
+     "key": "likeCnt"
+    },
+    {
+     "checked": false,
+     "desc": "评论数",
+     "hidden": false,
+     "key": "commentCnt"
+    },
+    {
+     "checked": false,
+     "desc": "分享数",
+     "hidden": false,
+     "key": "shareCnt"
+    },
+    {
+     "checked": false,
+     "desc": "关注数",
+     "hidden": false,
+     "key": "followCnt"
+    },
+    {
+     "checked": false,
+     "desc": "互动数",
+     "hidden": false,
+     "key": "interactCnt"
+    },
+    {
+     "checked": false,
+     "desc": "互动率(%)",
+     "hidden": false,
+     "key": "IR"
+    }
+   ],
+   "tip": "直播指标主要用于直播场景数据分析，其他指标"
+  },
+  {
+   "checked": false,
+   "desc": "订单效果数据",
+   "hidden": false,
+   "key": "orderData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "订单号",
+     "hidden": false,
+     "key": "orderId"
+    },
+    {
+     "checked": false,
+     "desc": "下单SKU ID",
+     "hidden": false,
+     "key": "skuId",
+     "tip": "下单SKU ID是指用户点击广告后实际下单的SKU ID，并非广告的跟单SKU ID。"
+    },
+    {
+     "checked": false,
+     "desc": "订单类型",
+     "hidden": false,
+     "key": "myself"
+    },
+    {
+     "checked": false,
+     "desc": "订单状态",
+     "hidden": false,
+     "key": "orderStatusExpand",
+     "tip": "订单状态为订单当前的状态，有可能会发生变化。付款24小时后取消的订单属于成交订单。"
+    },
+    {
+     "checked": false,
+     "desc": "下单SKU金额",
+     "hidden": false,
+     "key": "skuMoney"
+    },
+    {
+     "checked": false,
+     "desc": "下单SKU数量",
+     "hidden": false,
+     "key": "skuNum"
+    },
+    {
+     "checked": false,
+     "desc": "下单地域",
+     "hidden": false,
+     "key": "province",
+     "tip": "下单地域所在省市暂无法获取的，均会显示为未知。"
+    },
+    {
+     "checked": false,
+     "desc": "点击时间",
+     "hidden": false,
+     "key": "cookieTime"
+    },
+    {
+     "checked": false,
+     "desc": "下单时间",
+     "hidden": false,
+     "key": "orderTime"
+    },
+    {
+     "checked": false,
+     "desc": "预售订单",
+     "hidden": false,
+     "key": "orderJobStatus"
+    }
+   ],
+   "tip": "订单效果指标主要用于分析订单明细数据"
+  },
+  {
+   "checked": false,
+   "desc": "引流数据",
+   "hidden": false,
+   "key": "drainageData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "下单新客数(去重)",
+     "hidden": false,
+     "key": "newCustomersUserCnt",
+     "tip": "用户一次下单若购买了两件商品，则下单新客数会记为两个下单新客数，而下单新客数（去重）将只记录为一个新客"
+    },
+    {
+     "checked": false,
+     "desc": "预约数",
+     "hidden": false,
+     "key": "preorderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "领券数",
+     "hidden": false,
+     "key": "couponCnt"
+    },
+    {
+     "checked": false,
+     "desc": "商品关注数",
+     "hidden": false,
+     "key": "goodsAttentionCnt"
+    },
+    {
+     "checked": false,
+     "desc": "店铺关注数",
+     "hidden": false,
+     "key": "shopAttentionCnt"
+    },
+    {
+     "checked": false,
+     "desc": "新客订单行",
+     "hidden": false,
+     "key": "newCustomersOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "新客订单金额",
+     "hidden": false,
+     "key": "newCustomersGMV"
+    },
+    {
+     "checked": false,
+     "desc": "成交用户数",
+     "hidden": false,
+     "key": "dealUserCnt"
+    },
+    {
+     "checked": false,
+     "desc": "成交用户成本",
+     "hidden": false,
+     "key": "dealUserCost"
+    }
+   ],
+   "tip": "为用户行为指标，可用于分析用户转化"
+  }
+ ],
+ "customIndexOptions": [
+  {
+   "checked": false,
+   "desc": "基础数据",
+   "hidden": false,
+   "key": "basicData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "展现数",
+     "hidden": false,
+     "key": "impressions"
+    },
+    {
+     "checked": false,
+     "desc": "点击数",
+     "hidden": false,
+     "key": "clicks"
+    },
+    {
+     "checked": false,
+     "desc": "点击率(%)",
+     "hidden": false,
+     "key": "CTR"
+    },
+    {
+     "checked": false,
+     "desc": "花费",
+     "hidden": false,
+     "key": "cost"
+    },
+    {
+     "checked": false,
+     "desc": "千次展现成本",
+     "hidden": false,
+     "key": "CPM"
+    },
+    {
+     "checked": false,
+     "desc": "平均点击成本",
+     "hidden": false,
+     "key": "CPC"
+    }
+   ],
+   "tip": "为广告基础投放数据，用于分析广告投放的基础表现"
+  },
+  {
+   "checked": false,
+   "desc": "转化数据",
+   "hidden": false,
+   "key": "resultData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "直接订单行",
+     "hidden": false,
+     "key": "directOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "直接订单金额",
+     "hidden": false,
+     "key": "directOrderSum"
+    },
+    {
+     "checked": false,
+     "desc": "间接订单行",
+     "hidden": false,
+     "key": "indirectOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "间接订单金额",
+     "hidden": false,
+     "key": "indirectOrderSum"
+    },
+    {
+     "checked": false,
+     "desc": "总订单行",
+     "hidden": false,
+     "key": "totalOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "总订单金额",
+     "hidden": false,
+     "key": "totalOrderSum"
+    },
+    {
+     "checked": false,
+     "desc": "直接加购数",
+     "hidden": false,
+     "key": "directCartCnt"
+    },
+    {
+     "checked": false,
+     "desc": "间接加购数",
+     "hidden": false,
+     "key": "indirectCartCnt"
+    },
+    {
+     "checked": false,
+     "desc": "总加购数",
+     "hidden": false,
+     "key": "totalCartCnt"
+    },
+    {
+     "checked": false,
+     "desc": "转化率(%)",
+     "hidden": false,
+     "key": "orderCVS"
+    },
+    {
+     "checked": false,
+     "desc": "平均订单成本",
+     "hidden": false,
+     "key": "orderCPA",
+     "tip": "直投的订单行成本就是CPA"
+    },
+    {
+     "checked": false,
+     "desc": "投产比",
+     "hidden": false,
+     "key": "orderROI"
+    },
+    {
+     "checked": false,
+     "desc": "预售订单行",
+     "hidden": false,
+     "key": "totalPresaleOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "预售订单金额",
+     "hidden": false,
+     "key": "totalPresaleOrderSum"
+    }
+   ],
+   "tip": "为通过广告获得的用户后链路指标，包含了加购、下单等"
+  },
+  {
+   "checked": false,
+   "desc": "转化数据[媒]",
+   "hidden": false,
+   "key": "mediaResultData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "总订单行[媒]",
+     "hidden": false,
+     "key": "mediaTotalOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "总订单金额[媒]",
+     "hidden": false,
+     "key": "mediaTotalOrderSum"
+    },
+    {
+     "checked": false,
+     "desc": "转化率[媒](%)",
+     "hidden": false,
+     "key": "mediaOrderCVS"
+    },
+    {
+     "checked": false,
+     "desc": "投产比[媒]",
+     "hidden": false,
+     "key": "mediaOrderROI"
+    },
+    {
+     "checked": false,
+     "desc": "CPA[媒]",
+     "hidden": false,
+     "key": "mediaOrderCPA",
+     "tip": "订单行成本"
+    },
+    {
+     "checked": false,
+     "desc": "总加购数[媒]",
+     "hidden": false,
+     "key": "mediaTotalCartCnt"
+    },
+    {
+     "checked": false,
+     "desc": "加购成本[媒]",
+     "hidden": false,
+     "key": "mediaCartCost"
+    }
+   ],
+   "tip": "为站外广告专属指标，支持查询2022年9月27日以后的数据。（媒体口径数据介绍：归因范围为单一媒体渠道，即该媒体渠道通过展现/点击广告创意之后，一段时间周期内，为您引入的全部订单行量，与其他渠道不进行去重；一笔订单含多个SKU会记多个订单行；统计口径为您选择的订单查询口径。）"
+  },
+  {
+   "checked": false,
+   "desc": "直播数据",
+   "hidden": false,
+   "key": "liveData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "点赞数",
+     "hidden": false,
+     "key": "likeCnt"
+    },
+    {
+     "checked": false,
+     "desc": "评论数",
+     "hidden": false,
+     "key": "commentCnt"
+    },
+    {
+     "checked": false,
+     "desc": "分享数",
+     "hidden": false,
+     "key": "shareCnt"
+    },
+    {
+     "checked": false,
+     "desc": "关注数",
+     "hidden": false,
+     "key": "followCnt"
+    },
+    {
+     "checked": false,
+     "desc": "互动数",
+     "hidden": false,
+     "key": "interactCnt"
+    },
+    {
+     "checked": false,
+     "desc": "互动率(%)",
+     "hidden": false,
+     "key": "IR"
+    }
+   ],
+   "tip": "直播指标主要用于直播场景数据分析，其他指标"
+  },
+  {
+   "checked": false,
+   "desc": "订单效果数据",
+   "hidden": false,
+   "key": "orderData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "订单号",
+     "hidden": false,
+     "key": "orderId"
+    },
+    {
+     "checked": false,
+     "desc": "下单SKU ID",
+     "hidden": false,
+     "key": "skuId",
+     "tip": "下单SKU ID是指用户点击广告后实际下单的SKU ID，并非广告的跟单SKU ID。"
+    },
+    {
+     "checked": false,
+     "desc": "订单类型",
+     "hidden": false,
+     "key": "myself"
+    },
+    {
+     "checked": false,
+     "desc": "订单状态",
+     "hidden": false,
+     "key": "orderStatusExpand",
+     "tip": "订单状态为订单当前的状态，有可能会发生变化。"
+    },
+    {
+     "checked": false,
+     "desc": "下单SKU金额",
+     "hidden": false,
+     "key": "skuMoney"
+    },
+    {
+     "checked": false,
+     "desc": "下单SKU数量",
+     "hidden": false,
+     "key": "skuNum"
+    },
+    {
+     "checked": false,
+     "desc": "下单地域",
+     "hidden": false,
+     "key": "province",
+     "tip": "下单地域所在省市暂无法获取的，均会显示为未知。"
+    },
+    {
+     "checked": false,
+     "desc": "点击时间",
+     "hidden": false,
+     "key": "cookieTime"
+    },
+    {
+     "checked": false,
+     "desc": "下单时间",
+     "hidden": false,
+     "key": "orderTime"
+    },
+    {
+     "checked": false,
+     "desc": "预售订单",
+     "hidden": false,
+     "key": "orderJobStatus"
+    }
+   ],
+   "tip": "订单效果指标主要用于分析订单明细数据"
+  },
+  {
+   "checked": false,
+   "desc": "引流数据",
+   "hidden": false,
+   "key": "drainageData",
+   "options": [
+    {
+     "checked": false,
+     "desc": "下单新客数(去重)",
+     "hidden": false,
+     "key": "newCustomersUserCnt",
+     "tip": "用户一次下单若购买了两件商品，则下单新客数会记为两个下单新客数，而下单新客数（去重）将只记录为一个新客"
+    },
+    {
+     "checked": false,
+     "desc": "预约数",
+     "hidden": false,
+     "key": "preorderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "领券数",
+     "hidden": false,
+     "key": "couponCnt"
+    },
+    {
+     "checked": false,
+     "desc": "商品关注数",
+     "hidden": false,
+     "key": "goodsAttentionCnt"
+    },
+    {
+     "checked": false,
+     "desc": "店铺关注数",
+     "hidden": false,
+     "key": "shopAttentionCnt"
+    },
+    {
+     "checked": false,
+     "desc": "新客订单行",
+     "hidden": false,
+     "key": "newCustomersOrderCnt"
+    },
+    {
+     "checked": false,
+     "desc": "新客订单金额",
+     "hidden": false,
+     "key": "newCustomersGMV"
+    },
+    {
+     "checked": false,
+     "desc": "成交用户数",
+     "hidden": false,
+     "key": "dealUserCnt"
+    },
+    {
+     "checked": false,
+     "desc": "成交用户成本",
+     "hidden": false,
+     "key": "dealUserCost"
+    }
+   ],
+   "tip": "为用户行为指标，可用于分析用户转化"
+  }
+ ],
+ "cycle": 30,
+ "daily": 1,
+ "endTime": 1791648000000,
+ "sortedDimensionKeys": [
+  "mappedAreaName"
+ ],
+ "sortedIndexKeys": [
+  "impressions",
+  "clicks",
+  "CTR",
+  "cost",
+  "CPM",
+  "CPC",
+  "totalOrderCnt",
+  "totalOrderSum",
+  "orderCVS",
+  "orderROI",
+  "totalPresaleOrderCnt",
+  "totalPresaleOrderSum"
+ ],
+ "startTime": 1789142400000,
+ "timeout": false,
+ "version": "JZT_V9"
+}

@@ -77,6 +77,9 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# ---- 远程桌面连接文件（内含服务器地址与加密口令，一律不入库）----
+*.rdp
+
 # ---- agent 本地记忆（含真实 SKU / 经营数字，不入库）----
 .workbuddy/
 

@@ -85,6 +85,10 @@ COSTS_CACHE_FILE = Path(_env("JD_COSTS_CACHE", str(DATA_DIR / "costs_cache.json"
 KEEPALIVE_ENABLED = _env_bool("JD_KEEPALIVE", True)
 KEEPALIVE_INTERVAL = _env_int("JD_KEEPALIVE_INTERVAL", 20 * 60)   # 秒；默认 20 分钟（< 30 分钟账期）
 KEEPALIVE_JITTER = _env_int("JD_KEEPALIVE_JITTER", 120)           # 每次随机抖动，避免固定节奏被风控
+
+# AI 解读层：夜间抓取完成后自动生成「最近 N 天」的 AI 运营解读，报表页展示。
+AI_ENABLED = _env_bool("JD_AI_ENABLED", True)
+AI_RANGE_DAYS = _env_int("JD_AI_RANGE_DAYS", 7)                   # 自动生成的区间天数
 # 保活时依次访问的页面（逗号分隔）。模仿京麦：打开真实业务页 → 页面 JS 会自发
 # 三层心跳（sso/rac 续期、bypass 风控、sgm 埋点），比只访问首页更接近真人使用。
 # 顺序访问 + 每页停留数秒，让前端脚本有时间把心跳发出去。

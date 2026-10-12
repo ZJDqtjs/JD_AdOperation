@@ -38,9 +38,10 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
+                               Response, StreamingResponse)
 
-from . import analyze2, dailystore as ds, report2, scrape_day, settings
+from . import ai_page, analyze2, analyze_ai, dailystore as ds, report2, scrape_day, settings
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -74,6 +75,22 @@ def resolve_range(start: str | None, end: str | None, days: int | None) -> tuple
     e = _yesterday()
     s = e - dt.timedelta(days=n - 1)
     return s.isoformat(), e.isoformat()
+
+
+def ui_range(start: str | None, end: str | None, days: int | None,
+             default_days: int = 7) -> tuple:
+    """界面默认区间：未显式给日期时，**贴着本地已抓取的数据**（最新一天往前 N 天）。
+
+    这样打开报表/看 JSON 默认落在「有数据的区间」，
+    也与夜间 AI 解读的区间一致（否则默认区间会跨到还没抓的日期）。
+    """
+    if start and end:
+        return ds.norm_day(start), ds.norm_day(end)
+    n = int(days) if days else default_days
+    rng = analyze_ai.local_range(settings.ACCOUNTS, max(n, 1))
+    if rng:
+        return rng
+    return resolve_range(None, None, n)
 
 
 def account_list(accounts) -> list:
@@ -121,7 +138,7 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
 <form class="rangebar" method="get" action="{_e(action)}" id="rangeForm">
   <label>起 <input type="date" name="start" id="rbStart" value="{_e(start)}"></label>
   <label>止 <input type="date" name="end" id="rbEnd" value="{_e(end)}"></label>
-  <span class="mini" id="rbDays" style="color:#c7d2fe">共 {n} 天</span>
+  <span class="mini" id="rbDays" style="color:var(--muted)">共 {n} 天</span>
   {pre_html}{acc_html}
   <button type="submit">生成分析</button>
   {extra}
@@ -147,70 +164,81 @@ function upd(){{
 
 # ================================================================ 控制台
 DASH_CSS = """
-:root{--bg:#f5f7fa;--card:#fff;--ink:#111827;--sub:#6b7280;--line:#e5e7eb;
- --green:#16a34a;--amber:#d97706;--red:#dc2626;--blue:#2563eb}
+:root{--canvas:#faf9f5;--soft:#f5f0e8;--surface-card:#efe9de;--cream:#e8e0d2;
+ --ink:#141413;--body:#3d3d3a;--strong:#252523;--muted:#6c6a64;--muted2:#8e8b82;
+ --hair:#e6dfd8;--primary:#cc785c;--primary-a:#a9583e;--on-primary:#fff;
+ --dark:#181715;--dark-soft:#1f1e1b;--on-dark:#faf9f5;--on-dark-soft:#a09d96;
+ --green:#5db872;--greenbg:#e8f2ea;--amber:#d4a017;--amberbg:#f6efda;
+ --red:#c64545;--redbg:#f6e6e3;
+ --bg:var(--canvas);--card:#faf9f5;--sub:var(--muted);--line:var(--hair);--blue:#cc785c;
+ --serif:Georgia,"Songti SC","STSong","SimSun","Noto Serif SC","Source Han Serif SC",serif;
+ --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif;
+ --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
- font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.6}
+body{margin:0;background:var(--canvas);color:var(--body);
+ font-family:var(--sans);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
 .wrap{max-width:1180px;margin:0 auto;padding:0 20px 60px}
-header.top{background:linear-gradient(120deg,#0f172a,#1e3a8a);color:#fff;padding:26px 0 22px;margin-bottom:18px}
-h1{margin:0 0 6px;font-size:23px}
-.metaline{color:#c7d2fe;font-size:13px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:16px;
- box-shadow:0 1px 3px rgba(16,24,40,.05)}
-.card h2{margin:0 0 6px;font-size:16px}
-.hint{color:var(--sub);font-size:12.5px;margin:2px 0 12px}
+header.top{background:var(--soft);border-bottom:1px solid var(--hair);color:var(--ink);padding:34px 0 24px;margin-bottom:22px}
+h1{margin:0 0 8px;font-size:30px;font-weight:400;font-family:var(--serif);letter-spacing:-.5px;color:var(--ink);
+ display:flex;align-items:center;gap:12px}
+.metaline{color:var(--muted);font-size:13px}
+.card{background:var(--canvas);border:1px solid var(--hair);border-radius:12px;padding:20px 22px;margin-bottom:16px}
+.card h2{margin:0 0 6px;font-size:21px;font-weight:400;font-family:var(--serif);letter-spacing:-.3px;color:var(--ink)}
+.hint{color:var(--muted);font-size:12.5px;margin:2px 0 12px}
 .grid{display:grid;gap:14px}
 .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
 .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
 @media(max-width:900px){.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.kpi .lbl{font-size:12.5px;color:var(--sub)}
-.kpi .val{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
-.badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:700}
-.b-ok{background:#ecfdf5;color:var(--green)}.b-warn{background:#fffbeb;color:var(--amber)}
-.b-bad{background:#fef2f2;color:var(--red)}.b-idle{background:#f3f4f6;color:var(--sub)}
+.kpi{background:var(--surface-card);border:1px solid var(--hair);border-radius:12px;padding:16px 18px}
+.kpi .lbl{font-size:12.5px;color:var(--muted)}
+.kpi .val{font-size:24px;font-weight:400;font-family:var(--serif);color:var(--ink);font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.badge{display:inline-block;padding:2px 10px;border-radius:9999px;font-size:12px;font-weight:600}
+.b-ok{background:var(--greenbg);color:#3e7d55}.b-warn{background:var(--amberbg);color:#8a6a1e}
+.b-bad{background:var(--redbg);color:#a5382f}.b-idle{background:var(--surface-card);color:var(--muted)}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:7px 9px;border-bottom:1px solid var(--line);text-align:left}
-th{background:#f9fafb;font-weight:700;color:#374151;font-size:12.5px}
+th,td{padding:7px 9px;border-bottom:1px solid var(--hair);text-align:left}
+th{background:var(--soft);font-weight:600;color:var(--strong);font-size:12.5px}
 td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
-.btn{display:inline-block;background:#1e3a8a;color:#fff;border:none;border-radius:9px;padding:9px 18px;
- font-weight:700;cursor:pointer;font-size:13px;text-decoration:none}
-.btn:hover{background:#1e40af}
-.btn.sec{background:#fff;color:#1e3a8a;border:1px solid #c7d2fe}
-.btn.green{background:#16a34a}.btn.green:hover{background:#15803d}
-.note{background:#eff6ff;border-left:3px solid var(--blue);padding:10px 14px;border-radius:0 8px 8px 0;
- font-size:12.5px;color:#1e40af;margin:10px 0}
-.warn{background:#fffbeb;border-left:3px solid var(--amber);padding:10px 14px;border-radius:0 8px 8px 0;
- font-size:12.5px;color:#92400e;margin:10px 0}
+.btn{display:inline-block;background:var(--primary);color:var(--on-primary);border:none;border-radius:8px;padding:9px 18px;
+ font-weight:500;cursor:pointer;font-size:13px;text-decoration:none}
+.btn:hover{background:var(--primary-a)}
+.btn.sec{background:var(--canvas);color:var(--ink);border:1px solid var(--hair)}
+.btn.sec:hover{background:var(--soft)}
+.btn.green{background:var(--primary)}.btn.green:hover{background:var(--primary-a)}
+.note{background:var(--soft);border-left:3px solid var(--hair);padding:10px 14px;border-radius:0 8px 8px 0;
+ font-size:12.5px;color:var(--body);margin:10px 0}
+.warn{background:var(--amberbg);border-left:3px solid var(--amber);padding:10px 14px;border-radius:0 8px 8px 0;
+ font-size:12.5px;color:#8a6a1e;margin:10px 0}
 .days{display:flex;flex-wrap:wrap;gap:3px;margin-top:6px}
-.days i{width:15px;height:15px;border-radius:3px;background:#e5e7eb;display:block}
-.days i.on{background:#22c55e}
-code{background:#f1f5f9;padding:1px 6px;border-radius:5px;font-size:12px}
-footer{color:var(--sub);font-size:12px;text-align:center;margin-top:24px;line-height:1.9}
-a{color:var(--blue)}
+.days i{width:15px;height:15px;border-radius:3px;background:var(--hair);display:block}
+.days i.on{background:var(--green)}
+code{background:var(--soft);padding:1px 6px;border-radius:5px;font-size:12px;font-family:var(--mono);color:var(--strong)}
+footer{background:var(--dark);color:var(--on-dark-soft);font-size:12px;text-align:center;margin-top:24px;
+ line-height:1.9;border-radius:12px;padding:26px 22px}
+footer code{background:var(--dark-soft);color:var(--on-dark)}
+a{color:var(--primary)}
 .kpi.click{cursor:pointer;transition:box-shadow .15s,border-color .15s}
-.kpi.click:hover{border-color:#93c5fd;box-shadow:0 2px 10px rgba(37,99,235,.12)}
+.kpi.click:hover{border-color:var(--primary);box-shadow:0 2px 10px rgba(204,120,92,.16)}
 .btn.mini{padding:4px 10px;font-size:12px;border-radius:7px}
-.btn.danger{background:#dc2626}.btn.danger:hover{background:#b91c1c}
+.btn.danger{background:var(--red)}.btn.danger:hover{background:#a53a3a}
 .btn[disabled]{opacity:.5;cursor:not-allowed}
-.modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.5);z-index:50;
+.modal{display:none;position:fixed;inset:0;background:rgba(20,20,19,.55);z-index:50;
  padding:28px 14px;overflow:auto}
 .modal.open{display:block}
-.modal-card{max-width:1000px;margin:0 auto;background:#fff;border-radius:14px;
- box-shadow:0 20px 50px rgba(2,6,23,.35)}
-.modal-head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--line)}
-.modal-head h2{margin:0;font-size:17px;flex:1}
+.modal-card{max-width:1000px;margin:0 auto;background:var(--canvas);border:1px solid var(--hair);border-radius:12px;
+ box-shadow:0 20px 50px rgba(20,20,19,.35)}
+.modal-head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--hair)}
+.modal-head h2{margin:0;font-size:19px;font-weight:400;font-family:var(--serif);flex:1}
 .modal-body{padding:16px 20px;max-height:76vh;overflow:auto}
-.tasklog{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px 12px;font-size:12px;
+.tasklog{background:var(--dark-soft);color:var(--on-dark);border-radius:10px;padding:10px 12px;font-size:12px;
  line-height:1.7;max-height:190px;overflow:auto;white-space:pre-wrap;word-break:break-all;
- font-family:Consolas,Menlo,monospace;margin-top:8px}
-.tm{display:flex;flex-wrap:wrap;gap:12px;font-size:12.5px;color:#374151;margin:6px 0}
-.tm b{font-weight:700}
+ font-family:var(--mono);margin-top:8px}
+.tm{display:flex;flex-wrap:wrap;gap:12px;font-size:12.5px;color:var(--body);margin:6px 0}
+.tm b{font-weight:600;color:var(--ink)}
 .trow{cursor:pointer}
-.trow:hover td{background:#f8fafc}
-.trow.open td{background:#eff6ff}
-tbody .det td{background:#f8fafc;padding:0 9px 12px}
+.trow:hover td{background:var(--soft)}
+.trow.open td{background:var(--surface-card)}
+tbody .det td{background:var(--soft);padding:0 9px 12px}
 """
 
 
@@ -237,11 +265,11 @@ def dashboard(request: Request):
             info = per.get(kind) or {}
             cnt = info.get("count", 0)
             last = (info.get("last") or "—")[5:]
-            cls = "" if cnt else ' style="color:#c7c7c7"'
+            cls = "" if cnt else ' style="color:var(--muted2)"'
             cells += (f'<td class="n"{cls}><b>{cnt}</b>'
-                      f'<div style="font-size:11px;color:#9ca3af">{_e(last)}</div></td>')
+                      f'<div style="font-size:11px;color:var(--muted2)">{_e(last)}</div></td>')
         rows.append(
-            f'<tr><td><b>{_e(a.get("label"))}</b><div style="color:#6b7280;font-size:12px">'
+            f'<tr><td><b>{_e(a.get("label"))}</b><div style="color:var(--muted);font-size:12px">'
             f'{_e(k)} · ID {_e(a.get("account_id"))}</div></td>'
             f'<td class="n">{d.get("count", 0)}</td>'
             f'<td class="n" style="font-size:12px">{_e(d.get("first") or "—")}<br>{_e(d.get("last") or "—")}</td>'
@@ -305,7 +333,8 @@ def dashboard(request: Request):
 <header class="top"><div class="wrap">
   <h1>京东广告运营分析服务</h1>
   <div class="metaline">按天自动入库 · 任意区间聚合分析 · 每天 {settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d}（±{settings.SCHEDULE_JITTER_MIN} 分钟浮动，{_e(settings.TZ)}）抓取前一天</div>
-  {_range_bar(start, end, keys, "/report")}
+  {_range_bar(start, end, keys, "/report",
+              extra='<a href="/ai" style="color:var(--primary)">AI 分析台（可追问）→</a>')}
 </div></header>
 <div class="wrap">
 
@@ -314,11 +343,11 @@ def dashboard(request: Request):
   <div class="kpi click" onclick="openTasks()" title="点击查看任务中心：运行中与历史任务">
     <div class="lbl">当前任务</div><div class="val" style="font-size:16px">{task_html}</div>
     <div class="hint">{task_hint}{busy}</div>
-    <div class="hint" style="color:#2563eb">点击查看任务中心 →</div></div>
+    <div class="hint" style="color:var(--primary)">点击查看任务中心 →</div></div>
   <div class="kpi"><div class="lbl">登录状态</div>
     <div class="val" style="font-size:16px" id="loginVal"><span class="badge b-idle">未检查</span></div>
     <div class="hint" id="loginHint">点击「检查登录」确认落盘登录态是否有效</div>
-    <div class="hint" id="keepHint" style="color:#6b7280">保活：—</div>
+    <div class="hint" id="keepHint" style="color:var(--muted)">保活：—</div>
     <div class="hint" style="margin-top:6px">
       <button class="btn sec mini" onclick="checkLogin()">检查登录</button>
       <button class="btn sec mini" onclick="keepNow()">立即续期</button>
@@ -409,7 +438,7 @@ function renderLogin(j){{
   var accs=j.accounts||[];
   var parts=accs.map(function(a){{
     var b=loginBadge(a.state)[0];
-    return (accs.length>1 ? '<span class="mini" style="color:#64748b">'+(a.label||a.key)+' </span>' : '')+b;
+    return (accs.length>1 ? '<span class="mini" style="color:var(--muted)">'+(a.label||a.key)+' </span>' : '')+b;
   }});
   var overall='idle';
   if(accs.some(function(a){{return a.state==='checking';}})) overall='checking';
@@ -572,7 +601,7 @@ function renderTasks(j){{
   if(cur){{
     var cancelling = j.cancelRequested ? ' <span class="badge b-warn">正在取消…</span>' : '';
     box.innerHTML =
-      '<div class="card" style="margin:0;border-color:#fcd34d;background:#fffbeb">'
+      '<div class="card" style="margin:0;border-color:var(--amber);background:var(--amberbg)">'
       + '<div class="val" style="font-size:15px"><span class="badge b-warn">运行中</span>'
       + cancelling + ' <b>'+esc(cur.name)+'</b></div>'
       + '<div class="tm"><span>区间 <b>'+esc(cur.start)+' ~ '+esc(cur.end)+'</b></span>'
@@ -684,7 +713,7 @@ function clearTasks(){{
 @app.get("/report", response_class=HTMLResponse)
 def report(request: Request):
     q = request.query_params
-    start, end = resolve_range(q.get("start"), q.get("end"), 7)
+    start, end = ui_range(q.get("start"), q.get("end"), q.get("days"), 7)
     accounts = account_list(q.getlist("accounts"))
     try:
         data = analyze2.build(start=start, end=end, accounts=accounts)
@@ -701,10 +730,40 @@ def report(request: Request):
     keys = [a["key"] for a in accounts]
     ui = _range_bar(start, end, keys, "/report",
                     extra='<a href="/">← 控制台</a>'
+                          '<a href="/ai?start=%s&end=%s&accounts=%s">AI 分析台（可追问）→</a>'
                           '<a href="/api/analysis?start=%s&end=%s&accounts=%s" target="_blank">看 JSON</a>'
-                          % (_e(start), _e(end), _e(",".join(keys))))
+                          % (_e(start), _e(end), _e(",".join(keys)),
+                             _e(start), _e(end), _e(",".join(keys))))
     title = f"广告运营分析 {start} ~ {end}（{(dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days + 1}天）"
-    return HTMLResponse(report2.render(data, ui=ui, title=title))
+    cached = analyze_ai.load_latest()
+    ai = cached if analyze_ai.matches(cached, start, end, keys) else None
+    return HTMLResponse(report2.render(data, ui=ui, title=title, ai=ai))
+
+
+# ================================================================ AI 分析台
+@app.get("/ai", response_class=HTMLResponse)
+def ai_console(request: Request):
+    """独立 AI 分析台：左侧每日详细 AI 报告，右侧可追问的对话框。"""
+    q = request.query_params
+    start, end = ui_range(q.get("start"), q.get("end"), q.get("days"), 7)
+    accounts = account_list(q.getlist("accounts"))
+    try:
+        data = analyze2.build(start=start, end=end, accounts=accounts)
+    except FileNotFoundError as exc:
+        return HTMLResponse(
+            f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>缺少数据</title>
+<style>{DASH_CSS}</style></head><body><div class="wrap" style="padding-top:40px">
+<div class="card"><h2>该区间没有数据</h2>
+<div class="warn">{_e(exc)}</div>
+<p class="hint">区间 {_e(start)} ~ {_e(end)} 内没有任何一天的京准通数据。</p>
+<p><a class="btn" href="/">← 回到控制台</a></p></div></div></body></html>""",
+            status_code=200)
+    keys = [a["key"] for a in accounts]
+    ui = _range_bar(start, end, keys, "/ai")
+    title = f"AI 运营分析台 {start} ~ {end}"
+    cached = analyze_ai.load_latest()
+    ai = cached if analyze_ai.matches(cached, start, end, keys) else None
+    return HTMLResponse(ai_page.render(ai, data, ui=ui, title=title))
 
 
 # ================================================================ API
@@ -743,7 +802,7 @@ def api_coverage(accounts: list[str] | None = Query(None)):
 def api_analysis(start: str | None = None, end: str | None = None,
                  days: int | None = None, accounts: list[str] | None = Query(None),
                  save: int = 0):
-    s, e = resolve_range(start, end, days)
+    s, e = ui_range(start, end, days)
     try:
         data = analyze2.build(start=s, end=e, accounts=account_list(accounts))
     except FileNotFoundError as exc:
@@ -778,6 +837,104 @@ def api_run(start: str | None = None, end: str | None = None,
 def api_run_cancel(force: int = 0):
     """有任务 → 请求取消；锁被卡死（无存活持有者）→ 直接解锁。"""
     return {"ok": True, **scrape_day.cancel_running(force=bool(force))}
+
+
+# ---------------------------------------------------------------- AI 解读
+@app.get("/api/ai/status")
+def api_ai_status():
+    st = _ai.snapshot()
+    cur = analyze_ai.load_latest()
+    return {"ok": True, "enabled": settings.AI_ENABLED, **st,
+            "cached": (None if not cur else {
+                "range": cur.get("range"), "accounts": cur.get("accounts"),
+                "generatedAt": cur.get("generatedAt"), "model": cur.get("model")})}
+
+
+@app.post("/api/ai/run")
+def api_ai_run(start: str | None = None, end: str | None = None,
+               accounts: str | None = None):
+    """生成 AI 解读（后台线程）。区间缺省时**贴着本地已抓取的数据**。"""
+    if not settings.AI_ENABLED:
+        return {"ok": False, "error": "AI 解读已禁用（JD_AI_ENABLED=0）"}
+    accs = account_list([accounts] if accounts else None)
+    if start and end:
+        s, e = start, end
+    else:
+        rng = analyze_ai.local_range(accs)
+        if not rng:
+            return {"ok": False, "error": "本地还没有已抓取的数据，请先抓取"}
+        s, e = rng
+    return _ai.run_background(s, e, accs)
+
+
+# ---------------------------------------------------------------- AI 对话（分析台）
+# 会话缓存：把「本地已抓取数据摘要 + 方法论」按 (区间, 账号) 备好，同一区间内多次追问不再重算。
+# 摘要构建纯本地、很快；这里缓存只是为了省掉重复读盘与 JSON 序列化，不是硬需求。
+_CHAT_CACHE: dict = {}
+_CHAT_LOCK = threading.Lock()
+
+
+def _chat_context(start: str, end: str, accs):
+    """准备（并缓存）一次对话所需的上下文：digest + methodology。"""
+    ck = (start, end, ",".join(a["key"] for a in accs))
+    with _CHAT_LOCK:
+        hit = _CHAT_CACHE.get(ck)
+    if hit:
+        return hit
+    data = analyze2.build(start=start, end=end, accounts=accs)
+    digest, methodology = analyze_ai.prepare_chat_context(data, None)
+    with _CHAT_LOCK:
+        _CHAT_CACHE.clear()          # 只保留最近一次区间，避免无限增长
+        _CHAT_CACHE[ck] = (digest, methodology)
+    return digest, methodology
+
+
+@app.post("/api/ai/chat")
+async def api_ai_chat(request: Request):
+    """对话框追问：流式返回纯文本（前端边收边渲染）。
+
+    请求体 JSON：{start, end, accounts, question, history:[{role,content}]}
+    accounts 为逗号串；start/end 缺省时贴本地已抓取区间。
+    """
+    if not settings.AI_ENABLED:
+        return JSONResponse({"ok": False, "error": "AI 解读已禁用（JD_AI_ENABLED=0）"},
+                            status_code=400)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    question = (body.get("question") or "").strip()
+    if not question:
+        return JSONResponse({"ok": False, "error": "问题为空"}, status_code=400)
+    accs = account_list([body.get("accounts")] if body.get("accounts") else None)
+    start, end = body.get("start"), body.get("end")
+    if not (start and end):
+        rng = analyze_ai.local_range(accs)
+        if not rng:
+            return JSONResponse({"ok": False, "error": "本地还没有已抓取的数据，请先抓取"},
+                                status_code=400)
+        start, end = rng
+    history = body.get("history") or []
+
+    try:
+        digest, methodology = _chat_context(start, end, accs)
+    except FileNotFoundError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                            status_code=500)
+
+    def _gen():
+        try:
+            for piece in analyze_ai.chat_stream_ctx(digest, methodology, history, question):
+                yield piece
+        except Exception as exc:  # noqa: BLE001
+            yield f"\n\n[对话失败] {type(exc).__name__}: {exc}\n（可检查 AI 配置或稍后重试）"
+            _log_progress(f"AI 对话失败：{type(exc).__name__}: {exc}")
+
+    return StreamingResponse(_gen(), media_type="text/plain; charset=utf-8",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 # ---------------------------------------------------------------- 任务中心
@@ -1499,14 +1656,83 @@ class LoginSession:
 
 _login = LoginSession()
 
+
+class AiRunner:
+    """后台生成 AI 运营解读（单线程串行，防重复触发）。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = {"running": False, "startedAt": None, "finishedAt": None,
+                       "error": None, "range": None, "accounts": None, "ok": True}
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._state)
+
+    def run_background(self, start: str, end: str, accounts) -> dict:
+        with self._lock:
+            if self._state.get("running"):
+                return {"ok": False, "error": "已有 AI 生成任务在运行"}
+            self._state.update({"running": True, "startedAt": settings.now_iso(),
+                                "finishedAt": None, "error": None, "ok": True,
+                                "range": [start, end],
+                                "accounts": [a.get("key") for a in (accounts or settings.ACCOUNTS)]})
+
+        def _work():
+            try:
+                out = analyze_ai.run_for(start, end, accounts)
+                path, md = analyze_ai.save(out)
+                ok = not (out.get("validation") or {}).get("issues")
+                with self._lock:
+                    self._state.update({"running": False, "ok": ok,
+                                        "finishedAt": settings.now_iso()})
+                _log_progress(f"AI 解读已生成：{start} ~ {end} -> {path.name}")
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    self._state.update({"running": False,
+                                        "error": f"{type(exc).__name__}: {exc}",
+                                        "finishedAt": settings.now_iso()})
+                _log_progress(f"AI 解读生成失败：{type(exc).__name__}: {exc}")
+
+        threading.Thread(target=_work, name="ai-advice", daemon=True).start()
+        return {"ok": True, "range": [start, end]}
+
+
+_ai = AiRunner()
+
+
+def _ai_after_scrape(summary: dict) -> None:
+    """夜间抓取完成后的后置任务：对「本地刚抓到的数据」生成 AI 解读。
+
+    区间取自 analyze_ai.local_range()（贴着本地实际已抓到的天），
+    而不是自己按天数拍一个区间 —— 避免分析到没抓过的日期。
+    """
+    if not settings.AI_ENABLED:
+        return
+    if summary.get("cancelled"):
+        return
+    rng = analyze_ai.local_range(settings.ACCOUNTS)
+    if rng:
+        start, end = rng
+    else:
+        start, end = summary.get("start"), summary.get("end")
+    if not (start and end):
+        _log_progress("AI 解读：本地没有可用数据，跳过")
+        return
+    _log_progress(f"开始生成 AI 解读（贴本地数据 {start} ~ {end}）")
+    _ai.run_background(start, end, settings.ACCOUNTS)
+
+
 LOGIN_CSS = DASH_CSS + """
-.qrbox{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;display:inline-block}
+.qrbox{background:var(--canvas);border:1px solid var(--hair);border-radius:12px;padding:14px;display:inline-block}
 .qrbox img{display:block;max-width:340px;image-rendering:pixelated}
-.tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:14px}
-.tabs button{background:none;border:none;padding:9px 14px;cursor:pointer;font-size:15px;color:#6b7280;border-bottom:2px solid transparent}
-.tabs button.active{color:#111827;font-weight:600;border-bottom-color:#2563eb}
+.tabs{display:flex;gap:6px;border-bottom:1px solid var(--hair);margin-bottom:14px}
+.tabs button{background:none;border:none;padding:9px 14px;cursor:pointer;font-size:15px;color:var(--muted);border-bottom:2px solid transparent}
+.tabs button.active{color:var(--ink);font-weight:600;border-bottom-color:var(--primary)}
 .fld{margin-bottom:10px}
-.fld input{padding:9px 11px;border-radius:8px;border:1px solid var(--line);font-size:14px;width:320px;max-width:80vw}
+.fld input{padding:9px 11px;border-radius:8px;border:1px solid var(--hair);font-size:14px;width:320px;max-width:80vw;
+ background:var(--canvas);color:var(--ink)}
+.fld input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(204,120,92,.15)}
 """
 
 
@@ -1699,7 +1925,8 @@ def _nightly_job():
     _log_progress(f"定时任务 {start} ~ {end}（库内最新 {newest or '无'}）")
     res = scrape_day.run_background(settings.ACCOUNTS, start, end, force=False,
                                      log=_log_progress, name="nightly",
-                                     trigger="schedule")
+                                     trigger="schedule",
+                                     after=_ai_after_scrape)
     if not res.get("ok"):
         _log_progress(f"定时任务未启动：{res.get('error')}")
 
