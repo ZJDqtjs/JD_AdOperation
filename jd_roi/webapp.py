@@ -169,82 +169,49 @@ function upd(){{
 
 
 # ================================================================ 控制台
-DASH_CSS = """
-:root{--canvas:#faf9f5;--soft:#f5f0e8;--surface-card:#efe9de;--cream:#e8e0d2;
- --ink:#141413;--body:#3d3d3a;--strong:#252523;--muted:#6c6a64;--muted2:#8e8b82;
- --hair:#e6dfd8;--primary:#cc785c;--primary-a:#a9583e;--on-primary:#fff;
- --dark:#181715;--dark-soft:#1f1e1b;--on-dark:#faf9f5;--on-dark-soft:#a09d96;
- --green:#5db872;--greenbg:#e8f2ea;--amber:#d4a017;--amberbg:#f6efda;
- --red:#c64545;--redbg:#f6e6e3;
- --bg:var(--canvas);--card:#faf9f5;--sub:var(--muted);--line:var(--hair);--blue:#cc785c;
- --serif:Georgia,"Songti SC","STSong","SimSun","Noto Serif SC","Source Han Serif SC",serif;
- --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif;
- --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace}
-*{box-sizing:border-box}
-body{margin:0;background:var(--canvas);color:var(--body);
- font-family:var(--sans);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
-.wrap{max-width:1180px;margin:0 auto;padding:0 20px 60px}
-header.top{background:var(--soft);border-bottom:1px solid var(--hair);color:var(--ink);padding:34px 0 24px;margin-bottom:22px}
-h1{margin:0 0 8px;font-size:30px;font-weight:400;font-family:var(--serif);letter-spacing:-.5px;color:var(--ink);
- display:flex;align-items:center;gap:12px}
-.metaline{color:var(--muted);font-size:13px}
-.card{background:var(--canvas);border:1px solid var(--hair);border-radius:12px;padding:20px 22px;margin-bottom:16px}
-.card h2{margin:0 0 6px;font-size:21px;font-weight:400;font-family:var(--serif);letter-spacing:-.3px;color:var(--ink)}
-.hint{color:var(--muted);font-size:12.5px;margin:2px 0 12px}
-.grid{display:grid;gap:14px}
-.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
-.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
-@media(max-width:900px){.g4{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.kpi{background:var(--surface-card);border:1px solid var(--hair);border-radius:12px;padding:16px 18px}
-.kpi .lbl{font-size:12.5px;color:var(--muted)}
-.kpi .val{font-size:24px;font-weight:400;font-family:var(--serif);color:var(--ink);font-variant-numeric:tabular-nums;letter-spacing:-.5px}
-.badge{display:inline-block;padding:2px 10px;border-radius:9999px;font-size:12px;font-weight:600}
-.b-ok{background:var(--greenbg);color:#3e7d55}.b-warn{background:var(--amberbg);color:#8a6a1e}
-.b-bad{background:var(--redbg);color:#a5382f}.b-idle{background:var(--surface-card);color:var(--muted)}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:7px 9px;border-bottom:1px solid var(--hair);text-align:left}
-th{background:var(--soft);font-weight:600;color:var(--strong);font-size:12.5px}
-td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
-.btn{display:inline-block;background:var(--primary);color:var(--on-primary);border:none;border-radius:8px;padding:9px 18px;
- font-weight:500;cursor:pointer;font-size:13px;text-decoration:none}
-.btn:hover{background:var(--primary-a)}
-.btn.sec{background:var(--canvas);color:var(--ink);border:1px solid var(--hair)}
-.btn.sec:hover{background:var(--soft)}
-.btn.green{background:var(--primary)}.btn.green:hover{background:var(--primary-a)}
-.note{background:var(--soft);border-left:3px solid var(--hair);padding:10px 14px;border-radius:0 8px 8px 0;
- font-size:12.5px;color:var(--body);margin:10px 0}
-.warn{background:var(--amberbg);border-left:3px solid var(--amber);padding:10px 14px;border-radius:0 8px 8px 0;
- font-size:12.5px;color:#8a6a1e;margin:10px 0}
-.days{display:flex;flex-wrap:wrap;gap:3px;margin-top:6px}
-.days i{width:15px;height:15px;border-radius:3px;background:var(--hair);display:block}
+# 控制台复用报表页的同一套设计系统（奶油画布 × 珊瑚 × 深墨），只做局部覆盖，
+# 避免"两个页面两套风格"的割裂。
+DASH_CSS = report2.CSS + """
+.wrap{max-width:1300px;padding:0 24px 64px}
+header.top{padding:26px 0 0;margin-bottom:24px}
+header.top h1{font-size:36px}
+.topnav{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+/* 覆盖日历 */
+.days{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+.days i{width:16px;height:16px;border-radius:4px;background:var(--hair);display:block}
 .days i.on{background:var(--green)}
-code{background:var(--soft);padding:1px 6px;border-radius:5px;font-size:12px;font-family:var(--mono);color:var(--strong)}
-footer{background:var(--dark);color:var(--on-dark-soft);font-size:12px;text-align:center;margin-top:24px;
- line-height:1.9;border-radius:12px;padding:26px 22px}
-footer code{background:var(--dark-soft);color:var(--on-dark)}
-a{color:var(--primary)}
-.kpi.click{cursor:pointer;transition:box-shadow .15s,border-color .15s}
-.kpi.click:hover{border-color:var(--primary);box-shadow:0 2px 10px rgba(204,120,92,.16)}
-.btn.mini{padding:4px 10px;font-size:12px;border-radius:7px}
-.btn.danger{background:var(--red)}.btn.danger:hover{background:#a53a3a}
-.btn[disabled]{opacity:.5;cursor:not-allowed}
-.modal{display:none;position:fixed;inset:0;background:rgba(20,20,19,.55);z-index:50;
- padding:28px 14px;overflow:auto}
+/* 数字列 */
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+/* 任务中心弹窗 */
+.modal{display:none;position:fixed;inset:0;background:rgba(20,20,19,.5);z-index:80;
+  -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);padding:32px 16px;overflow:auto}
 .modal.open{display:block}
-.modal-card{max-width:1000px;margin:0 auto;background:var(--canvas);border:1px solid var(--hair);border-radius:12px;
- box-shadow:0 20px 50px rgba(20,20,19,.35)}
-.modal-head{display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--hair)}
-.modal-head h2{margin:0;font-size:19px;font-weight:400;font-family:var(--serif);flex:1}
-.modal-body{padding:16px 20px;max-height:76vh;overflow:auto}
-.tasklog{background:var(--dark-soft);color:var(--on-dark);border-radius:10px;padding:10px 12px;font-size:12px;
- line-height:1.7;max-height:190px;overflow:auto;white-space:pre-wrap;word-break:break-all;
- font-family:var(--mono);margin-top:8px}
-.tm{display:flex;flex-wrap:wrap;gap:12px;font-size:12.5px;color:var(--body);margin:6px 0}
+.modal-card{max-width:1040px;margin:0 auto;background:var(--canvas);border:1px solid var(--hair);
+  border-radius:var(--r-lg);box-shadow:var(--shadow-lift);animation:fadeup .22s ease}
+.modal-head{display:flex;align-items:center;gap:10px;padding:18px 22px;border-bottom:1px solid var(--hair);
+  position:sticky;top:0;background:var(--canvas);border-radius:var(--r-lg) var(--r-lg) 0 0;z-index:2}
+.modal-head h2{margin:0;font-size:20px;font-weight:400;font-family:var(--serif);flex:1;color:var(--ink)}
+.modal-body{padding:18px 22px;max-height:76vh;overflow:auto}
+.tasklog{background:var(--dark);color:var(--on-dark);border-radius:var(--r-sm);padding:12px 14px;
+  font-size:12px;line-height:1.75;max-height:200px;overflow:auto;white-space:pre-wrap;
+  word-break:break-all;font-family:var(--mono);margin-top:10px}
+.tm{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:12.5px;color:var(--body);margin:8px 0}
 .tm b{font-weight:600;color:var(--ink)}
 .trow{cursor:pointer}
 .trow:hover td{background:var(--soft)}
 .trow.open td{background:var(--surface-card)}
-tbody .det td{background:var(--soft);padding:0 9px 12px}
+tbody .det td{background:var(--soft);padding:12px 11px}
+/* 登录页 */
+.fld{margin-bottom:12px}
+.fld input{padding:10px 12px;border-radius:var(--r-sm);border:1px solid var(--hair);font-size:14px;
+  width:340px;max-width:82vw;background:var(--canvas);color:var(--ink)}
+.fld input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(204,120,92,.15)}
+.qrbox{background:var(--canvas);border:1px solid var(--hair);border-radius:var(--r-md);padding:16px;
+  display:inline-block}
+.qrbox img{display:block;max-width:320px;image-rendering:pixelated}
+.warn{background:var(--amberbg);border-left:3px solid var(--amber);padding:12px 16px;
+  border-radius:0 var(--r-sm) var(--r-sm) 0;font-size:12.5px;color:var(--amberink);margin:12px 0;line-height:1.75}
+details>summary{cursor:pointer}
 """
 
 
@@ -275,14 +242,15 @@ def dashboard(request: Request):
             cells += (f'<td class="n"{cls}><b>{cnt}</b>'
                       f'<div style="font-size:11px;color:var(--muted2)">{_e(last)}</div></td>')
         rows.append(
-            f'<tr><td><b>{_e(a.get("label"))}</b><div style="color:var(--muted);font-size:12px">'
-            f'{_e(k)} · ID {_e(a.get("account_id"))}</div></td>'
-            f'<td class="n">{d.get("count", 0)}</td>'
-            f'<td class="n" style="font-size:12px">{_e(d.get("first") or "—")}<br>{_e(d.get("last") or "—")}</td>'
+            f'<tr><td class="l"><b>{_e(a.get("label"))}</b>'
+            f'<div class="mini">{_e(k)} · ID {_e(a.get("account_id"))}</div></td>'
+            f'<td class="n"><b>{d.get("count", 0)}</b></td>'
+            f'<td class="n mini">{_e(d.get("first") or "—")}<br>{_e(d.get("last") or "—")}</td>'
             f'{cells}</tr>')
 
-    kinds_head = "".join(f'<th class="n">{_e(lab)}<div style="font-weight:400;font-size:11px">'
-                         f'天/最近</div></th>' for _k, lab in KINDS_UI)
+    kinds_head = "".join(f'<th class="n">{_e(lab)}'
+                         f'<div style="font-weight:400;font-size:10.5px;color:var(--muted2)">'
+                         f'天 / 最近</div></th>' for _k, lab in KINDS_UI)
 
     # 覆盖日历（近 30 天）
     gap = scrape_day.catchup_range()
@@ -300,7 +268,7 @@ def dashboard(request: Request):
             day = (_today() - dt.timedelta(days=i)).isoformat()
             on = "on" if day in have else ""
             cells += f'<i class="{on}" title="{day}"></i>'
-        cal += (f'<div style="margin:8px 0"><b>{_e(a.get("label"))}</b>'
+        cal += (f'<div style="margin:10px 0"><b>{_e(a.get("label"))}</b>'
                 f'<span class="hint" style="margin-left:8px">近30天（绿=已入库）</span>'
                 f'<div class="days">{cells}</div></div>')
 
@@ -336,77 +304,94 @@ def dashboard(request: Request):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>京东广告运营分析服务</title><style>{DASH_CSS}</style>
 <style>{report2.UI_CSS}</style></head><body>
-<header class="top"><div class="wrap">
+{report2.navtop("/")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}广告运营控制台</div>
   <h1>京东广告运营分析服务</h1>
-  <div class="metaline">按天自动入库 · 任意区间聚合分析 · 每天 {settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d}（±{settings.SCHEDULE_JITTER_MIN} 分钟浮动，{_e(settings.TZ)}）抓取前一天</div>
-  {_range_bar(start, end, keys, "/report",
-              extra='<a href="/ai" style="color:var(--primary)">AI 分析台（可追问）→</a>')}
+  <div class="metaline">
+    <span>按天自动入库</span><span class="dot"></span>
+    <span>任意区间聚合分析</span><span class="dot"></span>
+    <span>每天 {settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d}
+      （±{settings.SCHEDULE_JITTER_MIN} 分钟，{_e(settings.TZ)}）抓取前一天</span>
+  </div>
+  {_range_bar(start, end, keys, "/report")}
 </div></header>
 <div class="wrap">
 
 <div class="grid g4">
-  <div class="kpi"><div class="lbl">最近一次自动抓取</div><div class="val" style="font-size:14px">{lr_html}</div></div>
+  <div class="kpi">
+    <div class="lbl">最近一次自动抓取</div>
+    <div class="val" style="font-size:15px;line-height:1.45">{lr_html}</div>
+  </div>
   <div class="kpi click" onclick="openTasks()" title="点击查看任务中心：运行中与历史任务">
-    <div class="lbl">当前任务</div><div class="val" style="font-size:16px">{task_html}</div>
-    <div class="hint">{task_hint}{busy}</div>
-    <div class="hint" style="color:var(--primary)">点击查看任务中心 →</div></div>
-  <div class="kpi"><div class="lbl">登录状态</div>
-    <div class="val" style="font-size:16px" id="loginVal"><span class="badge b-idle">未检查</span></div>
-    <div class="hint" id="loginHint">点击「检查登录」确认落盘登录态是否有效</div>
-    <div class="hint" id="keepHint" style="color:var(--muted)">保活：—</div>
-    <div class="hint" style="margin-top:6px">
+    <div class="lbl">当前任务</div>
+    <div class="val" style="font-size:17px">{task_html}</div>
+    <div class="sub">{task_hint}{busy}</div>
+    <div class="sub" style="color:var(--primary);font-weight:600">查看任务中心 →</div>
+  </div>
+  <div class="kpi">
+    <div class="lbl">登录状态</div>
+    <div class="val" style="font-size:17px" id="loginVal"><span class="badge b-idle">未检查</span></div>
+    <div class="sub" id="loginHint">点击「检查登录」确认落盘登录态是否有效</div>
+    <div class="sub" id="keepHint">保活：—</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
       <button class="btn sec mini" onclick="checkLogin()">检查登录</button>
       <button class="btn sec mini" onclick="keepNow()">立即续期</button>
-      <a href="/login" style="margin-left:6px">扫码 / 账号密码登录 →</a>
-    </div></div>
-  <div class="kpi"><div class="lbl">抓取回刷窗口</div><div class="val" style="font-size:16px">最近 {settings.REFRESH_DAYS} 天</div>
-    <div class="hint">每晚重刷以修正归因延迟</div></div>
+      <a class="btn ghost mini" href="/login">登录 →</a>
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="lbl">抓取回刷窗口</div>
+    <div class="val">最近 {settings.REFRESH_DAYS} 天</div>
+    <div class="sub">每晚重刷以修正归因延迟</div>
+  </div>
 </div>
 
-<div class="card" style="margin-top:16px">
-  <h2>数据覆盖</h2>
+<div class="card" style="margin-top:18px">
+  <h2>数据覆盖 <span class="tagline">按天入库</span></h2>
   <p class="hint">按天入库；<b>只要某天缺数据，区间分析就会按 0 计入</b>。缺哪几天可以用下方「立即抓取」补。</p>
   <div class="note">补数策略：<b>{gap_html}</b>。定时任务会把「停机期间的空洞」和「最近 {settings.REFRESH_DAYS} 天回刷」合并成一次抓取。</div>
-  {cal}
-  <div style="overflow:auto;margin-top:10px">
-  <table><thead><tr><th>账号</th><th class="n">总天数</th><th class="n">区间</th>{kinds_head}</tr></thead>
-  <tbody>{''.join(rows)}</tbody></table>
+  <div class="grid g2">{cal}</div>
+  <div class="tblwrap short" style="margin-top:16px">
+    <table><thead><tr><th class="l noSort">账号</th><th class="n noSort">总天数</th>
+      <th class="n noSort">区间</th>{kinds_head}</tr></thead>
+    <tbody>{''.join(rows)}</tbody></table>
   </div>
 </div>
 
 <div class="card">
-  <h2>手动抓取 / 补数</h2>
+  <h2>手动抓取 / 补数 <span class="tagline">只补缺失，或强制覆盖</span></h2>
   <p class="hint">选择要抓的日期（只抓缺失的天；勾选「强制」会覆盖重抓）。默认抓昨天。</p>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-    <label>从 <input type="date" id="runStart" value="{_e(start)}"></label>
-    <label>到 <input type="date" id="runEnd" value="{_e(end)}"></label>
-    <label><input type="checkbox" id="runForce"> 强制覆盖</label>
-    <button class="btn green" onclick="doRun()">立即抓取</button>
+  <div class="toolbar">
+    <label class="mini">从 <input type="date" id="runStart" value="{_e(start)}"></label>
+    <label class="mini">到 <input type="date" id="runEnd" value="{_e(end)}"></label>
+    <label class="mini"><input type="checkbox" id="runForce"> 强制覆盖</label>
+    <button class="btn" onclick="doRun()">立即抓取</button>
     <button class="btn sec" onclick="quickRun(1)">补昨天</button>
     <button class="btn sec" onclick="quickRun(3)">补近3天</button>
     <button class="btn sec" onclick="doCancel()">取消 / 解锁</button>
-    <span id="runMsg" class="hint"></span>
+    <span id="runMsg" class="hint" style="margin:0"></span>
   </div>
   <div class="note">说明：京准通是「点击后 15 天归因」，昨天的数据在未来两周还会增长，所以每晚都会<b>回刷最近 {settings.REFRESH_DAYS} 天</b>。商智数据当天结算后不再变化。</div>
 </div>
 
 <div class="card">
-  <h2>报表说明</h2>
+  <h2>报表说明 <span class="tagline">区间 → 环比</span></h2>
   <p class="hint">
     顶部选择任意区间 → 「生成分析」。报表会以<b>所选区间</b>为最新一期，自动往前取两个等长区间做<b>环比</b>，
     并包含：商品(SKU)跨账号交叉、计划明细、<b>操作日志复盘</b>（每条调整对应前后 7 天效果）、搜索词诊断、行动清单。
   </p>
   <div class="grid g2">
-    <div class="note">示例：选 <code>{_e((_yesterday()-dt.timedelta(days=2)).isoformat())}</code> ~ <code>{_e(_yesterday().isoformat())}</code>
+    <div class="note" style="margin-top:0">示例：选 <code>{_e((_yesterday()-dt.timedelta(days=2)).isoformat())}</code> ~ <code>{_e(_yesterday().isoformat())}</code>
       就是「近 3 天」聚合报告，对比前 3 天与前 6 天。</div>
-    <div class="warn">区间越长，越早的日期受归因延迟影响越小；<b>看绝对效率用 7~14 天，看即时反应用 1~3 天</b>。</div>
+    <div class="warn" style="margin-top:0">区间越长，越早的日期受归因延迟影响越小；<b>看绝对效率用 7~14 天，看即时反应用 1~3 天</b>。</div>
   </div>
 </div>
 
-<footer>
+<div class="foot">
   接口来源：京准通（概览/智能投放/关键词/搜索词/操作日志）+ 商智（商品明细/流量概况）<br>
   数据目录 <code>{_e(settings.DATA_DIR)}</code> ｜ 登录态 <code>{_e(settings.AUTH_DIR)}</code>
-</footer>
+</div>
 </div>
 
 <div class="modal" id="taskModal" onclick="if(event.target===this)closeTasks()">
@@ -1849,15 +1834,14 @@ def _ai_after_scrape(summary: dict) -> None:
 
 
 LOGIN_CSS = DASH_CSS + """
-.qrbox{background:var(--canvas);border:1px solid var(--hair);border-radius:12px;padding:14px;display:inline-block}
-.qrbox img{display:block;max-width:340px;image-rendering:pixelated}
-.tabs{display:flex;gap:6px;border-bottom:1px solid var(--hair);margin-bottom:14px}
-.tabs button{background:none;border:none;padding:9px 14px;cursor:pointer;font-size:15px;color:var(--muted);border-bottom:2px solid transparent}
+/* 登录页：按钮式页签（复用 .tabs 容器，但登录用 button） */
+.tabs{border-bottom:1px solid var(--hair);margin-bottom:18px;gap:2px;margin-top:0}
+.tabs button{background:none;border:none;padding:10px 16px;cursor:pointer;font-size:14px;font-family:inherit;
+  color:var(--muted);border-bottom:2px solid transparent;font-weight:500;transition:color .15s,border-color .15s}
+.tabs button:hover{color:var(--ink)}
 .tabs button.active{color:var(--ink);font-weight:600;border-bottom-color:var(--primary)}
-.fld{margin-bottom:10px}
-.fld input{padding:9px 11px;border-radius:8px;border:1px solid var(--hair);font-size:14px;width:320px;max-width:80vw;
- background:var(--canvas);color:var(--ink)}
-.fld input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(204,120,92,.15)}
+.loginwrap{max-width:860px}
+.loginwrap .card{padding:28px 32px}
 """
 
 
@@ -1869,9 +1853,13 @@ def login_page(request: Request):
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>登录京东</title><style>{LOGIN_CSS}</style></head><body>
-<header class="top"><div class="wrap"><h1>登录京东</h1>
-<div class="metaline">登录态会写入 <code>{_e(settings.AUTH_DIR)}</code>，容器重启后依然有效</div></div></header>
-<div class="wrap">
+{report2.navtop("/login")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}账号登录</div>
+  <h1>登录京东</h1>
+  <div class="metaline">登录态会写入 <code>{_e(settings.AUTH_DIR)}</code><span class="dot"></span>容器重启后依然有效</div>
+</div></header>
+<div class="wrap loginwrap">
 <div class="card">
   <div class="tabs">
     <button id="tabQr" class="active" onclick="switchTab('qr')">扫码登录</button>

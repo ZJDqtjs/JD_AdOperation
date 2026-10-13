@@ -20,92 +20,112 @@ _AI = report2._e
 
 
 AI_PAGE_CSS = report2.CSS + report2.UI_CSS + report2.AI_CSS + """
-.aitop{background:linear-gradient(120deg,#0f172a,#1e3a8a);color:#fff;padding:22px 0 18px;margin-bottom:16px}
-.aitop h1{margin:0 0 6px;font-size:22px}
-.aitop .metaline{color:#c7d2fe;font-size:13px}
-.aitop .navlinks{margin-top:10px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
-.aitop .navlinks a{color:#dbeafe;font-size:13px;text-decoration:none;border-bottom:1px dashed rgba(219,234,254,.5)}
-.aitop .navlinks a:hover{color:#fff}
-.aigrid{display:grid;grid-template-columns:minmax(0,1fr) 430px;gap:16px;align-items:start}
-@media(max-width:1180px){.aigrid{grid-template-columns:1fr}}
-.chatcard{position:sticky;top:14px;background:#fff;border:1px solid #e5e7eb;border-radius:14px;
-  box-shadow:0 1px 3px rgba(16,24,40,.06);display:flex;flex-direction:column;max-height:calc(100vh - 30px)}
-.chathd{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid #eef2f7}
-.chathd h3{margin:0;font-size:15px;color:#0c447c}
-.chathd .st{font-size:11.5px;color:#94a3b8;margin-left:auto}
-.chatlog{flex:1;overflow:auto;padding:12px 14px;min-height:220px}
-.msg{margin:0 0 12px;display:flex;flex-direction:column}
-.msg .who{font-size:11px;color:#94a3b8;margin-bottom:3px}
-.msg .bub{border-radius:10px;padding:9px 12px;font-size:13px;line-height:1.7;white-space:pre-wrap;
-  word-break:break-word;border:1px solid #eef2f7;background:#f8fafc;color:#1f2937}
+/* ============================================================================
+   AI 分析台：与全站同一套奶油 × 珊瑚设计语言。
+   深色表面只留给「思考过程 / Agent 执行步骤」——那是产品面板（code-window）的语汇。
+   ============================================================================ */
+.ailayout{display:grid;grid-template-columns:minmax(0,1fr) 440px;gap:18px;align-items:start}
+@media(max-width:1180px){.ailayout{grid-template-columns:1fr}}
+.chatcard{position:sticky;top:76px;background:var(--canvas);border:1px solid var(--hair);
+  border-radius:var(--r-lg);display:flex;flex-direction:column;
+  max-height:calc(100vh - 100px);box-shadow:var(--shadow-soft);overflow:hidden}
+.chathd{display:flex;align-items:center;gap:9px;padding:15px 18px;border-bottom:1px solid var(--hair);
+  background:var(--soft)}
+.chathd h3{margin:0;font-size:15px;font-family:var(--serif);font-weight:400;color:var(--ink);letter-spacing:-.2px}
+.chathd .st{font-size:11.5px;color:var(--muted2);margin-left:auto}
+.chatlog{flex:1;overflow:auto;padding:16px 18px;min-height:240px}
+.msg{margin:0 0 14px;display:flex;flex-direction:column}
+.msg .who{font-size:10.5px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted2);
+  margin-bottom:5px;font-weight:600}
+.msg .bub{border-radius:var(--r-md);padding:11px 14px;font-size:13px;line-height:1.75;white-space:pre-wrap;
+  word-break:break-word;border:1px solid var(--hair);background:var(--canvas);color:var(--body)}
 .msg.user{align-items:flex-end}
-.msg.user .bub{background:#e8f0fe;border-color:#d5e3fb;color:#12335e}
-.msg.ai .bub{background:#fff}
-.msg .bub h4{margin:8px 0 4px;font-size:13.5px;color:#0b3d6b}
+.msg.user .bub{background:var(--surface-card);border-color:var(--hair);color:var(--strong)}
+.msg.ai .bub{background:var(--canvas)}
+.msg .bub h4{margin:9px 0 4px;font-size:13.5px;color:var(--ink)}
 .msg .bub ul{margin:4px 0;padding-left:18px}
-.msg .bub code{background:#f1f5f9;padding:0 5px;border-radius:4px;font-size:12px}
+.msg .bub code{background:var(--soft);border:1px solid var(--hair);padding:0 5px;border-radius:4px;font-size:12px}
 .bub.streaming:empty{display:none}
-.bub.streaming::after{content:'▌';color:#185fa5;margin-left:1px;animation:blink 1s steps(1) infinite}
+.bub.streaming::after{content:'▌';color:var(--primary);margin-left:1px;animation:blink 1s steps(1) infinite}
 @keyframes blink{50%{opacity:0}}
-.think{margin:0 0 7px;border:1px dashed #d7e2f2;border-radius:9px;background:#fbfcff;overflow:hidden}
-.think>summary{cursor:pointer;font-size:11.5px;color:#64748b;padding:5px 10px;user-select:none;list-style:none}
+/* 思考过程：深色产品面板（Claude code-window 语汇） */
+.think{margin:0 0 9px;border:1px solid var(--dark-elev);border-radius:var(--r-md);background:var(--dark);
+  overflow:hidden}
+.think>summary{cursor:pointer;font-size:11.5px;color:var(--on-dark-soft);padding:7px 12px;user-select:none;
+  list-style:none;font-weight:500;letter-spacing:.3px}
 .think>summary::-webkit-details-marker{display:none}
-.think[open]>summary{color:#185fa5;border-bottom:1px solid #eef2f7}
-.think .tbody{padding:7px 11px 9px;font-size:11.8px;line-height:1.65;color:#64748b;white-space:pre-wrap;
-  word-break:break-word;max-height:230px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace}
-.think .tst{color:#94a3b8;font-weight:400}
-.thinkingbar{display:flex;align-items:center;gap:8px;font-size:12px;color:#185fa5;
-  background:#f2f7ff;border:1px solid #dbe8fb;border-radius:8px;padding:6px 10px;margin-bottom:8px}
-.thinkingbar .el{margin-left:auto;color:#64748b;font-size:11.5px}
-.spin{width:12px;height:12px;flex:0 0 12px;border:2px solid #bfd7f5;border-top-color:#185fa5;
+.think>summary:before{content:"▸ ";font-size:10px}
+.think[open]>summary:before{content:"▾ "}
+.think[open]>summary{color:var(--on-dark);border-bottom:1px solid var(--dark-elev)}
+.think .tbody{padding:10px 13px 12px;font-size:11.8px;line-height:1.7;color:var(--on-dark-soft);
+  white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto;font-family:var(--mono)}
+.think .tst{color:var(--muted2);font-weight:400}
+/* 生成进度条 */
+.thinkingbar{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--primary-a);
+  background:var(--surface-card);border:1px solid var(--hair);border-radius:var(--r-sm);padding:8px 12px;margin-bottom:9px}
+.thinkingbar .el{margin-left:auto;color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
+.spin{width:12px;height:12px;flex:0 0 12px;border:2px solid var(--primary-dim);border-top-color:var(--primary);
   border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.chatbox{border-top:1px solid #eef2f7;padding:10px 12px}
-.chatbox textarea{width:100%;min-height:62px;max-height:160px;resize:vertical;border:1px solid #d8e0ea;
-  border-radius:9px;padding:9px 11px;font-size:13px;font-family:inherit;line-height:1.6}
-.chatbox textarea:focus{outline:none;border-color:#93c5fd;box-shadow:0 0 0 3px rgba(37,99,235,.1)}
-.chatrow{display:flex;align-items:center;gap:8px;margin-top:8px}
-.chatrow .hintline{font-size:11.5px;color:#94a3b8;margin-right:auto}
-.chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 12px 10px}
-.chips button{border:1px solid #dbe4f0;background:#f8fbff;color:#185fa5;border-radius:20px;
-  padding:3px 11px;font-size:12px;cursor:pointer}
-.chips button:hover{background:#185fa5;color:#fff}
-.aibig{width:100%;border:none;background:#1e3a8a;color:#fff;border-radius:10px;padding:11px;
-  font-weight:700;font-size:14px;cursor:pointer}
+/* 输入区 */
+.chatbox{border-top:1px solid var(--hair);padding:12px 14px;background:var(--soft)}
+.chatbox textarea{width:100%;min-height:66px;max-height:170px;resize:vertical;border:1px solid var(--hair);
+  border-radius:var(--r-sm);padding:10px 12px;font-size:13px;font-family:inherit;line-height:1.65;
+  background:var(--canvas);color:var(--ink)}
+.chatbox textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(204,120,92,.15)}
+.chatrow{display:flex;align-items:center;gap:8px;margin-top:9px}
+.chatrow .hintline{font-size:11.5px;color:var(--muted2);margin-right:auto;line-height:1.5}
+.chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 14px 12px;background:var(--soft)}
+.chips button{border:1px solid var(--hair);background:var(--canvas);color:var(--muted);border-radius:9999px;
+  padding:4px 12px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s}
+.chips button:hover{background:var(--primary);border-color:var(--primary);color:var(--on-primary)}
+.aibig{width:100%;border:none;background:var(--primary);color:var(--on-primary);border-radius:var(--r-sm);
+  padding:12px;font-weight:600;font-size:14px;cursor:pointer;font-family:inherit;transition:background .15s}
+.aibig:hover{background:var(--primary-a)}
 .aibig:disabled{opacity:.55;cursor:default}
-.chatempty{color:#94a3b8;font-size:12.8px;line-height:1.9}
-.rptprog{margin:0 0 12px;border:1px solid #dbe4f0;border-radius:12px;background:#f8fbff;padding:10px 12px}
-.rptprog .hd{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#0c447c}
-.rptprog .hd .el{margin-left:auto;font-weight:400;font-size:11.5px;color:#64748b}
-.rptprog .pg{font-size:12.3px;color:#475569;margin-top:5px}
-.rptprog .tbody{font-size:11.8px;color:#64748b;white-space:pre-wrap;word-break:break-word;
-  max-height:190px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;margin-top:6px}
-.modesw{display:flex;align-items:center;gap:6px;font-size:12px;color:#475569;margin-bottom:8px}
-.modesw label{cursor:pointer;user-select:none;display:flex;align-items:center;gap:5px}
-.modesw input{accent-color:#185fa5;width:14px;height:14px}
-.modesw .tag{font-size:11px;color:#94a3b8}
-.steps{margin:0 0 7px}
-.step{display:flex;gap:7px;align-items:flex-start;font-size:12.2px;line-height:1.6;
-  padding:4px 8px;border-radius:7px;margin-bottom:3px;background:#f8fafc;border:1px solid #eef2f7}
-.step .ic{flex:0 0 auto;font-size:12px;line-height:1.6}
-.step.tool{background:#f2f7ff;border-color:#dbe8fb;color:#12335e}
-.step.plan{background:#fbfcff;border-color:#e6eef8;color:#475569}
-.step.obs{background:#fbfdfb;border-color:#e8f2ea;color:#475569;display:block}
-.step.err{background:#fdf3f3;border-color:#f5dede;color:#9f1d1d}
-.step .nm{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600;color:#185fa5}
-.step .ar{color:#64748b;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.4px;
-  word-break:break-all}
-.step.obs details{margin-top:2px}
-.step.obs summary{cursor:pointer;color:#3f6212;font-size:11.6px;list-style:none}
+.chatempty{color:var(--muted2);font-size:12.8px;line-height:1.95}
+/* 生成进度卡片 */
+.rptprog{margin:0 0 16px;border:1px solid var(--hair);border-radius:var(--r-lg);background:var(--surface-card);
+  padding:14px 16px}
+.rptprog .hd{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:600;color:var(--ink)}
+.rptprog .hd .el{margin-left:auto;font-weight:400;font-size:11.5px;color:var(--muted)}
+.rptprog .pg{font-size:12.3px;color:var(--body);margin-top:6px}
+.rptprog .tbody{font-size:11.8px;color:var(--on-dark-soft);white-space:pre-wrap;word-break:break-word;
+  max-height:200px;overflow:auto;font-family:var(--mono);margin-top:8px;background:var(--dark);
+  border-radius:var(--r-sm);padding:10px 12px}
+/* 模式开关 */
+.modesw{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--body);margin-bottom:9px}
+.modesw label{cursor:pointer;user-select:none;display:flex;align-items:center;gap:6px}
+.modesw input{accent-color:var(--primary);width:14px;height:14px}
+.modesw .tag{font-size:11px;color:var(--muted2)}
+/* Agent 执行步骤 */
+.steps{margin:0 0 9px}
+.steps-wrap>summary{cursor:pointer;font-size:11.5px;color:var(--muted);list-style:none;
+  padding:2px 0;user-select:none}
+.steps-wrap>summary::-webkit-details-marker{display:none}
+.steps-wrap>summary:before{content:"▸ ";font-size:10px}
+.steps-wrap[open]>summary:before{content:"▾ "}
+.step{display:flex;gap:8px;align-items:flex-start;font-size:12.2px;line-height:1.65;
+  padding:5px 10px;border-radius:var(--r-sm);margin-bottom:4px;background:var(--soft);border:1px solid var(--hair)}
+.step .ic{flex:0 0 auto;font-size:12px;line-height:1.65}
+.step.tool{background:var(--surface-card);border-color:var(--hair);color:var(--strong)}
+.step.plan{background:var(--soft);border-color:var(--hair);color:var(--muted)}
+.step.obs{background:#edf5ef;border-color:var(--greenbg);color:var(--body);display:block}
+.step.err{background:var(--redbg);border-color:var(--redbg);color:var(--redink)}
+.step .nm{font-family:var(--mono);font-weight:600;color:var(--primary-a)}
+.step .ar{color:var(--muted);font-family:var(--mono);font-size:11.4px;word-break:break-all}
+.step.obs details{margin-top:3px}
+.step.obs summary{cursor:pointer;color:var(--greenink);font-size:11.6px;list-style:none}
 .step.obs summary::-webkit-details-marker{display:none}
-.step.obs pre{margin:4px 0 0;font-size:11.3px;white-space:pre-wrap;word-break:break-word;
-  max-height:180px;overflow:auto;color:#475569}
-.agenthint{font-size:11.5px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;
-  border-radius:7px;padding:5px 9px;margin-bottom:8px}
-.jumpbtn{position:absolute;right:14px;bottom:118px;z-index:6;border:1px solid #c7d2fe;background:#fff;
-  color:#185fa5;border-radius:20px;padding:4px 12px;font-size:12px;cursor:pointer;
-  box-shadow:0 3px 10px rgba(16,24,40,.14)}
-.jumpbtn:hover{background:#185fa5;color:#fff}
+.step.obs pre{margin:5px 0 0;font-size:11.3px;white-space:pre-wrap;word-break:break-word;
+  max-height:190px;overflow:auto;color:var(--on-dark-soft);background:var(--dark);border-radius:var(--r-sm);
+  padding:9px 11px;font-family:var(--mono)}
+.agenthint{font-size:11.5px;color:var(--amberink);background:var(--amberbg);border:1px solid var(--amber);
+  border-radius:var(--r-sm);padding:7px 11px;margin-bottom:9px;line-height:1.7}
+.jumpbtn{position:absolute;right:16px;bottom:130px;z-index:6;border:1px solid var(--primary);
+  background:var(--canvas);color:var(--primary);border-radius:9999px;padding:5px 14px;font-size:12px;
+  cursor:pointer;font-family:inherit;font-weight:500;box-shadow:var(--shadow-soft)}
+.jumpbtn:hover{background:var(--primary);color:var(--on-primary)}
 """
 
 
@@ -200,7 +220,7 @@ function msgHTML(m){
   var cls = m.role==='user' ? 'user' : 'ai';
   var h = '<div class="msg '+cls+'"><div class="who">'+(m.role==='user'?'我':'AI')+'</div>';
   if(m.role!=='user' && m.steps && m.steps.length){
-    h += '<details class="steps-wrap" style="margin:0 0 6px"><summary style="cursor:pointer;font-size:11.5px;color:#64748b">'
+    h += '<details class="steps-wrap" style="margin:0 0 7px"><summary>'
        + '🛠 执行过程（'+m.steps.length+' 步）</summary><div class="steps" style="margin-top:5px">'
        + m.steps.map(stepHTML).join('') + '</div></details>';
   }
@@ -489,7 +509,7 @@ def render(ai, d, ui: str = "", title: str = "AI 运营分析台") -> str:
     keys = ",".join(a.get("key", "") for a in (meta.get("accounts") or []))
     labels = " / ".join(str(a.get("label") or a.get("key")) for a in (meta.get("accounts") or []))
 
-    report_html = report2._ai_block(ai, d, link=False)
+    report_html = report2._ai_block(ai, d, link=False, default_open=True)
     if not ai:
         report_html = (
             '<div class="aicard empty"><div class="aihd"><span class="aibadge off">AI</span> 暂无本区间解读'
@@ -508,20 +528,26 @@ def render(ai, d, ui: str = "", title: str = "AI 运营分析台") -> str:
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_AI(title)}</title><style>{AI_PAGE_CSS}</style></head><body>
-<header class="aitop"><div class="wrap">
-  <h1>AI 运营分析台</h1>
-  <div class="metaline">区间 {_AI(start)} ~ {_AI(end)}　｜　账号 {_AI(labels)}
-    　｜　生成 {_AI(str((ai or {}).get("generatedAt") or "—"))}</div>
-  <div class="navlinks">
-    <a href="/">← 控制台</a>
-    <a href="/report?start={_AI(start)}&end={_AI(end)}&accounts={_AI(keys)}">聚合报表</a>
-    <a href="/api/ai/status" target="_blank">AI 状态 JSON</a>
-    <span style="color:#93c5fd;font-size:12.5px;margin-left:auto">生成状态：<b id="aistat">…</b></span>
+{report2.navtop("/ai")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}AI 运营分析台</div>
+  <div style="display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap">
+    <h1 style="flex:1;min-width:260px;margin-bottom:8px">AI 运营分析台</h1>
+    <div class="actions" style="margin-top:8px">
+      <a class="btn sec" href="/report?start={_AI(start)}&end={_AI(end)}&accounts={_AI(keys)}">聚合报表</a>
+      <a class="btn ghost" href="/api/ai/status" target="_blank">AI 状态 JSON</a>
+    </div>
   </div>
+  <div class="metaline">
+    <span>区间 {_AI(start)} ~ {_AI(end)}</span><span class="dot"></span>
+    <span>账号 {_AI(labels)}</span><span class="dot"></span>
+    <span>生成 {_AI(str((ai or {}).get("generatedAt") or "—"))}</span><span class="dot"></span>
+    <span>生成状态：<b id="aistat">…</b></span>
+  </div>
+  {ui}
 </div></header>
 <div class="wrap">
-  {ui}
-  <div class="aigrid">
+  <div class="ailayout">
     <div>
       <div class="rptprog" id="rptprog" style="display:none"></div>
       {report_html}
@@ -552,7 +578,7 @@ def render(ai, d, ui: str = "", title: str = "AI 运营分析台") -> str:
       </div>
     </aside>
   </div>
-  <div class="foot" style="color:#94a3b8;font-size:11.5px;margin-top:14px">
+  <div class="foot" style="margin-top:20px">
     对话与「思考过程」在本机浏览器保存；生成任务在服务端执行，页面离开/刷新不中断。
     AI 生成内容仅供参考，执行前请人工复核。
   </div>
