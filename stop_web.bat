@@ -3,7 +3,9 @@ REM ============================================================
 REM  京东广告运营分析服务 —— 停止脚本（Windows）
 REM  关闭所有监听 8011 端口的进程。
 REM ============================================================
-chcp 65001 >nul
+REM NOTE: this .bat is stored as GBK/ANSI. Keep 'chcp 936' matched to it.
+REM       If you ever re-save this file as UTF-8, change it to 'chcp 65001'.
+chcp 936 >nul
 setlocal enabledelayedexpansion
 
 set FOUND=0

@@ -12,6 +12,8 @@ kind 取值：
     jst_sku      智能投放-商品      jst_searchword 智能投放-搜索词
     kw           快车-关键词        sz_product  商智-商品明细
     sz_flow      商智-流量概况      oplog       京准通操作日志
+    crowd        定向-人群(DMP)     area        定向-地域
+    hourly       京准通分时曲线（列表行「趋势」背后的数据；只抓昨天，见 OPTIONAL_KINDS）
 """
 from __future__ import annotations
 
@@ -26,7 +28,11 @@ from . import settings
 from .indicators import FLOW_SUM, PRODUCT_SUM, SRC_AMT, SRC_UV, SZ_AMT, SZ_ORDN, SZ_UV
 
 KINDS = ["jzt_campaign", "jst_campaign", "jst_sku", "jst_searchword", "kw",
-         "sz_product", "sz_flow", "oplog", "crowd", "area"]
+         "sz_product", "sz_flow", "oplog", "crowd", "area", "hourly"]
+
+# 「可选」数据源：不是每天都能/都需要抓（分时只在夜间随抓取跑一次、只抓昨天）。
+# `_day_complete` 判定「这天抓全了没」时会忽略它们，否则历史天永远算「不完整」。
+OPTIONAL_KINDS = {"hourly"}
 
 # 广告类报表可相加的字段
 AD_SUM = ["impressions", "clicks", "cost", "totalOrderCnt", "totalOrderSum", "totalCartCnt"]
@@ -52,6 +58,8 @@ AGG = {
     "area": {"key": ["mappedAreaName"], "sum": AD_SUM + AREA_EXTRA_SUM,
              "keep": ["mappedAreaName"]},
 }
+# 注：hourly（分时）不走 AGG —— 它按 (level, campaignId, hour) 汇总且不做派生指标，
+# 由 _agg_hourly() 单独处理。
 
 _lock = threading.RLock()
 _days_cache: dict = {}
@@ -264,6 +272,44 @@ def _agg_sz_flow(payloads: list) -> dict:
     return {"core": [core] if core else [], "source": list(src.values()), "rawCode": 0}
 
 
+def _agg_hourly(payloads: list) -> dict:
+    """分时数据聚合：按 (level, campaignId, hour) 相加。
+
+    只聚「原始可加指标」（cost / totalOrderSum / totalOrderCnt / clicks / impressions），
+    ROI、CPC 等派生指标一律由消费方现算 —— 聚合前先算好的话，跨天相加就错了。
+    """
+    groups: dict = {}
+    order: list = []
+    for pl in payloads or []:
+        for r in (pl or {}).get("rows", []):
+            if r.get("hour") is None:
+                continue
+            kk = (r.get("level"), str(r.get("campaignId")), _f(r.get("hour")))
+            g = groups.get(kk)
+            if g is None:
+                g = {"level": r.get("level"), "campaignId": r.get("campaignId"),
+                     "campaignName": r.get("campaignName"), "hour": int(_f(r.get("hour")))}
+                for x in ("cost", "totalOrderSum"):
+                    g[x] = 0.0
+                for x in ("totalOrderCnt", "clicks", "impressions"):
+                    g[x] = 0
+                groups[kk] = g
+                order.append(kk)
+            for x in ("cost", "totalOrderSum"):
+                g[x] += _f(r.get(x))
+            for x in ("totalOrderCnt", "clicks", "impressions"):
+                g[x] += int(_f(r.get(x)))
+    out = []
+    for kk in order:
+        g = groups[kk]
+        g["cost"] = round(g["cost"], 2)
+        g["totalOrderSum"] = round(g["totalOrderSum"], 2)
+        out.append(g)
+    # 账号级排最前；计划级按计划聚合在一起（消费方需要按计划花费排序时自己排）
+    out.sort(key=lambda x: (x["level"] != "account", str(x["campaignId"]), x["hour"]))
+    return {"rows": out}
+
+
 def _agg_oplog(payloads: list) -> dict:
     seen, rows = set(), []
     for pl in payloads or []:
@@ -301,6 +347,8 @@ def load_window(account: str, kind: str, start: str, end: str):
         out = _agg_sz_product(payloads)
     elif kind == "sz_flow":
         out = _agg_sz_flow(payloads)
+    elif kind == "hourly":
+        out = _agg_hourly(payloads)
     elif kind == "oplog":
         out = _agg_oplog(payloads)
     else:

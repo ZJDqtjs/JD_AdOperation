@@ -353,6 +353,8 @@ def _load_accounts(windows=None, accounts=None):
                 "kw": dstore.load_window(k, "kw", s, e),
                 "sz": _sz_rows(dstore.load_window(k, "sz_product", s, e)),
                 "flow": dstore.load_window(k, "sz_flow", s, e),
+                # 分时（列表行「趋势」）：只有夜间抓取时抓的「昨天」那天有数据
+                "hourly": dstore.load_window(k, "hourly", s, e),
                 "range": [s, e],
             }
             d["wins"][wk] = win
@@ -1233,6 +1235,148 @@ def targeting_gaps(targeting, accts):
     return gaps
 
 
+# ---------------- 分时（京准通列表行「趋势」）----------------
+# 分时数据只在夜间抓取时抓「昨天」那一天，所以它描述的是「最近一天的小时分布」，
+# 而不是所选区间的分布 —— 文案里必须写清日期，否则会被当成区间结论。
+_HOUR_BAD_RATIO = 0.6      # 低于全天均值这个倍数 → 问题时段
+_HOUR_MIN_SHARE = 3.0      # 且花费占比 ≥ 该百分比才值得动手
+_SWEET_MIN_COST = 10.0     # 好时段至少要花到这个钱
+_PLAN_BAD_MIN_COST = 20.0  # 计划内单时段问题的最小花费
+_PLAN_MIN_TOTAL = 50.0     # 计划全天最小花费（太小没意义）
+
+
+def _hour_metrics(rows: list) -> dict:
+    cost = sum(_f(r.get("cost")) for r in rows)
+    amt = sum(_f(r.get("totalOrderSum")) for r in rows)
+    clk = sum(_i(r.get("clicks")) for r in rows)
+    imp = sum(_i(r.get("impressions")) for r in rows)
+    cnt = sum(_i(r.get("totalOrderCnt")) for r in rows)
+    return {"cost": round(cost, 2), "amt": round(amt, 2),
+            "roi": round(amt / cost, 2) if cost else 0.0,
+            "cnt": cnt, "clicks": clk, "impressions": imp,
+            "cpc": round(cost / clk, 2) if clk else 0.0,
+            "cpm": round(cost / imp * 1000, 2) if imp else 0.0}
+
+
+def hourly_rows(active, wins):
+    """分时曲线：每账号 24 小时表 + 计划级 24 小时表。
+
+    ROI / CPC 等派生指标在这里现算（库里只存原始可加指标），
+    这样跨天聚合不会把「先算好的比率」再加一遍。
+    """
+    from . import dailystore as dstore
+    out = {}
+    wk = wins[-1]
+    s, e = wk[1], wk[2]
+    for a in active:
+        key = a["key"]
+        block = dstore.load_window(key, "hourly", s, e) or {}
+        rows = block.get("rows") or []
+        days = block.get("days") or []
+        label = a.get("label") or key
+        if not rows:
+            out[key] = {"label": label, "available": False, "days": [], "range": [s, e],
+                        "hours": [], "plans": [], "totals": _hour_metrics([])}
+            continue
+        acc_rows = [r for r in rows if r.get("level") == "account"]
+        totals = _hour_metrics(acc_rows)
+        hours = []
+        for r in acc_rows:
+            m = _hour_metrics([r])
+            m["hour"] = _i(r.get("hour"))
+            m["share"] = (round(m["cost"] / totals["cost"] * 100, 1)
+                          if totals["cost"] else 0.0)
+            hours.append(m)
+        hours.sort(key=lambda x: x["hour"])
+
+        by_plan: dict = {}
+        order: list = []
+        for r in rows:
+            if r.get("level") != "plan":
+                continue
+            cid = r.get("campaignId")
+            g = by_plan.get(cid)
+            if g is None:
+                g = {"campaignId": cid, "name": r.get("campaignName"), "rows": []}
+                by_plan[cid] = g
+                order.append(cid)
+            g["rows"].append(r)
+        plans = []
+        for cid in order:
+            g = by_plan[cid]
+            t = _hour_metrics(g["rows"])
+            if t["cost"] <= 0:
+                continue
+            hs = []
+            for r in g["rows"]:
+                m = _hour_metrics([r])
+                m["hour"] = _i(r.get("hour"))
+                hs.append(m)
+            hs.sort(key=lambda x: x["hour"])
+            plans.append({"campaignId": cid, "name": g["name"], "hours": hs, **t})
+        plans.sort(key=lambda x: -x["cost"])
+        out[key] = {"label": label, "available": True, "days": days, "range": [s, e],
+                    "hours": hours, "totals": totals, "plans": plans[:30]}
+    return out
+
+
+def hourly_gaps(hourly, accts):
+    """由代码算出「哪些时段在烧钱 / 哪些时段值得加」，供 AI 直接引用（不臆测）。"""
+    gaps = []
+    for a in accts:
+        key = a["key"]
+        b = hourly.get(key) or {}
+        if not b.get("available"):
+            continue
+        label = b.get("label") or key
+        tot = b.get("totals") or {}
+        avg = _f(tot.get("roi"))
+        if not tot.get("cost") or not avg:
+            continue
+        day_txt = "、".join(b.get("days") or []) or "最近一天"
+        hours = b.get("hours") or []
+        waste = [h for h in hours if h["cost"] > 0
+                 and h["share"] >= _HOUR_MIN_SHARE and h["roi"] < avg * _HOUR_BAD_RATIO]
+        waste.sort(key=lambda x: -x["cost"])
+        sweet = [h for h in hours if h["cost"] >= _SWEET_MIN_COST and h["roi"] > avg * 1.3]
+        sweet.sort(key=lambda x: -x["roi"])
+        if waste:
+            gaps.append({
+                "account": key, "label": label, "type": "hour", "day": day_txt,
+                "finding": (f"{day_txt} 分时：全天花费 ¥{tot['cost']:,.0f}、ROI {avg}；"
+                            f"有 {len(waste)} 个时段花费占比≥{_HOUR_MIN_SHARE:.0f}% 且 ROI 低于全天均值的 "
+                            f"{_HOUR_BAD_RATIO:.0%}：" + "、".join(
+                                f"{h['hour']:02d}点(¥{h['cost']:.0f}/ROI{h['roi']}"
+                                + (f"/CPC¥{h['cpc']:.2f}" if h["cpc"] else "") + ")"
+                                for h in waste[:6])),
+                "suggest": "对这些时段设分时折扣/降价（先 30%~50% 试），把预算挪到高 ROI 时段。",
+            })
+        if sweet:
+            gaps.append({
+                "account": key, "label": label, "type": "hour", "day": day_txt,
+                "finding": (f"{day_txt} 高 ROI 时段：" + "、".join(
+                    f"{h['hour']:02d}点(¥{h['cost']:.0f}/ROI{h['roi']})" for h in sweet[:6])),
+                "suggest": "这些时段适当提价/放宽预算，抢更多高转化流量。",
+            })
+        for p in (b.get("plans") or [])[:12]:
+            pr = _f(p.get("roi"))
+            if _f(p.get("cost")) < _PLAN_MIN_TOTAL or not pr:
+                continue
+            bad = [h for h in p["hours"] if h["cost"] >= _PLAN_BAD_MIN_COST and h["roi"] < pr * 0.5]
+            bad.sort(key=lambda x: -x["cost"])
+            if bad:
+                gaps.append({
+                    "account": key, "label": label, "type": "hour_plan", "day": day_txt,
+                    "plan": p.get("name"),
+                    "finding": (f"{day_txt} 计划「{str(p.get('name') or '')[:18]}」全天花费 "
+                                f"¥{p['cost']:,.0f}/ROI {pr}，但 " + "、".join(
+                                    f"{h['hour']:02d}点(¥{h['cost']:.0f}/ROI{h['roi']})" for h in bad[:4])
+                                + " 明显低于它自己的全天水平"),
+                    "suggest": "只对这几个时段降价，不要整体关停该计划（它其它时段是赚的）。",
+                })
+    return gaps
+
+
 # ---------------- 决策建议 ----------------
 def _acct_label(accts) -> str:
     """按实际参与分析的账号生成措辞，避免只选一个账号时还写「两账号」。"""
@@ -1371,6 +1515,8 @@ def build(start=None, end=None, windows=None, accounts=None):
     advice = build_advice(active, totals, skus, plans, ops, words, adj)
     targeting = targeting_rows(active, wins)
     t_gaps = targeting_gaps(targeting, active)
+    hourly = hourly_rows(active, wins)
+    h_gaps = hourly_gaps(hourly, active)
     # 整店一条「加权保本线」：按本期各 SKU 成交额加权毛利率取倒数，
     # 用它替代「全店一条线」做汇总文案，才不会把高毛利 SKU 的花费算成打平
     beBlend, marginBlend = blended_breakeven(
@@ -1400,6 +1546,8 @@ def build(start=None, end=None, windows=None, accounts=None):
         "typeSplit": type_split(active),
         "targeting": targeting,
         "targetingGaps": t_gaps,
+        "hourly": hourly,
+        "hourlyGaps": h_gaps,
         "ops": ops,
         "adjustments": adj,
         "words": {a["key"]: {wk: {cid: {"sw": v["sw"][:60], "kw": v["kw"][:40]}

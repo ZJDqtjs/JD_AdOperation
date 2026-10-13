@@ -79,6 +79,16 @@ def local_range(accounts=None, days: int | None = None,
 
 
 # ---------------- 摘要构建 ----------------
+def _f(v, d=0.0) -> float:
+    """摘要层统一的宽松数值转换（接口可能给字符串、None 或空串）。"""
+    try:
+        if v is None or v == "":
+            return d
+        return float(v)
+    except (TypeError, ValueError):
+        return d
+
+
 def _w(x: dict) -> dict:
     return {"cost": round(x.get("cost", 0), 1), "roi": round(x.get("roi", 0), 2),
             "ctr": round(x.get("ctr", 0), 2), "cvr": round(x.get("cvr", 0), 2),
@@ -128,6 +138,8 @@ def build_digest(data: dict, account: str | None = None, *, max_skus: int = 30,
         "recent_ops": [],
         "targeting": {},
         "targeting_gaps": [],
+        "hourly": {},
+        "hourly_gaps": [],
     }
 
     for a in accts:
@@ -211,6 +223,50 @@ def build_digest(data: dict, account: str | None = None, *, max_skus: int = 30,
     digest["targeting_gaps"] = [g for g in (data.get("targetingGaps") or [])
                                 if not account or g.get("account") == account]
 
+    # 分时（京准通列表行「趋势」的背后数据）—— 分时折扣 / 时段出价的唯一依据。
+    # 注意口径：夜间抓取只抓「昨天」那一天，所以这是「最近一天的小时分布」，不是区间分布，
+    # 摘要里显式带 `days` 与 `scope`，避免模型把它当成整段区间的结论。
+    hy = data.get("hourly") or {}
+    for a in accts:
+        key = a["key"]
+        b = hy.get(key) or {}
+        if not b.get("available"):
+            digest["hourly"][key] = {"available": False,
+                                     "note": "本轮未抓到分时数据（该数据只在夜间抓取时抓昨天一天）"}
+            continue
+        tot = b.get("totals") or {}
+        plans_out = []
+        for p in (b.get("plans") or [])[:12]:
+            hs = [h for h in (p.get("hours") or []) if _f(h.get("cost")) > 0]
+            # 「最差时段」必须先花过钱：不然一整排「花 0.5 元 / ROI 0」的噪声小时会挤掉真正在烧钱的时段
+            pcost = _f(p.get("cost"))
+            floor = max(pcost / 24 * 0.5, 5.0)
+            heavy = [h for h in hs if _f(h.get("cost")) >= floor] or hs
+            worst = sorted(heavy, key=lambda x: _f(x.get("roi")))[:4]
+            best = sorted(hs, key=lambda x: -_f(x.get("roi")))[:3]
+            plans_out.append({
+                "campaignId": p.get("campaignId"), "name": str(p.get("name") or "")[:24],
+                "cost": round(pcost, 1), "roi": round(_f(p.get("roi")), 2),
+                "worst_hours": [{"h": h.get("hour"), "cost": round(_f(h.get("cost")), 1),
+                                 "roi": round(_f(h.get("roi")), 2),
+                                 "cpc": round(_f(h.get("cpc")), 2)} for h in worst],
+                "best_hours": [{"h": h.get("hour"), "cost": round(_f(h.get("cost")), 1),
+                                "roi": round(_f(h.get("roi")), 2)} for h in best],
+            })
+        digest["hourly"][key] = {
+            "available": True, "days": b.get("days"),
+            "scope": "仅「最近一天」的 24 小时分布（非区间分布）",
+            "total": {"cost": round(_f(tot.get("cost")), 1), "amt": round(_f(tot.get("amt")), 1),
+                      "roi": round(_f(tot.get("roi")), 2)},
+            "hours": [{"h": h.get("hour"), "cost": round(_f(h.get("cost")), 1),
+                       "amt": round(_f(h.get("amt")), 1), "roi": round(_f(h.get("roi")), 2),
+                       "cpc": round(_f(h.get("cpc")), 2), "share": h.get("share")}
+                      for h in (b.get("hours") or [])],
+            "plans": plans_out,
+        }
+    digest["hourly_gaps"] = [g for g in (data.get("hourlyGaps") or [])
+                             if not account or g.get("account") == account]
+
     # 近期人工操作（只给事实：改了什么、前后 ROI），不下判定，交给模型复盘
     adjs = [x for x in (data.get("adjustments") or [])
             if not account or x.get("account") in keys]
@@ -284,6 +340,17 @@ SCHEMA = {
         "suggest": "具体怎么做（建什么包/怎么设溢价/先小预算测试等，可执行）",
         "priority": "高/中/低",
     }],
+    "dayparting_advice": [{
+        "scope": "account（账号级时段策略）或 plan（某计划的时段策略）",
+        "campaignId": "scope=plan 时必填，必须来自输入的 hourly[].plans / plans；account 时留空",
+        "target": "作用对象：账号 key 或 plan 名",
+        "hours": "要调整的小时，如「04:00-05:00、23:00」或「18:00-22:00」",
+        "direction": "降价/关停/提价/放宽预算 之一",
+        "evidence": "必须引用输入 hourly / hourly_gaps 里的小时花费与 ROI 数字（含该时段在全天的花费占比）",
+        "method": "为什么这个时段该这样调（结合保本线、CPC 异常、拉新/收割节奏讲原理）",
+        "suggest": "可执行做法：折扣幅度/预算调整量/先测几天；以及要盯的验证指标",
+        "priority": "高/中/低",
+    }],
     "sequence": [{"step": 1, "do": "先做什么", "because": "为什么这个顺序（哪些能立即止损、哪些要等内功）"}],
     "watchlist": ["上线后要盯的信号/验证点（用哪个指标、期望变成什么）"],
     "risks": ["数据或执行上的风险提示"],
@@ -306,10 +373,18 @@ SYSTEM = """你是资深京东快车（搜索广告）投放操盘手。你的�
   例如：定向人群(DMP 人群包)、定向地域、时间折扣、设备定向、测图测词测人群、竞品定向、智能出价等。
   每条都要引用输入里的客观证据（如「本期人群花费全部来自默认人群」「覆盖 29 个地域中 X 个零成交」），
   讲清方法论原理，并给出**可落地的做法**（建什么包、怎么设溢价、先小预算怎么测）。没有证据的功能不要硬凑。
+- 【分时只当「最近一天」看】输入里的 `hourly` 是**最近一天 24 小时**的分布（`days` 字段写了具体日期），
+  **不是**所选区间的分布，严禁当成区间结论；引用时必须带上那个日期。
+  若某账号 `hourly.available=false`，说明本轮没抓分时，不要编造时段数据。
+  有数据时，在 `dayparting_advice` 里给出时段策略：优先处理「花费占比高但 ROI 明显低于全天均值」的时段
+  （`hourly_gaps` 已算好，直接引用其中的小时、花费、ROI）；同时指出高 ROI 时段该怎么加。
+  注意：分时 ROI 按**点击所在小时**归因，越晚的时段归因窗口越短、ROI 天然偏低，
+  所以对 23:00 这类时段的判断要留余地，别只凭一天的数据下死结论。
 - 【只给待审建议】不要发号施令，只给**待人工审阅**的建议。
 - 【控制篇幅，务必输出完整 JSON】diagnosis ≤5 条；plan_judgements 最多 8 条（按 w2 花费从高到低，
   只判断最关键的，不要逐个计划都写）；keyword_plan 只对「确有可否定/可提价词」的计划给；
   targeting_advice ≤5 条（按 priority 高到低，优先未启用的）；
+  dayparting_advice ≤4 条（账号级时段策略优先，其次只挑时段差异最大的 1-2 个计划）；
   account_reads ≤2 条；sequence ≤5 步。宁可少而精，也不要写半截 —— 输出被截断会导致整份解读不可用。
 - 输出**只含一个 JSON 对象**，符合给定 schema，不要任何额外解释文字。
 """
@@ -398,6 +473,28 @@ def normalize(advice: dict) -> dict:
                 if t.get(alt):
                     t["suggest"] = t[alt]
                     break
+    # 分时（时段）建议
+    if "dayparting_advice" not in advice:
+        for alt in ("hour_advice", "dayparting", "time_advice", "hourly_advice",
+                    "daypartingAdvice", "schedule_advice"):
+            if isinstance(advice.get(alt), list):
+                advice["dayparting_advice"] = advice.pop(alt)
+                break
+    for d in advice.get("dayparting_advice", []) or []:
+        if not isinstance(d, dict):
+            continue
+        if not d.get("hours"):
+            for alt in ("hour", "time", "period", "hours_range"):
+                if d.get(alt):
+                    d["hours"] = d[alt]
+                    break
+        if not d.get("scope"):
+            d["scope"] = "plan" if d.get("campaignId") else "account"
+        if not d.get("suggest"):
+            for alt in ("action", "advice", "recommend", "howto"):
+                if d.get(alt):
+                    d["suggest"] = d[alt]
+                    break
     return advice
 
 
@@ -449,12 +546,28 @@ def validate(advice: dict, digest: dict) -> dict:
     if sc is not None and not (0 <= sc <= 100):
         warnings.append(f"health.score={sc} 超出 0-100")
 
+    # 分时建议：scope=plan 时必须指向真实存在的计划；且不能引用没有分时数据的账号
+    hy = digest.get("hourly") or {}
+    no_hour = {k for k, v in hy.items() if not v.get("available")}
+    for d in advice.get("dayparting_advice", []) or []:
+        if not isinstance(d, dict):
+            continue
+        if str(d.get("scope") or "").lower() == "plan":
+            cid = str(d.get("campaignId") or "")
+            if cid and cid not in plan_ids:
+                issues.append(f"dayparting_advice 引用了不存在的 campaignId={cid}")
+        claim = (str(d.get("evidence") or "") + str(d.get("finding") or ""))
+        for k in no_hour:
+            if k and k in claim:
+                warnings.append(f"dayparting_advice 引用了本轮没有分时数据的账号「{k}」")
+
     n_pj = len([x for x in (advice.get("plan_judgements") or []) if isinstance(x, dict)])
     n_kp = len([x for x in (advice.get("keyword_plan") or []) if isinstance(x, dict)])
     n_ta = len([x for x in (advice.get("targeting_advice") or []) if isinstance(x, dict)])
+    n_dp = len([x for x in (advice.get("dayparting_advice") or []) if isinstance(x, dict)])
     return {"ok": not issues, "issues": issues, "warnings": warnings,
             "n_plan_judgements": n_pj, "n_keyword_plan": n_kp,
-            "n_targeting_advice": n_ta,
+            "n_targeting_advice": n_ta, "n_dayparting_advice": n_dp,
             "n_plan_actions": n_pj}   # 兼容旧前端字段
 
 
@@ -527,6 +640,10 @@ CHAT_SYSTEM = """你是资深京东快车（搜索广告）投放操盘手，正
 - 【未启用的功能主动提示】用户问到某个功能（定向人群 DMP、定向地域、时间折扣、设备定向、
   测图测词测人群、竞品定向、智能出价等）时，先看摘要 `targeting` / `targeting_gaps` 里是否在用，
   再给「要不要做、怎么做、先怎么测」的建议。
+- 【分时数据只代表最近一天】摘要里 `hourly` / `hourly_gaps` 是**最近一天 24 小时**的分布
+  （`days` 字段写明是哪天），**不是**所选区间的分布；引用时必须带上那个日期，严禁当成区间结论。
+  某账号 `hourly.available=false` 表示本轮没抓分时，不要编造时段数字。
+  分时 ROI 按点击所在小时归因，越晚的时段归因窗口越短、ROI 天然偏低，别只凭一天对深夜时段下死结论。
 - 【篇幅】一般 300~600 字，条理清晰（可用小标题 / 列表）；用户明确要求详细时才展开。
 - 一律用简体中文回答。
 """

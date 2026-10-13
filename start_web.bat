@@ -4,7 +4,9 @@ REM  京东广告运营分析服务 —— 稳定启动脚本（Windows）
 REM  双击即可运行；会固化时区，避免 TZ=UTC 污染导致抓取日期错一天。
 REM  监听 0.0.0.0：同一局域网的其它设备也能访问（http://<本机IP>:8011/）。
 REM ============================================================
-chcp 65001 >nul
+REM NOTE: this .bat is stored as GBK/ANSI. Keep 'chcp 936' matched to it.
+REM       If you ever re-save this file as UTF-8, change it to 'chcp 65001'.
+chcp 936 >nul
 setlocal enabledelayedexpansion
 
 REM 关键：显式指定业务时区（代码层亦有双保险，这里是第一道防线）

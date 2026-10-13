@@ -157,6 +157,18 @@ SZ_CAPTURE_WAIT = _env_int("JD_SZ_CAPTURE_WAIT", 13000)
 PAGE_SLEEP = float(_env("JD_PAGE_SLEEP", "0.35") or 0.35)
 RETRY_SLEEP = float(_env("JD_RETRY_SLEEP", "22") or 22)
 
+# ---------------- 分时（趋势）数据 ----------------
+# 京准通「推广计划」列表里的「趋势」= 分时曲线（granularity=4，only 单日有效）。
+# 只在**夜间抓取时**跑一次、**只抓昨天那一天**，避免频繁调用被风控。
+HOURLY_ENABLED = _env_bool("JD_HOURLY", True)
+# 计划级只取当天花费前 N 个计划（账号级永远是 1 次请求）。N=0 表示只抓账号级。
+HOURLY_PLANS = _env_int("JD_HOURLY_PLANS", 20)
+# 每晚抓取「最近几天」的分时（默认 1 = 只抓昨天）。调大可以覆盖更早的天，
+# 但请求数会按天数翻倍（每天 1 + HOURLY_PLANS 次）。
+HOURLY_DAYS = _env_int("JD_HOURLY_DAYS", 1)
+# 每个分时请求之间的间隔，别打太密
+HOURLY_SLEEP = float(_env("JD_HOURLY_SLEEP", "0.4") or 0.4)
+
 # ---------------- Web ----------------
 WEB_HOST = _env("JD_WEB_HOST", "0.0.0.0") or "0.0.0.0"
 WEB_PORT = _env_int("JD_WEB_PORT", 8000)

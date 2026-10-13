@@ -30,6 +30,7 @@ from .scrape_jzt import CAMPAIGN_API, CUSTOM_COLUMNS
 from .scrape_keyword import COLUMNS as KW_COLS, KEYWORD_API
 from .scrape_sz import INDICATORS, SzSession, URL_CORE, URL_FLOWSRC, URL_PRODUCT, _base
 from .scrape_target import fetch_area_days, fetch_crowd_days
+from .scrape_trend import fetch_hourly_day
 
 _JST_KEY = {"jst_campaign": "campaign", "jst_sku": "sku", "jst_searchword": "searchword"}
 # 允许直接传接口短名（campaign/sku/searchword），避免调用方传错 key 时静默失败
@@ -684,6 +685,9 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
         return False
 
     err: str | None = None
+    # 分时只抓「最近 N 天」（默认 1 = 昨天）：它是可选数据源，不参与 _day_complete 判定
+    h_days = (days[-max(int(settings.HOURLY_DAYS), 1):]
+              if (settings.HOURLY_ENABLED and "hourly" in kinds) else [])
     try:
         for acct in accounts:
             if _stopped():
@@ -693,6 +697,12 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
             acc_sum = {"label": label, "days": {}, "errors": []}
             summary["accounts"][key] = acc_sum
             todo = [d for d in days if force or not _day_complete(key, d, kinds)]
+            # 分时(hourly)是「可选」数据源，_day_complete 刻意不看它（否则历史天永远算不完整）。
+            # 这里单独把需要抓分时的天补进待办，否则「只抓分时」或「历史天齐全但缺昨天分时」会被整体跳过。
+            if h_days:
+                extra = [d for d in h_days if _need_hourly(key, d, force)]
+                if extra:
+                    todo = sorted(set(todo) | set(extra))
             if not todo:
                 log(f"[{label}] {start}~{end} 全部已存在，跳过")
                 continue
@@ -756,6 +766,21 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                             got.append(kind)
                         except Exception as exc:  # noqa: BLE001
                             acc_sum["errors"].append(f"{kind}@{day}: {exc}")
+                    # --- 分时（列表行「趋势」）：只对最近 HOURLY_DAYS 天抓，默认只有昨天 ---
+                    # 用户明确要求「不要实时轮询，避免频繁调用被风控」，所以：
+                    #   ① 只在夜间抓取流程里跑；② 只抓「最近 N 天」（默认 1 = 昨天）；
+                    #   ③ 同一天当天已抓过就跳过（_need_hourly 看 fetchedAt）。
+                    if "hourly" in kinds and settings.HOURLY_ENABLED and day in h_days \
+                            and _need_hourly(key, day, force):
+                        try:
+                            plan_rows = (ds.load_day(key, day, "jzt_campaign") or {}).get("rows") or []
+                            ds.save_day(key, day, "hourly",
+                                        fetch_hourly_day(p_jzt, day, plan_rows, log=log))
+                            got.append("hourly")
+                        except Exception as exc:  # noqa: BLE001
+                            acc_sum["errors"].append(f"hourly@{day}: {exc}")
+                            log(f"[{label}] 分时 {day} 失败：{exc}")
+
                     for kind in ("sz_product", "sz_flow"):
                         if kind not in kinds:
                             continue
@@ -856,8 +881,33 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
     return summary
 
 
+def _need_hourly(key: str, day: str, force: bool) -> bool:
+    """分时当天是否还需要抓。
+
+    分时是「同一天只抓一次」的数据：夜间任务跑完又手动重跑、或一天内被触发两次，
+    都不该把请求数翻倍（用户明确要求避免频繁调用被风控）。
+    判据优先看落盘里的 `fetchedAt`，早期没有该字段的老数据退回用**文件修改时间**；
+    跨天后会自动重新抓（归因会长）。
+    """
+    if force:
+        return True
+    p = ds.day_path(key, day, "hourly")
+    if not p.exists():
+        return True
+    stamp = str((ds.load_day(key, day, "hourly") or {}).get("fetchedAt") or "")
+    if stamp[:10]:
+        return stamp[:10] != ds.today().isoformat()
+    try:
+        mt = dt.datetime.fromtimestamp(p.stat().st_mtime, tz=settings.now().tzinfo)
+        return mt.date() != ds.today()
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _day_complete(key: str, day: str, kinds) -> bool:
-    want = [k for k in kinds if k in ds.KINDS]
+    # OPTIONAL_KINDS（如分时 hourly）不算在内：它们不是每天都抓，
+    # 算进去会让所有历史天永远判定为「不完整」，每晚重跑整段区间。
+    want = [k for k in kinds if k in ds.KINDS and k not in ds.OPTIONAL_KINDS]
     return all(ds.has_day(key, day, k) for k in want)
 
 

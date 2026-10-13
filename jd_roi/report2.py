@@ -1530,6 +1530,33 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
         tgt_block = (f'<details class="aidt"{opn}><summary>未用起来 / 待优化的投放功能'
                      f'（{len(tas)} 条 · 定向人群/地域/时段等）</summary>{"".join(tas)}</details>')
 
+    # 分时（时段）策略：数据只覆盖「最近一天」，标题里标出日期，避免被当成区间结论
+    dps = []
+    for x in (a.get("dayparting_advice") or []):
+        pr = tpri.get(str(x.get("priority") or ""), "l2")
+        scope = str(x.get("scope") or "")
+        tgt = str(x.get("target") or x.get("campaign") or "")
+        dhead = (f'<span class="aipri {pr}">{_e(str(x.get("priority") or "中"))}</span>'
+                 + (_e(tgt) if tgt else "账号级")
+                 + (f' <span class="aimeta">· {_e(scope)}</span>' if scope else "")
+                 + (f' <span class="aimeta">· {_e(str(x.get("hours") or ""))}</span>' if x.get("hours") else "")
+                 + (f' <span class="aivd">{_e(str(x.get("direction") or ""))}</span>' if x.get("direction") else ""))
+        dps.append(f'<div class="aip"><div class="t">{dhead}</div>'
+                   + (f'<div class="b"><b>证据：</b>{_e(str(x.get("evidence") or ""))}</div>' if x.get("evidence") else "")
+                   + (f'<div class="b"><b>方法论：</b>{_e(str(x.get("method") or ""))}</div>' if x.get("method") else "")
+                   + (f'<div class="b"><b>做法：</b>{_e(str(x.get("suggest") or ""))}</div>' if x.get("suggest") else "")
+                   + '</div>')
+    dp_block = ""
+    if dps:
+        hdays: list = []
+        for v in (d.get("hourly") or {}).values():
+            for dd in (v.get("days") or []):
+                if dd not in hdays:
+                    hdays.append(dd)
+        dp_block = (f'<details class="aidt"{opn}><summary>分时（时段）策略建议（{len(dps)} 条'
+                    + (f' · 数据日期 {"、".join(hdays)}' if hdays else " · 无分时数据") + '）</summary>'
+                    + "".join(dps) + '</details>')
+
     ps = []
     for p in (a.get("plan_judgements") or []):
         acts = "".join(f'<li>{_e(str(t))}</li>' for t in (p.get("actions") or []))
@@ -1593,7 +1620,7 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
         f'（{len(a.get("account_reads") or [])} 账号 / {len(a.get("sequence") or [])} 步）</summary>'
         f'{_mid_inner}</details>' if _mid_has else "")
 
-    return (f'<div class="aicard">{head}{hd}{hl}{diag}{mid_block}{tgt_block}{dt}{kw_block}'
+    return (f'<div class="aicard">{head}{hd}{hl}{diag}{mid_block}{dp_block}{tgt_block}{dt}{kw_block}'
             f'<div class="aidisc">AI 套用《京东快车底层逻辑》方法论生成，<b>仅供参考</b>；'
             f'算数与口径由规则层代码保证，执行前请人工复核。'
             + (f'　<a href="/ai?start={_e(start)}&end={_e(end)}&accounts={_e(keys)}">'

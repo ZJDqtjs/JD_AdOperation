@@ -55,7 +55,8 @@ app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redo
 KINDS_UI = [("jzt_campaign", "概览计划"), ("jst_campaign", "投放计划"),
             ("jst_sku", "投放商品"), ("jst_searchword", "搜索词"),
             ("kw", "关键词"), ("sz_product", "商智商品"),
-            ("sz_flow", "商智流量"), ("oplog", "操作日志")]
+            ("sz_flow", "商智流量"), ("oplog", "操作日志"),
+            ("hourly", "分时")]
 
 
 # ================================================================ 工具
