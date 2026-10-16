@@ -21,7 +21,18 @@ ENV PYTHONUNBUFFERED=1 \
     JD_MAX_BACKFILL_DAYS=120 \
     JD_HEADLESS=1 \
     JD_ENABLE_SCHEDULER=1 \
-    JD_RUN_ON_START=1
+    JD_RUN_ON_START=1 \
+    JD_KEEPALIVE=1 \
+    JD_KEEPALIVE_INTERVAL=1200 \
+    JD_KEEPALIVE_JITTER=120 \
+    JD_KEEPALIVE_DWELL=8000 \
+    JD_KEEPALIVE_EXPORT_STATE=0 \
+    JD_HOURLY=1 \
+    JD_HOURLY_PLANS=20 \
+    JD_HOURLY_DAYS=1 \
+    JD_HOURLY_SLEEP=0.4 \
+    JD_AI_ENABLED=1 \
+    JD_AI_RANGE_DAYS=7
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends tzdata ca-certificates \

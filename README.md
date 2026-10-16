@@ -56,6 +56,15 @@ source 取值：
 
 **任意区间分析 = 把这些按天文件聚合**，所以查询很快，也不受接口限流影响。
 
+> **换机器 / 重新部署时，`docker-data/` 必须手工搬 —— 它不会自动跟过去。**
+> compose 只是把它当挂载目录，全新 `docker compose up` 会建成空的：
+> 于是报表里只剩新部署之后抓到的那几天，之前的全没了。
+> 迁移方法：把老机器的 `docker-data/daily/` 整个拷进新机器的 `docker-data/daily/`。
+> 两点注意：
+> - **`state.json` 不用搬** —— 它是运行时产物，跑一次就会重新生成。
+> - 两边的日期有重叠时，**只补缺失的日期、别整段覆盖**：新机器上刚抓的数据
+>   归因更完整（京准通是点击后 15 天归因），拿旧的盖新的反而会退步。
+
 ---
 
 ## 3. 配置
@@ -190,6 +199,8 @@ account_id 是「快车-关键词报表」接口需要的 pinIds。
 | 现象 | 原因 / 处理 |
 |---|---|
 | 报表显示「数据不完整」 | 该区间有日期没入库。到控制台按日期「立即抓取」补齐 |
+| 换了机器/重新部署后没有历史数据 | `docker-data/` 是挂载目录，新部署时是**空的、不会自动迁移**（见 §2）。把老机器的 `docker-data/daily/` 拷过来即可；日期重叠时只补缺、别覆盖 |
+| 区间分析报「没有找到 X ~ Y 的数据」 | 该区间的按天数据里**只有 `oplog`**（操作日志）。一个账号算不算「有数据」的条件是窗口内有 `jzt_campaign`（京准通）或 `jst_campaign` / `jst_sku`（智能投放）之一——只有操作日志不算数，见 `analyze2._load_accounts` |
 | 抓取报「登录态已失效」 | JD 会话过期。打开 /login 重新扫码 |
 | 容器内扫码扫不了 | 无头浏览器遇到滑块/短信验证时无法完成。**替代方案**：在本地电脑跑一次 `python -m jd_roi.login --account=main`，然后把生成的 `auth/browser_profile`（或 `auth/<key>`）整个目录 + `auth/jd_state.json` 拷进 `./docker-auth/<key>/`，容器直接复用 |
 | 报表出现「口径降级」提示 | 该区间缺 jzt_campaign，账号总额退化为智能投放口径（不含全站智能推广） |
@@ -197,6 +208,7 @@ account_id 是「快车-关键词报表」接口需要的 pinIds。
 | 抓取报 -3010 限流 | 搜索词接口限流，脚本会自动退避重试；也可调小 JD_SW_MAX_ROWS |
 | 想改抓取时间 | 改 JD_SCHEDULE_HOUR / JD_SCHEDULE_MINUTE 后 docker compose up -d |
 | `docker build` 在 pip 阶段报 `ReadTimeoutError` | 容器内直连 pypi.org 太慢。Dockerfile 已带 `--retries 5 --timeout 60`；国内建议在 `.env` 里设 `PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/`（`.env.example` 默认已给），构建会快很多 |
+| 宿主机上堆积大量 `<defunct>` 僵尸进程 | 容器**没有 init**，而 `entrypoint.sh` 最后 `exec uvicorn` 让 uvicorn 成了容器内 PID 1。Chromium 是多进程浏览器，浏览器进程退出时它的子进程（zygote / GPU / 渲染器 / 崩溃处理器）被 reparent 给 PID 1，而 Python 不会 `wait()` 任意子进程 → 孤儿永久停在 `<defunct>`，越积越多（实测 2.7 天堆到 834 个）。**修法：compose 里加 `init: true`**（Docker 注入 tini 作 PID 1 专门回收孤儿），加完**必须重建容器**才生效（`docker compose up -d`） |
 
 ---
 
