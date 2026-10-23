@@ -1,0 +1,60 @@
+# ============================================================
+# 本地开发编排 —— 与 docker-compose.yml（线上）完全独立
+#
+#   启动：docker compose -f docker-compose.dev.yml up -d
+#   日志：docker compose -f docker-compose.dev.yml logs -f
+#   停止：docker compose -f docker-compose.dev.yml down
+#
+# 与线上的四点区别：
+#   1. 端口 8012（线上 8011，且宿主机 8000 被 /opt/wsl-api 占用）
+#   2. 源码 bind mount + uvicorn --reload，改文件即生效，不用重建镜像
+#   3. 调度器 / 启动补跑 / 登录保活 全部关闭，避免与线上抢账号登录态
+#   4. data / auth / config 用 docker-dev/ 下的独立副本，绝不碰线上目录
+# ============================================================
+services:
+  jd-roi-dev:
+    image: jd-roi:latest        # 复用已装好 playwright + chromium 的镜像，免重建
+    container_name: jd-roi-dev
+    # 同线上：tini 作为 PID 1 回收 Chromium 的孤儿进程
+    # （--reload 每次重启 uvicorn 都会留下浏览器子进程，没有 init 会越积越多）
+    init: true
+    ports:
+      - "8012:8000"
+    # 覆盖 ENTRYPOINT 的原因：entrypoint.sh 结尾 exec uvicorn 时把参数写死了，
+    # 没法追加 --reload；这里直接给出等价的启动命令。
+    entrypoint:
+      - uvicorn
+      - jd_roi.webapp:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --workers=1
+      - --reload
+      - --reload-dir=/app/jd_roi
+      - --log-level=debug
+    environment:
+      TZ: Asia/Shanghai
+      # ---- 三条红线：dev 绝不参与定时任务，否则会和线上同时登录同一账号 ----
+      JD_ENABLE_SCHEDULER: "0"
+      JD_RUN_ON_START: "0"
+      JD_KEEPALIVE: "0"
+      # ---- 其余尽量压低，避免调试时打出真实流量 ----
+      JD_AI_ENABLED: "0"          # 不自动调 LLM，省额度；需要时改 1
+      JD_REFRESH_DAYS: "1"        # dev 只回刷 1 天
+      JD_MAX_BACKFILL_DAYS: "3"
+      JD_SCOPE: ""                # 留空 = accounts.json 里的全部账号
+      JD_LOG_LEVEL: debug
+    volumes:
+      # 源码：唯一需要挂载的目录，改完保存即触发 reload
+      - ./jd_roi:/app/jd_roi
+      # 运行期数据：线上 docker-data 的副本（只读调试用，写入不影响线上）
+      - ./docker-dev/data:/data
+      # 登录态：线上 docker-auth 的瘦身副本（拷完后 sdtoken 只有约 30 分钟）
+      - ./docker-dev/auth:/auth
+      # 账号与成本表：线上 docker-config 的副本
+      - ./docker-dev/config:/config
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s

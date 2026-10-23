@@ -13,6 +13,7 @@ data/
 docker-data/
 docker-auth/
 docker-config/
+docker-dev/
 
 # ---- 本地私有配置（存放真实京准通账户 ID、SKU 成本等）----
 jd_roi/local_config.py
