@@ -1,0 +1,21 @@
+# ============================================================
+# 统一行尾，避免「Windows 上编辑 → docker build 烤进镜像」把 CRLF 带上线
+#   py 带 CRLF 只是不美观，docker/entrypoint.sh 带 CRLF 会 bad interpreter 起不来
+# ============================================================
+* text=auto eol=lf
+
+# 容器内由 bash 执行，必须 LF
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Windows 上双击运行的脚本，必须 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制：不参与换行转换与 diff
+*.xlsx  binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.min.js binary
