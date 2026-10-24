@@ -1111,6 +1111,12 @@ function cancel(){
   fetch(API + '/cancel', {method:'POST'}).then(function(r){ return r.json(); })
     .then(function(j){ msg(j.cancelRequested ? '已请求取消，当前 SKU 取完后停止' : '当前没有任务'); });
 }
+function expView(){
+  if(!JOB){ msg('还没有数据，先点「查询」','bad'); return; }
+  var qs = new URLSearchParams({job: JOB, account: $('pcAcc').value,
+    start: $('pcStart').value, end: $('pcEnd').value, dim: DIM});
+  window.location = API + '/export?' + qs.toString();
+}
 function exp(){
   var s = $('pcStart').value, e = $('pcEnd').value;
   if(!JOB && !s){ msg('还没有数据，先点「查询」','bad'); return; }
@@ -1123,7 +1129,8 @@ function sort(k){
   render();
 }
 window.PC = {sort: sort, run: run, refetch: refetch, exp: exp, cancel: cancel,
-             render: render, loadCache: loadCache, delCache: delCache, dim: dim};
+             render: render, loadCache: loadCache, delCache: delCache, dim: dim,
+             expView: expView};
 function boot(){
   poll(); loadCache();
   $('pcTable').addEventListener('click', function(e){
@@ -1195,7 +1202,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     <label class="fld">止 <input type="date" id="pcEnd" value="{_e(end)}"></label>
     <button class="btn" id="pcRun" onclick="PC.run()">查询</button>
     <button class="btn ghost" id="pcRefetch" onclick="PC.refetch()" title="忽略本地缓存，重新请求京准通">重新抓取</button>
-    <button class="btn sec" id="pcExport" onclick="PC.exp()" disabled>导出 Excel</button>
+    <button class="btn sec" id="pcExport" onclick="PC.exp()" disabled>导出完整 Excel</button>
     <button class="btn ghost" id="pcCancel" onclick="PC.cancel()" style="display:none">取消</button>
   </div>
   <div class="hint" id="pcMsg" style="min-height:20px">选账号与区间后点「查询」：有缓存直接读本地（不请求京准通），没有才去抓。</div>
@@ -1228,6 +1235,8 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     <input id="pcFilter" placeholder="筛选 SKU / 商品名 / 品类" oninput="PC.render()"
            style="min-width:260px;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
     <span class="hint" id="pcCount"></span>
+    <button class="btn sec mini" id="pcExportView" onclick="PC.expView()"
+            style="margin-left:auto" title="按当前维度导出（SKU 或 品类）">导出当前视图 Excel</button>
   </div>
   <div class="tblwrap long">
     <table id="pcTable"><thead id="pcHead"></thead><tbody id="pcBody"></tbody></table>
@@ -1300,9 +1309,10 @@ def _paycomm_snapshot(runner, rows: int) -> dict:
 
 
 def _paycomm_export(runner, job: str | None, account: str | None = None,
-                    start: str | None = None, end: str | None = None):
+                    start: str | None = None, end: str | None = None,
+                    dim: str = "sku"):
     from urllib.parse import quote
-    got = runner.export(job, account=account, start=start, end=end)
+    got = runner.export(job, account=account, start=start, end=end, dim=dim)
     if not got:
         return JSONResponse({"ok": False, "error": "没有可导出的结果，请先查询一次"}, status_code=404)
     data, fname = got
@@ -1332,8 +1342,9 @@ def api_paycomm_cancel():
 
 @app.get("/api/paycomm/export")
 def api_paycomm_export(job: str | None = None, account: str | None = None,
-                       start: str | None = None, end: str | None = None):
-    return _paycomm_export(_paycomm, job, account, start, end)
+                       start: str | None = None, end: str | None = None,
+                       dim: str = "sku"):
+    return _paycomm_export(_paycomm, job, account, start, end, dim)
 
 
 @app.post("/api/paycomm/spend/run")
@@ -1354,8 +1365,9 @@ def api_paycomm_spend_cancel():
 
 @app.get("/api/paycomm/spend/export")
 def api_paycomm_spend_export(job: str | None = None, account: str | None = None,
-                             start: str | None = None, end: str | None = None):
-    return _paycomm_export(_paycomm_spend, job, account, start, end)
+                             start: str | None = None, end: str | None = None,
+                             dim: str = "sku"):
+    return _paycomm_export(_paycomm_spend, job, account, start, end, dim)
 
 
 # ---------------------------------------------------------------- 本地缓存

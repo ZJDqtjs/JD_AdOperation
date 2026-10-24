@@ -372,7 +372,7 @@ def _fill():
 
 
 def build_cps_xlsx(rows: list[dict], daily: list[dict], start: str, end: str,
-                   account_label: str = "") -> bytes:
+                   account_label: str = "", dim: str = "sku") -> bytes:
     """CPS 花费（付款佣金）导出。"""
     from openpyxl import Workbook
     from openpyxl.utils import get_column_letter
@@ -470,13 +470,20 @@ def build_cps_xlsx(rows: list[dict], daily: list[dict], start: str, end: str,
     ws3.column_dimensions["A"].width = 14
     ws3.column_dimensions["B"].width = 92
 
+    if dim == "cat":
+        # 「按品类」导出：去掉 SKU 明细，品类汇总成为首屏
+        try:
+            wb.remove(wb["SKU付款佣金"])
+        except KeyError:
+            pass
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
 def build_spend_xlsx(rows: list[dict], spend: dict, start: str, end: str,
-                     account_label: str = "") -> bytes:
+                     account_label: str = "", dim: str = "sku") -> bytes:
     """京准通广告花费（按 SKU）导出。"""
     from openpyxl import Workbook
     from openpyxl.utils import get_column_letter
@@ -569,6 +576,12 @@ def build_spend_xlsx(rows: list[dict], spend: dict, start: str, end: str,
     ws3.column_dimensions["A"].width = 20
     ws3.column_dimensions["B"].width = 95
 
+    if dim == "cat":
+        try:
+            wb.remove(wb["SKU广告花费"])
+        except KeyError:
+            pass
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -659,7 +672,8 @@ class PayCommRunner:
         return {"ok": True, "cancelRequested": running}
 
     def export(self, job_id: str | None = None, account: str | None = None,
-               start: str | None = None, end: str | None = None) -> tuple[bytes, str] | None:
+               start: str | None = None, end: str | None = None,
+               dim: str = "sku") -> tuple[bytes, str] | None:
         """取结果的 Excel：优先按 (账号, 区间) 找缓存文件，其次内存 / jobId。"""
         data = None
         if account and start and end:
@@ -677,14 +691,17 @@ class PayCommRunner:
         if not data:
             return None
         label = data.get("accountLabel") or data.get("account")
+        suffix = "_品类" if dim == "cat" else ""
         if self.mode == "spend":
             xlsx = build_spend_xlsx(data["rows"], data.get("spend") or {},
-                                    data["start"], data["end"], label)
-            fname = f"京准通花费_{data.get('account')}_{data['start']}_{data['end']}.xlsx"
+                                    data["start"], data["end"], label, dim=dim)
+            fname = (f"京准通花费{suffix}_{data.get('account')}"
+                     f"_{data['start']}_{data['end']}.xlsx")
         else:
             xlsx = build_cps_xlsx(data["rows"], data.get("daily") or [],
-                                  data["start"], data["end"], label)
-            fname = f"CPS花费_{data.get('account')}_{data['start']}_{data['end']}.xlsx"
+                                  data["start"], data["end"], label, dim=dim)
+            fname = (f"CPS花费{suffix}_{data.get('account')}"
+                     f"_{data['start']}_{data['end']}.xlsx")
         return xlsx, fname
 
     # -------------------------------------------------- 本地缓存
