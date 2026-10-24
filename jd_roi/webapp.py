@@ -1006,8 +1006,10 @@ function dim(k){
 }
 function showTable(){ $('pcTableCard').style.display=''; $('pcExport').disabled=false; render(); }
 
+var POLL_FAILS = 0;
 function poll(){
   fetch(API + '/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
+    POLL_FAILS = 0;
     if(!j.ok){ msg(j.error||'状态查询失败','bad'); return; }
     if(j.active){
       if(j.jobId) JOB = j.jobId;
@@ -1035,7 +1037,20 @@ function poll(){
         msg('本页最近一次结果是 ' + rg[0] + ' ~ ' + rg[1] + '；当前区间点「查询」即可（有缓存秒出）');
       }
     }
-  }).catch(function(e){ msg('状态查询失败 '+e,'bad'); });
+  }).catch(function(e){
+    POLL_FAILS += 1;
+    if(POLL_FAILS <= 4){
+      msg('状态查询失败（' + e + '），2 秒后重试…');
+      clearTimeout(TIMER); TIMER = setTimeout(poll, 2000);
+      return;
+    }
+    // 连续失败：多半是服务在重启，恢复按钮，别把页面卡死
+    $('pcRun').disabled = false;
+    $('pcRefetch').disabled = false;
+    $('pcCancel').style.display = 'none';
+    $('pcBar').style.width = '0';
+    msg('与服务端的连接中断了（常见于服务重启）。刷新页面即可恢复；后台任务不受影响。', 'bad');
+  });
 }
 function run(force){
   var acc = $('pcAcc').value, s = $('pcStart').value, e = $('pcEnd').value;
@@ -1057,7 +1072,13 @@ function run(force){
         $('pcRun').disabled=false; $('pcRefetch').disabled=false; return;
       }
       JOB = j.jobId;
-      if(j.cached){ msg('命中本地缓存（'+(j.savedAt||'')+' 抓取，共 '+(j.rows||0)+' 个 SKU），未请求京准通'); }
+      if(j.cached){
+        msg(j.stitched
+          ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求京准通')
+          : ('命中本地缓存（' + (j.savedAt||'') + ' 抓取，共 ' + (j.rows||0) + ' 个 SKU），未请求京准通'));
+      } else {
+        msg('该区间没有完整缓存，已开始在后台抓取（约 20 秒 / 或几分钟）；完成后自动写入缓存');
+      }
       poll(); loadCache();
     }).catch(function(e){
       msg('请求失败 '+e,'bad');
@@ -1278,9 +1299,11 @@ def _paycomm_start(runner, account, start, end, force: bool = False) -> dict:
     acc = account or settings.MAIN_ACCOUNT
     try:
         if not force:
-            hit = runner.use_cache(acc, start, end)
-            if hit is not None:
-                return hit
+            # 1) 精确命中（账号+起+止完全一致）  2) 多段相邻缓存拼接（8月 + 9月 → 8/1~9/30）
+            for lookup in (runner.use_cache, runner.use_stitched):
+                got = lookup(acc, start, end)
+                if got is not None:
+                    return got
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     busy = _paycomm_other_running(runner.mode)
@@ -1294,7 +1317,9 @@ def _paycomm_start(runner, account, start, end, force: bool = False) -> dict:
                 "error": f"正在执行数据抓取（{who}，{info.get('acquiredAt') or ''} 开始），"
                          f"浏览器登录态被占用，等它结束再查；这期间可以先看已有缓存"}
     try:
-        return runner.run_background(acc, start, end)
+        note = ("该区间没有完整缓存（现有缓存见下方列表），开始抓取…" if not force
+                else "重新抓取中（会覆盖该区间缓存）…")
+        return runner.run_background(acc, start, end, note=note)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 

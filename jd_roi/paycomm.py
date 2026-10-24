@@ -644,7 +644,7 @@ class PayCommRunner:
                 state["spend"] = data.get("spend") or {}
         return state
 
-    def run_background(self, account: str, start: str, end: str) -> dict:
+    def run_background(self, account: str, start: str, end: str, note: str = "") -> dict:
         start, end = norm_range(start, end)
         key = settings.get_account(account)["key"]
         with self._lock:
@@ -654,7 +654,7 @@ class PayCommRunner:
             self._cancel.clear()
             self._state.update({
                 "running": True, "jobId": job_id, "account": key, "range": [start, end],
-                "total": 0, "done": 0, "message": "正在启动浏览器…", "error": None,
+                "total": 0, "done": 0, "message": note or "正在启动浏览器…", "error": None,
                 "startedAt": settings.now_iso(), "finishedAt": None, "cancelled": False,
                 "cached": False,
             })
@@ -686,6 +686,10 @@ class PayCommRunner:
             data = self._results.get(job_id) if job_id else None
         if not data and job_id:
             data = self._load_from_disk(job_id)
+        if not data and account and start and end:
+            got = self.use_stitched(account, start, end)   # 拼接结果只在内存，重启后这里重建
+            if got and got.get("jobId"):
+                data = self._results.get(got["jobId"])
         if not data:
             data = self._latest_from_disk()   # 兜底：最近一次落盘结果
         if not data:
@@ -772,6 +776,120 @@ class PayCommRunner:
         except Exception:  # noqa: BLE001
             return None
         return acc, s, e
+
+    def _spans(self, key: str) -> list[tuple[str, str]]:
+        return sorted({(e["start"], e["end"]) for e in self.cache_entries()
+                       if e.get("account") == key and e.get("start") and e.get("end")})
+
+    def use_stitched(self, account: str, start: str, end: str) -> dict | None:
+        """用多段相邻缓存拼出完整区间（如 8 月 + 9 月 → 8/1~9/30），完全不请求京准通。
+
+        只接受「首尾正好相接、完整覆盖且不外溢」的组合，避免把区间外的数据算进来。
+        """
+        start, end = norm_range(start, end)
+        key = settings.get_account(account)["key"]
+        with self._lock:
+            if self._state.get("running"):
+                return {"ok": False, "error": f"已有{MODES[self.mode][2]}任务在运行，请等它结束"}
+        spans = self._spans(key)
+        cur, picked = start, []
+        while cur <= end:
+            # 同一开始日可能有多段（如 9/1~9/3 与 9/1~9/30）：取「不越过 end 的最长一段」，
+            # 既保证覆盖，又不会把区间外的数据带进来
+            cands = [(s, e) for s, e in spans if s == cur and e <= end]
+            if not cands:
+                return None
+            hit = max(cands, key=lambda x: x[1])
+            picked.append(hit)
+            cur = (dt.date.fromisoformat(hit[1]) + dt.timedelta(days=1)).isoformat()
+        if len(picked) < 2:
+            return None                      # 单段就是精确命中，交给 use_cache
+        parts = []
+        for s, e in picked:
+            data = self.cached_result(key, s, e)
+            if not data:
+                return None
+            parts.append(data)
+
+        rows: dict[int, dict] = {}
+        daily: list[dict] = []
+        sums: dict[str, float] = {}
+        kw_map: dict[str, dict] = {}
+        hints: dict[int, str] = {}
+        num_keys = [k for k, _, _ in (FIELDS if self.mode == "cps" else SPEND_FIELDS)]
+        ratio_keys = {"payCommRate", "preCommRate", "orderCvr", "roi"}
+        for d in parts:
+            for r in d.get("rows") or []:
+                try:
+                    sku = int(r.get("skuId") or 0)
+                except (TypeError, ValueError):
+                    sku = 0
+                if not sku:
+                    continue
+                tgt = rows.get(sku)
+                if tgt is None:
+                    tgt = {"skuId": sku, "itemName": r.get("itemName") or "",
+                           "category": r.get("category") or ""}
+                    for k in num_keys:
+                        tgt[k] = 0.0
+                    rows[sku] = tgt
+                if not tgt["itemName"] and r.get("itemName"):
+                    tgt["itemName"] = r["itemName"]
+                for k in num_keys:
+                    if k in ratio_keys:
+                        continue
+                    v = r.get(k)
+                    if v is None:
+                        continue
+                    try:
+                        tgt[k] += float(v)
+                    except (TypeError, ValueError):
+                        pass
+            daily.extend(d.get("daily") or [])
+            sp = d.get("spend") or {}
+            for k, v in (sp.get("totals") or {}).items():
+                if isinstance(v, (int, float)):
+                    sums[k] = sums.get(k, 0.0) + float(v)
+            for c in sp.get("keywordRows") or []:
+                ck = f"{c.get('campaignId')}|{c.get('campaignName')}"
+                item = kw_map.setdefault(ck, {"campaignId": c.get("campaignId"),
+                                              "campaignName": c.get("campaignName") or "",
+                                              "cost": 0.0})
+                item["cost"] += float(c.get("cost") or 0)
+            for k2, v2 in (sp.get("hints") or {}).items():
+                hints.setdefault(int(k2), v2)
+
+        for r in rows.values():
+            for k in num_keys:
+                r[k] = None if k in ratio_keys else round(float(r[k]), 2)
+        out_rows = sorted(rows.values(),
+                          key=lambda x: (x.get("jztCost") if self.mode == "spend"
+                                         else x.get("payCommAmount")) or -1, reverse=True)
+        daily.sort(key=lambda x: str(x.get("date") or ""))
+        kw_rows = sorted(kw_map.values(), key=lambda x: -x["cost"])
+
+        job_id = f"stitch-{self.mode}-{key}-{start}_{end}"
+        label = settings.get_account(key).get("label") or key
+        payload = {"jobId": job_id, "mode": self.mode, "account": key, "accountLabel": label,
+                   "start": start, "end": end, "rows": out_rows,
+                   "stitched": [f"{a}~{b}" for a, b in picked],
+                   "finishedAt": settings.now_iso()}
+        if self.mode == "cps":
+            payload["daily"] = daily
+        else:
+            sums["skuCount"] = len(out_rows)
+            sums["total"] = round(sums.get("jst", 0) + sums.get("shopSmart", 0)
+                                  + sums.get("keywordTotal", 0), 2)
+            payload["spend"] = {"totals": sums, "keywordRows": kw_rows, "hints": hints}
+        self._results[job_id] = payload
+        pieces = " + ".join(f"{a}~{b}" for a, b in picked)
+        self._set(running=False, cancelled=False, cached=True, jobId=job_id,
+                  account=key, range=[start, end], total=len(out_rows), done=len(out_rows),
+                  error=None, finishedAt=settings.now_iso(),
+                  message=f"命中本地缓存拼接（{pieces}），未请求京准通；需要最新数据请点「重新抓取」")
+        return {"ok": True, "cached": True, "stitched": True, "jobId": job_id,
+                "account": key, "start": start, "end": end,
+                "pieces": [f"{a}~{b}" for a, b in picked], "rows": len(out_rows)}
 
     def cache_entries(self) -> list[dict]:
         """已落地的缓存清单（按同账号+区间去重，按抓取时间倒序）。"""
