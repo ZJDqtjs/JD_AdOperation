@@ -215,7 +215,7 @@ tbody tr:hover{background:var(--soft)}
 .btn.ghost:hover{background:var(--soft);color:var(--ink)}
 .btn.dark{background:var(--dark);border-color:var(--dark);color:var(--on-dark)}
 .btn.dark:hover{background:var(--dark-elev);border-color:var(--dark-elev)}
-.btn.danger{background:var(--red);border-color:var(--red)}
+.btn.danger{background:var(--red);border-color:var(--red);color:#fff}
 .btn.danger:hover{background:var(--redink);border-color:var(--redink)}
 .btn.mini{padding:5px 11px;font-size:12px;border-radius:7px}
 .btn[disabled]{opacity:.5;cursor:not-allowed}

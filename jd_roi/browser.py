@@ -189,6 +189,39 @@ async () => {
 """
 
 
+_JS_LOGININFO_DATA = """
+async () => {
+  try {
+    const r = await fetch('https://jzt-api.jd.com/common/logininfo', {
+      method: 'POST', credentials: 'include',
+      headers: {'Content-Type':'application/json','accept':'application/json, text/plain, */*',
+        'referer':'https://jzt.jd.com/','language':'zh_CN','siteid':'0','loginmode':'0'},
+      body: JSON.stringify({requestFrom: 0})});
+    const j = await r.json();
+    if (!j || j.code !== 1) return null;
+    const d = j.data || {};
+    return {userId: d.userId || 0, pin: d.pin || '',
+            name: d.userDisplayName || d.pin || ''};
+  } catch (e) { return null; }
+}
+"""
+
+
+def login_info(page: Page) -> dict | None:
+    """取当前登录账号的 pin / 京准通账户ID（新账号登录后自动回填用）。"""
+    try:
+        got = page.evaluate(_JS_LOGININFO_DATA)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(got, dict):
+        return None
+    try:
+        got["userId"] = int(got.get("userId") or 0)
+    except (TypeError, ValueError):
+        got["userId"] = 0
+    return got
+
+
 def session_ok(page: Page, retries: int = 2) -> bool:
     """真正问一次服务端：cookie 还在但服务端会话过期时 has_login 会误判。
 

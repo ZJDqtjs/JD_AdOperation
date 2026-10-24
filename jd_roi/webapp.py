@@ -49,8 +49,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                Response, StreamingResponse)
 
-from . import (aijobs, ai_page, analyze2, analyze_ai, dailystore as ds, paycomm,
-               report2, scrape_day, settings)
+from . import (aijobs, ai_page, analyze2, analyze_ai, config, dailystore as ds,
+               paycomm, report2, scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -846,8 +846,6 @@ PAYCOMM_CSS = """
 td.nm{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 td.hot{font-weight:700;color:var(--ink)}
 .toolbar .fld{display:inline-flex;align-items:center;gap:6px;margin:0 10px 8px 0}
-#pcCacheBody .btn.danger{color:#fff;background:var(--red);border-color:var(--red)}
-#pcCacheBody .btn.danger:hover{background:var(--redink);border-color:var(--redink)}
 .grid.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
 @media(max-width:1100px){.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
@@ -1812,6 +1810,7 @@ class LoginSession:
                     if session_ok(page):
                         self._set_account_state(key, "logged_in", "已登录，登录态有效")
                         n_ok += 1
+                        _autofill_account_id(page, key)
                     else:
                         self._set_account_state(key, "logged_out", "登录态已失效，需要重新登录")
                 except Exception as exc:  # noqa: BLE001
@@ -2318,6 +2317,7 @@ class LoginSession:
             while time.time() < deadline and not self._stop.is_set():
                 # 必须由服务端确认：cookie 还在但会话过期时 has_login 会误判
                 if has_login(ctx) and session_ok(page):
+                    _autofill_account_id(page, self.account)
                     self._save_state_snapshot(ctx, account)
                     self._set(state="logged_in", message="登录成功，登录态已保存", qr_png=None)
                     return
@@ -2365,6 +2365,7 @@ class LoginSession:
             while time.time() < deadline and not self._stop.is_set():
                 # 必须由服务端确认：只看 cookie 会在会话过期时误判为「已登录」
                 if has_login(ctx) and session_ok(page):
+                    _autofill_account_id(page, self.account)
                     self._save_state_snapshot(ctx, account)
                     self._set(state="logged_in", message="登录成功，登录态已保存", qr_png=None)
                     return
@@ -2385,6 +2386,22 @@ class LoginSession:
                 pw and pw.stop()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _autofill_account_id(page, key: str) -> None:
+    """新加的账号没填「京准通账户ID」时，登录成功后就地识别并回填（花费/关键词接口要用它）。"""
+    try:
+        acc = settings.get_account(key)
+        if int(acc.get("account_id") or 0) > 0:
+            return
+        from .browser import login_info
+        info = login_info(page) or {}
+        aid = int(info.get("userId") or 0)
+        if aid > 0:
+            settings.set_account_id(key, aid)
+            _log_progress(f"账号 {key} 自动识别账户ID：{aid}")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 _login = LoginSession()
@@ -2483,8 +2500,103 @@ LOGIN_CSS = DASH_CSS + """
   color:var(--muted);border-bottom:2px solid transparent;font-weight:500;transition:color .15s,border-color .15s}
 .tabs button:hover{color:var(--ink)}
 .tabs button.active{color:var(--ink);font-weight:600;border-bottom-color:var(--primary)}
-.loginwrap{max-width:860px}
+.loginwrap{max-width:1040px}
 .loginwrap .card{padding:28px 32px}
+"""
+
+
+LOGIN_ACC_JS = r"""
+(function(){
+  var LBL = {logged_in:'已登录', logged_out:'未登录', error:'异常', unknown:'未检查'};
+  var CLS = {logged_in:'b-ok', logged_out:'b-bad', error:'b-bad', unknown:'b-idle'};
+  function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+    return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+  function post(url){ return fetch(url,{method:'POST'}).then(function(r){ return r.json(); }); }
+  function tip(s, kind){
+    var el = $('accMsg'); if(!el) return;
+    el.textContent = s || '';
+    el.style.color = (kind === 'bad') ? 'var(--red)' : (kind === 'ok' ? 'var(--greenink)' : 'var(--muted)');
+  }
+  function loadAccounts(){
+    fetch('/api/accounts').then(function(r){ return r.json(); }).then(function(j){
+      if(!j.ok) return;
+      var rows = (j.accounts || []).map(function(a){
+        var st = '<span class="badge ' + (CLS[a.state] || 'b-idle') + '">'
+               + (LBL[a.state] || a.state) + '</span>';
+        var main = a.isMain ? ' <span class="badge b-warn">主账号</span>' : '';
+        var empty = a.profileExists ? '' : ' <span class="hint">（还没登录过）</span>';
+        return '<tr><td class="l"><b>' + esc(a.label) + '</b>' + main + '</td>'
+          + '<td class="l"><code>' + esc(a.key) + '</code></td>'
+          + '<td class="n">' + (a.account_id || '—') + '</td>'
+          + '<td class="l">' + st + ' ' + esc(a.message || '') + empty + '</td>'
+          + '<td class="n">'
+          + '<button class="btn sec mini" data-act="rename" data-key="' + esc(a.key) + '">改名</button> '
+          + '<button class="btn ghost mini" data-act="detect" data-key="' + esc(a.key) + '">识别账户ID</button> '
+          + '<button class="btn danger mini" data-act="delete" data-key="' + esc(a.key) + '">删除</button>'
+          + '</td></tr>';
+      }).join('');
+      $('accBody').innerHTML = rows || '<tr><td colspan="5" class="l">还没有账号</td></tr>';
+      if(j.checkMessage) tip(j.checkMessage);
+    }).catch(function(){});
+  }
+  function addAccount(){
+    var name = ($('newAccName').value || '').trim();
+    var aid = ($('newAccId').value || '').trim();
+    if(!name){ tip('请先填账号名称', 'bad'); return; }
+    post('/api/accounts/add?name=' + encodeURIComponent(name) + '&account_id=' + encodeURIComponent(aid || '0'))
+      .then(function(j){
+        if(!j.ok){ tip('添加失败：' + (j.error || ''), 'bad'); return; }
+        tip('已添加「' + j.account.label + '」，key=' + j.account.key + '，正在刷新…', 'ok');
+        setTimeout(function(){ location.reload(); }, 700);
+      });
+  }
+  function renameAccount(key){
+    var cur = '';
+    var tr = document.querySelector('button[data-act="rename"][data-key="' + key + '"]');
+    if(tr){ var cell = tr.closest('tr'); if(cell) cur = cell.querySelector('b').textContent; }
+    var name = prompt('给 ' + key + ' 起个新名称：', cur);
+    if(name === null) return;
+    name = name.trim();
+    if(!name){ tip('名称不能为空', 'bad'); return; }
+    post('/api/accounts/rename?key=' + encodeURIComponent(key) + '&name=' + encodeURIComponent(name))
+      .then(function(j){
+        if(!j.ok){ tip('改名失败：' + (j.error || ''), 'bad'); return; }
+        tip('已改名为「' + j.account.label + '」，正在刷新…', 'ok');
+        setTimeout(function(){ location.reload(); }, 600);
+      });
+  }
+  function delAccount(key){
+    if(!confirm('从账号列表删除 ' + key + ' ？')) return;
+    var rm = confirm('是否同时删除它的浏览器 Profile（登录态文件）？\n\n确定 = 连 Profile 一起删；取消 = 只从列表移除，Profile 保留。');
+    post('/api/accounts/delete?key=' + encodeURIComponent(key) + '&remove_profile=' + (rm ? 1 : 0))
+      .then(function(j){
+        if(!j.ok){ tip('删除失败：' + (j.error || ''), 'bad'); return; }
+        tip('已删除 ' + key + (rm && j.profileRemoved ? '（含 Profile）' : '（Profile 保留）'), 'ok');
+        setTimeout(function(){ location.reload(); }, 600);
+      });
+  }
+  function detectId(key){
+    tip('正在用 ' + key + ' 的登录态查询账户ID…');
+    post('/api/accounts/detect?account=' + encodeURIComponent(key)).then(function(j){
+      if(!j.ok){ tip('识别失败：' + (j.error || ''), 'bad'); return; }
+      tip('识别到账户ID ' + j.accountId + '（pin=' + (j.pin || '-') + '）', 'ok');
+      loadAccounts();
+    });
+  }
+  document.getElementById('accBody').addEventListener('click', function(e){
+    var b = e.target.closest('button[data-act]');
+    if(!b) return;
+    var key = b.getAttribute('data-key');
+    var act = b.getAttribute('data-act');
+    if(act === 'rename') renameAccount(key);
+    else if(act === 'delete') delAccount(key);
+    else if(act === 'detect') detectId(key);
+  });
+  document.getElementById('addAccBtn').addEventListener('click', addAccount);
+  loadAccounts();
+  window.addEventListener('beforeunload', function(){});
+})();
 """
 
 
@@ -2539,7 +2651,30 @@ def login_page(request: Request):
   </div>
   <div id="status" class="hint" style="margin-top:10px">未开始</div>
 </div>
+
+<div class="card" style="margin-top:18px">
+  <h2>账号管理 <span class="tagline">添加 / 改名 / 删除；改动写回 config/accounts.json</span></h2>
+  <p class="hint">新账号先在上面选中并扫码登录，登录成功后会自动识别「京准通账户ID」。
+    每个账号一个独立浏览器 Profile，互不影响。</p>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
+    <input id="newAccName" placeholder="账号名称，例如「梓云茶2店」"
+           style="padding:7px 10px;border-radius:8px;border:1px solid var(--line);width:220px">
+    <input id="newAccId" placeholder="京准通账户ID（可留空）" inputmode="numeric"
+           style="padding:7px 10px;border-radius:8px;border:1px solid var(--line);width:190px">
+    <button class="btn" id="addAccBtn">添加账号</button>
+  </div>
+  <div class="tblwrap short">
+    <table><thead><tr>
+      <th class="l noSort">名称</th><th class="l noSort">key</th><th class="n noSort">账户ID</th>
+      <th class="l noSort">登录态</th><th class="n noSort">操作</th>
+    </tr></thead><tbody id="accBody">
+      <tr><td colspan="5" class="l">加载中…</td></tr>
+    </tbody></table>
+  </div>
+  <div class="hint" id="accMsg" style="margin-top:10px"></div>
 </div>
+</div>
+<script>{LOGIN_ACC_JS}</script>
 <script>
 function switchTab(t){{
   var qr = t === 'qr';
@@ -2613,6 +2748,132 @@ def api_login_accounts():
     snap["accounts"] = [dict(v, key=k, label=labels.get(k, k))
                         for k, v in snap["accounts"].items()]
     return {"ok": True, **snap}
+
+
+# ---------------------------------------------------------------- 账号管理
+def _account_state_map() -> dict:
+    try:
+        snap = _login.accounts_snapshot()
+    except Exception:  # noqa: BLE001
+        return {}
+    raw = snap.get("accounts") or {}
+    if isinstance(raw, list):
+        raw = {x.get("key"): x for x in raw}
+    return raw
+
+
+@app.get("/api/accounts")
+def api_accounts():
+    """账号列表（含登录态快照），供登录页的账号管理表格使用。"""
+    states = _account_state_map()
+    out = []
+    for a in settings.ACCOUNTS:
+        st = states.get(a["key"]) or {}
+        prof = Path(a.get("user_data_dir") or "")
+        out.append({
+            "key": a["key"],
+            "label": a.get("label") or a["key"],
+            "account_id": int(a.get("account_id") or 0),
+            "isMain": a["key"] == settings.MAIN_ACCOUNT,
+            "profileExists": bool(prof and prof.exists()),
+            "state": st.get("state") or "unknown",
+            "message": st.get("message") or "",
+        })
+    return {"ok": True, "accounts": out, "main": settings.MAIN_ACCOUNT,
+            "file": str(settings.ACCOUNTS_FILE)}
+
+
+@app.post("/api/accounts/add")
+def api_accounts_add(name: str = "", account_id: str = "", key: str = ""):
+    """新增账号（只写配置，profile 在登录后生成）。"""
+    try:
+        aid = int(str(account_id).strip() or 0)
+    except ValueError:
+        return {"ok": False, "error": "账户ID 只能是数字"}
+    try:
+        acc = settings.add_account(name, aid, key or None)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "account": {"key": acc["key"], "label": acc["label"],
+                                    "account_id": acc.get("account_id") or 0}}
+
+
+@app.post("/api/accounts/rename")
+def api_accounts_rename(key: str = "", name: str = ""):
+    try:
+        acc = settings.rename_account(key, name)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "account": {"key": acc["key"], "label": acc["label"],
+                                    "account_id": acc.get("account_id") or 0}}
+
+
+@app.post("/api/accounts/delete")
+def api_accounts_delete(key: str = "", remove_profile: int = 0):
+    """删除账号；remove_profile=1 时连浏览器 Profile 一起删。"""
+    snap = _login.snapshot()
+    if snap.get("account") == key and snap.get("state") in ("starting", "waiting", "need_verify"):
+        return {"ok": False, "error": "该账号正在登录中，先取消登录再删除"}
+    try:
+        settings.delete_account(key)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    removed = False
+    if remove_profile:
+        # 账号已从列表移除，按默认规则推算 profile 目录
+        prof = Path(settings.default_profile_dir(key))
+        auth = Path(settings.AUTH_DIR).resolve()
+        try:
+            target = prof.resolve()
+            if target != auth and str(target).startswith(str(auth) + os.sep) and target.exists():
+                import shutil
+                shutil.rmtree(target, ignore_errors=True)
+                removed = True
+        except Exception:  # noqa: BLE001
+            removed = False
+    return {"ok": True, "key": key, "profileRemoved": removed}
+
+
+@app.post("/api/accounts/detect")
+def api_accounts_detect(account: str = ""):
+    """用该账号已登录的 Profile 查一次 logininfo，回填京准通账户ID。"""
+    key = account or settings.MAIN_ACCOUNT
+    if not any(a["key"] == key for a in settings.ACCOUNTS):
+        return {"ok": False, "error": "账号不存在"}
+    lock = _login._profile_lock
+    if not lock.acquire(timeout=90):
+        return {"ok": False, "error": "浏览器登录态正被占用（登录/保活/抓取中），稍后再试"}
+    pw = ctx = None
+    try:
+        from .browser import launch_persistent as _launch, login_info, session_ok as _ok
+        pw, ctx = _launch(headless=True, account=key)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(config.JZT_HOME, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)
+        if not _ok(page):
+            return {"ok": False, "error": "该账号登录态已失效，请重新扫码登录"}
+        info = login_info(page) or {}
+        aid = int(info.get("userId") or 0)
+        if aid <= 0:
+            return {"ok": False, "error": "接口没返回账户ID（可能是子账号）"}
+        settings.set_account_id(key, aid)
+        return {"ok": True, "accountId": aid, "pin": info.get("pin") or ""}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        try:
+            ctx and ctx.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            pw and pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            lock.release()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.get("/api/login/keepalive")
