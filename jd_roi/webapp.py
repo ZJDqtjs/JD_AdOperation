@@ -1159,8 +1159,6 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
 </div>
 {unattr_html}
 
-
-
 <div class="note" style="margin-top:18px">{PAYCOMM_NOTES[kind]}
 <p><a href="{_e(cfg["switch"][0])}">{_e(cfg["switch"][1])}</a>　·　
 <a href="/login">登录 / 检查登录态</a></p>
@@ -1205,6 +1203,13 @@ def _paycomm_start(runner, account, start, end, force: bool = False) -> dict:
     busy = _paycomm_other_running(runner.mode)
     if busy:
         return {"ok": False, "error": busy}
+    # 定时/手动抓取也开同一个浏览器 Profile：同一时刻只能有一个浏览器，否则会互相顶掉登录态
+    info = scrape_day.lock_info()
+    if info.get("locked") and info.get("alive"):
+        who = info.get("name") or info.get("thread") or "抓取任务"
+        return {"ok": False,
+                "error": f"正在执行数据抓取（{who}，{info.get('acquiredAt') or ''} 开始），"
+                         f"浏览器登录态被占用，等它结束再查；这期间可以先看已有缓存"}
     try:
         return runner.run_background(acc, start, end)
     except ValueError as exc:
