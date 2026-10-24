@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -243,6 +244,120 @@ def get_account(key: str | None = None) -> dict:
             return a
     return ACCOUNTS[0] if ACCOUNTS else {"key": "main", "label": "主账号", "account_id": 0,
                                          "user_data_dir": str(AUTH_DIR / "main")}
+
+
+# ---------------- 账号管理（网页「登录」页可以增删改名） ----------------
+# 只把 key/label/account_id 写回 accounts.json；user_data_dir 用默认值时省略。
+def _accounts_payload(accs: list) -> list:
+    out = []
+    for a in accs:
+        key = str(a.get("key") or "").strip()
+        if not key:
+            continue
+        item = {"key": key,
+                "label": (a.get("label") or key),
+                "account_id": int(a.get("account_id") or 0)}
+        custom_dir = a.get("user_data_dir")
+        if custom_dir and str(custom_dir) != default_profile_dir(key):
+            item["user_data_dir"] = str(custom_dir)
+        out.append(item)
+    return out
+
+
+def save_accounts(accs: list | None = None) -> None:
+    """写回 accounts.json（先写临时文件再替换，避免半个 JSON）。"""
+    payload = _accounts_payload(list(ACCOUNTS if accs is None else accs))
+    ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ACCOUNTS_FILE.with_name(ACCOUNTS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(ACCOUNTS_FILE)
+
+
+def apply_accounts(accs: list) -> list:
+    """把账号列表应用到全局。
+
+    必须**原地**改 ACCOUNTS（config.ACCOUNTS 等模块持有的是同一个 list 引用），
+    否则新增/删除账号后其他模块看到的还是旧列表。
+    """
+    global MAIN_ACCOUNT
+    norm = _normalize(list(accs))
+    ACCOUNTS.clear()
+    ACCOUNTS.extend(norm)
+    MAIN_ACCOUNT = ACCOUNTS[0]["key"] if ACCOUNTS else "main"
+    # config.py 里有一份 import 时拷贝的值，CLI 脚本会用到，这里同步一下
+    try:
+        from . import config as _config
+        _config.MAIN_ACCOUNT = MAIN_ACCOUNT
+        _config.ACCOUNT_ID = (ACCOUNTS[0].get("account_id") if ACCOUNTS else 0) or 0
+    except Exception:  # noqa: BLE001
+        pass
+    return ACCOUNTS
+
+
+def _next_key() -> str:
+    used = {a["key"] for a in ACCOUNTS}
+    i = 1
+    while f"acct{i}" in used:
+        i += 1
+    return f"acct{i}"
+
+
+def add_account(label: str, account_id: int = 0, key: str | None = None) -> dict:
+    """新增账号（还没登录，登录后 profile 落到 AUTH_DIR/<key>）。"""
+    key = (key or "").strip() or _next_key()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", key):
+        raise ValueError("账号 key 只能用字母/数字/下划线/短横线")
+    if any(a["key"] == key for a in ACCOUNTS):
+        raise ValueError(f"账号 key 已存在：{key}")
+    label = (label or "").strip() or key
+    accs = _accounts_payload(ACCOUNTS) + [
+        {"key": key, "label": label, "account_id": int(account_id or 0)}]
+    save_accounts(accs)
+    apply_accounts(accs)
+    return get_account(key)
+
+
+def rename_account(key: str, label: str) -> dict:
+    label = (label or "").strip()
+    if not label:
+        raise ValueError("名称不能为空")
+    accs = _accounts_payload(ACCOUNTS)
+    hit = next((a for a in accs if a["key"] == key), None)
+    if hit is None:
+        raise ValueError("账号不存在")
+    hit["label"] = label
+    save_accounts(accs)
+    apply_accounts(accs)
+    return get_account(key)
+
+
+def delete_account(key: str) -> dict:
+    if len(ACCOUNTS) <= 1:
+        raise ValueError("至少要保留一个账号")
+    key = str(key or "")
+    accs = [a for a in _accounts_payload(ACCOUNTS) if a["key"] != key]
+    if len(accs) == len(ACCOUNTS):
+        raise ValueError("账号不存在")
+    save_accounts(accs)
+    apply_accounts(accs)
+    return {"ok": True, "key": key}
+
+
+def set_account_id(key: str, account_id: int) -> bool:
+    """登录成功后回填「京准通账户ID」（花费/关键词等接口要用它做 pinIds）。"""
+    account_id = int(account_id or 0)
+    if account_id <= 0:
+        return False
+    acc = next((a for a in ACCOUNTS if a["key"] == key), None)
+    if acc is None or int(acc.get("account_id") or 0) == account_id:
+        return False
+    accs = _accounts_payload(ACCOUNTS)
+    for a in accs:
+        if a["key"] == key:
+            a["account_id"] = account_id
+    save_accounts(accs)
+    apply_accounts(accs)
+    return True
 
 
 EXCEL_PATH = excel_path()

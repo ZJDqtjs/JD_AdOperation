@@ -1,0 +1,23 @@
+# 快速上线用：以「线上正在跑的镜像」为基底，只覆盖 /app/jd_roi 代码层。
+#
+# 为什么不用根目录 Dockerfile：
+#   Dockerfile 的 FROM python:3.12-slim-bookworm 需要访问 docker.io，
+#   在拉不动外网（或没有镜像加速器）的机器上会直接失败；
+#   而线上镜像里 playwright + chromium + 全部 pip 依赖都已装好，
+#   只改业务代码时没必要重建整个环境（1.89GB）。
+#
+# 用法（在仓库根目录）：
+#   docker build -f docker/Dockerfile.deploy \
+#     --build-arg BASE_IMAGE=jd-roi:latest -t jd-roi:new .
+#
+# 换依赖（requirements.txt 变更）时仍需用根目录 Dockerfile 完整重建。
+
+ARG BASE_IMAGE=jd-roi:latest
+FROM ${BASE_IMAGE}
+
+# 只覆盖代码；config-default / entrypoint.sh / requirements 沿用基底镜像
+COPY jd_roi /app/jd_roi
+
+# 冒烟：能 import 就说明依赖与新代码都就位（构建期失败比上线后白屏好）
+RUN python -c "import jd_roi.webapp as w; \
+print('routes:', len([r for r in w.app.routes if getattr(r, 'path', '').startswith('/paycomm')]))"
