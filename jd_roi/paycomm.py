@@ -30,7 +30,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import settings
+from . import catalog, settings
 from .browser import launch_persistent, session_ok
 
 BOARD_PAGE = "https://jzt.jd.com/jtk/#/data-board"
@@ -412,6 +412,32 @@ def build_cps_xlsx(rows: list[dict], daily: list[dict], start: str, end: str,
             elif isinstance(c.value, int):
                 c.number_format = "#,##0"
 
+    # 品类汇总（忽略斤数/g数/个数等规格，按大类汇总）
+    cps_keys = ["payCommAmount", "preCommAmount", "clicks", "uv", "orderCnt", "orderGmv",
+                "payOrderCnt", "fiOrderCnt", "fiOrderGmv", "orderUserCnt"]
+    labels = {k: lab for k, lab, _ in FIELDS}
+    cats = sorted(catalog.aggregate(rows, cps_keys), key=lambda x: -x["payCommAmount"])
+    ws_c = wb.create_sheet("品类汇总", 1)
+    ws_c.append(["品类", "SKU数"] + [labels[k] for k in cps_keys])
+    for c in ws_c[1]:
+        c.font = _bold()
+        c.fill = fill
+        c.alignment = _center()
+    for it in cats:
+        ws_c.append([it["category"], it["skuCount"]] + [it[k] for k in cps_keys])
+    ws_c.append([])
+    ws_c.append(["合计", f"{len(rows)} 个 SKU"] + [
+        round(sum(it[k] for it in cats), 2) if k == "payCommAmount" else None for k in cps_keys])
+    ws_c.freeze_panes = "C2"
+    for i, w in enumerate([20, 10] + [17] * len(cps_keys), 1):
+        ws_c.column_dimensions[get_column_letter(i)].width = w
+    for row in ws_c.iter_rows(min_row=2):
+        for c in row[2:]:
+            if isinstance(c.value, float):
+                c.number_format = "#,##0.00"
+            elif isinstance(c.value, int):
+                c.number_format = "#,##0"
+
     ws2 = wb.create_sheet("分日合计")
     ws2.append(["日期", "付款佣金金额(元)", "预估佣金金额(元)", "点击数", "下单订单量",
                 "下单订单金额(元)", "完成订单量", "完成订单金额(元)", "ROI"])
@@ -476,6 +502,30 @@ def build_spend_xlsx(rows: list[dict], spend: dict, start: str, end: str,
     for i, w in enumerate([15, 46] + [17] * len(SPEND_FIELDS), 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     for row in ws.iter_rows(min_row=2):
+        for c in row[2:]:
+            if isinstance(c.value, float):
+                c.number_format = "#,##0.00"
+            elif isinstance(c.value, int):
+                c.number_format = "#,##0"
+
+    sp_keys = [k for k, _, _ in SPEND_FIELDS]
+    sp_labels = {k: lab for k, lab, _ in SPEND_FIELDS}
+    cats = sorted(catalog.aggregate(rows, sp_keys), key=lambda x: -x.get("jztCost", 0))
+    ws_c = wb.create_sheet("品类汇总", 1)
+    ws_c.append(["品类", "SKU数"] + [sp_labels[k] for k in sp_keys])
+    for c in ws_c[1]:
+        c.font = _bold()
+        c.fill = fill
+        c.alignment = _center()
+    for it in cats:
+        ws_c.append([it["category"], it["skuCount"]] + [it[k] for k in sp_keys])
+    ws_c.append([])
+    ws_c.append(["合计", f"{len(rows)} 个 SKU"] + [
+        round(sum(it[k] for it in cats), 2) if k == "jztCost" else None for k in sp_keys])
+    ws_c.freeze_panes = "C2"
+    for i, w in enumerate([20, 10] + [17] * len(sp_keys), 1):
+        ws_c.column_dimensions[get_column_letter(i)].width = w
+    for row in ws_c.iter_rows(min_row=2):
         for c in row[2:]:
             if isinstance(c.value, float):
                 c.number_format = "#,##0.00"
@@ -652,6 +702,9 @@ class PayCommRunner:
             return None
         if not data.get("rows"):
             return None
+        for r in data.get("rows") or []:
+            if not r.get("category"):
+                r["category"] = catalog.category_of(r.get("itemName") or "")
         st = fp.stat()
         data.setdefault("start", start)
         data.setdefault("end", end)
@@ -836,7 +889,8 @@ class PayCommRunner:
                     except Exception:  # noqa: BLE001
                         names = {}
                     hints = spend.get("hints") or {}
-                    rows = [{"skuId": sku, "itemName": names.get(sku) or hints.get(sku, ""),
+                    rows = [{"skuId": sku, "itemName": (nm := names.get(sku) or hints.get(sku, "")),
+                             "category": catalog.category_of(nm),
                              "jztJstCost": v["jst"], "jztShopCost": v["shop"],
                              "jztKwCost": v["kw"], "jztCost": v["total"]}
                             for sku, v in (spend.get("bySku") or {}).items()]
@@ -857,7 +911,8 @@ class PayCommRunner:
                         except Exception as exc:  # noqa: BLE001
                             od = {}
                             self._set(message=f"{sku} 取数失败（{type(exc).__name__}），已跳过")
-                        rec = {"skuId": sku, "itemName": g.get("itemName")}
+                        rec = {"skuId": sku, "itemName": g.get("itemName"),
+                               "category": catalog.category_of(g.get("itemName") or "")}
                         for k, _, _ in FIELDS:
                             rec[k] = od.get(k)
                         rows.append(rec)

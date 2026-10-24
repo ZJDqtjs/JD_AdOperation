@@ -793,6 +793,7 @@ PAYCOMM_KINDS = {
             {"label": "下单订单金额", "key": "orderGmv", "type": "money"},
         ],
         "sort": "payCommAmount",
+        "ratioKeys": ["payCommRate", "orderCvr", "roi"],
         "showUnattr": False,
     },
     "spend": {
@@ -815,6 +816,7 @@ PAYCOMM_KINDS = {
             {"label": "全站智能推广", "key": "jztShopCost", "type": "money"},
         ],
         "sort": "jztCost",
+        "ratioKeys": [],
         "showUnattr": True,
     },
 }
@@ -857,9 +859,10 @@ var API = INIT.api || '/api/paycomm';
 var FIELDS = INIT.fields || [];
 var WEB = INIT.webKeys || [];
 var KPIS = INIT.kpis || [];
+var RATIO = INIT.ratioKeys || [];
 var LBL = {}, TYP = {};
 FIELDS.forEach(function(f){ LBL[f[0]] = f[1]; TYP[f[0]] = f[2]; });
-var JOB = null, ROWS = [], SPEND = {}, SORT = {k: (INIT.sort || 'payCommAmount'), d: -1}, TIMER = null;
+var DIM = 'sku', JOB = null, ROWS = [], SPEND = {}, SORT = {k: (INIT.sort || 'payCommAmount'), d: -1}, TIMER = null;
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
@@ -873,22 +876,54 @@ function msg(s,kind){ var el=$('pcMsg'); if(!el) return; el.textContent=s||'';
 function kpi(lbl,val,sub){ return '<div class="kpi"><div class="lbl">'+esc(lbl)+'</div><div class="val">'+val+'</div>'
   + (sub?'<div class="sub">'+esc(sub)+'</div>':'') + '</div>'; }
 
+function cols(){
+  if(DIM !== 'cat') return WEB;
+  return WEB.filter(function(k){ return RATIO.indexOf(k) < 0; });
+}
+function aggregate(list){
+  var map = {}, order = [];
+  list.forEach(function(r){
+    var k = r.category || '未分类';
+    var b = map[k];
+    if(!b){
+      b = {category: k, __n: 0};
+      cols().forEach(function(kk){ b[kk] = 0; });
+      map[k] = b; order.push(k);
+    }
+    b.__n += 1;
+    cols().forEach(function(kk){ var v = num(r[kk]); if(v !== null){ b[kk] += v; } });
+  });
+  return order.map(function(k){
+    var b = map[k];
+    cols().forEach(function(kk){ b[kk] = Math.round(b[kk]*100)/100; });
+    return b;
+  });
+}
 function head(){
-  var h = '<tr><th class="l noSort" onclick="PC.sort(\\'skuId\\')">SKU</th>'
-        + '<th class="l noSort" onclick="PC.sort(\\'itemName\\')">商品名称</th>';
-  WEB.forEach(function(k){
+  var cat = (DIM === 'cat');
+  var h = cat
+    ? '<tr><th class="l noSort" data-key="category">品类</th>'
+      + '<th class="n noSort" data-key="__n">SKU数</th>'
+    : '<tr><th class="l noSort" data-key="skuId">SKU</th>'
+      + '<th class="l noSort" data-key="itemName">商品名称</th>';
+  cols().forEach(function(k){
     var mark = SORT.k===k ? (SORT.d<0?' ↓':' ↑') : '';
-    h += '<th class="n noSort" onclick="PC.sort(\\'' + k + '\\')">' + esc(LBL[k]||k) + mark + '</th>';
+    h += '<th class="n noSort" data-key="' + k + '">' + esc(LBL[k]||k) + mark + '</th>';
   });
   return h + '</tr>';
 }
 function rowsHtml(list){
-  if(!list.length) return '<tr><td colspan="'+(WEB.length+2)+'" class="l">没有匹配的行</td></tr>';
+  var cat = (DIM === 'cat');
+  if(!list.length) return '<tr><td colspan="'+(cols().length+2)+'" class="l">没有匹配的行</td></tr>';
   return list.map(function(r){
-    var tds = WEB.map(function(k){
+    var tds = cols().map(function(k){
       var hot = (k==='payCommAmount'||k==='jztCost') ? ' hot' : '';
       return '<td class="n'+hot+'">'+fmt(r[k],TYP[k])+'</td>';
     }).join('');
+    if(cat){
+      return '<tr><td class="l"><b>'+esc(r.category)+'</b></td>'
+        + '<td class="n">'+r.__n+'</td>'+tds+'</tr>';
+    }
     return '<tr><td class="l"><b>'+esc(r.skuId)+'</b></td>'
       + '<td class="l nm" title="'+esc(r.itemName)+'">'+esc(r.itemName || '—')+'</td>'+tds+'</tr>';
   }).join('');
@@ -915,12 +950,21 @@ function kpisHtml(){
   return out;
 }
 function render(){
+  var cat = (DIM === 'cat');
   var kw = ($('pcFilter').value||'').trim().toLowerCase();
-  var list = ROWS.filter(function(r){
-    return !kw || String(r.skuId).indexOf(kw)>=0
-      || String(r.itemName||'').toLowerCase().indexOf(kw)>=0; });
+  var base = cat ? aggregate(ROWS) : ROWS;
+  var list = base.filter(function(r){
+    if(!kw) return true;
+    if(cat) return String(r.category||'').toLowerCase().indexOf(kw) >= 0;
+    return String(r.skuId).indexOf(kw) >= 0
+      || String(r.itemName||'').toLowerCase().indexOf(kw) >= 0
+      || String(r.category||'').toLowerCase().indexOf(kw) >= 0;
+  });
   list = list.slice().sort(function(a,b){
     var k = SORT.k;
+    if(cat && (k==='skuId' || k==='itemName' || k==='category')){
+      return String(a.category||'').localeCompare(String(b.category||''))*SORT.d;
+    }
     if(k==='itemName') return String(a[k]||'').localeCompare(String(b[k]||''))*SORT.d;
     if(k==='skuId') return String(a.skuId).localeCompare(String(b.skuId))*SORT.d;
     var x = num(a[k]), y = num(b[k]);
@@ -932,9 +976,13 @@ function render(){
   $('pcBody').innerHTML = rowsHtml(list);
   $('pcKpis').innerHTML = kpisHtml();
   $('pcKpis').style.display = '';
-  $('pcCount').textContent = '共 '+ROWS.length+' 个 SKU'
-    + (list.length!==ROWS.length ? ('，筛选后 '+list.length+' 行') : '');
-
+  var cnt = cat ? ('共 '+list.length+' 个品类 / '+ROWS.length+' 个 SKU')
+                : ('共 '+ROWS.length+' 个 SKU'
+                   + (list.length!==ROWS.length ? ('，筛选后 '+list.length+' 行') : ''));
+  $('pcCount').textContent = cnt;
+  renderUnattr();
+}
+function renderUnattr(){
   var kws = SPEND.keywordRows || [];
   if(INIT.showUnattr && kws.length){
     var kh = kws.map(function(c){
@@ -949,6 +997,14 @@ function render(){
   } else if($('pcUnattrCard')){
     $('pcUnattrCard').style.display = 'none';
   }
+}
+function dim(k){
+  DIM = (k === 'cat') ? 'cat' : 'sku';
+  $('pcDimSku').className = 'tab' + (DIM === 'sku' ? ' active' : '');
+  $('pcDimCat').className = 'tab' + (DIM === 'cat' ? ' active' : '');
+  $('pcFilter').placeholder = (DIM === 'cat') ? '筛选品类' : '筛选 SKU / 商品名 / 品类';
+  if($('pcTableTitle')) $('pcTableTitle').textContent = (DIM === 'cat') ? '品类汇总' : 'SKU 明细';
+  if(ROWS.length) render();
 }
 function showTable(){ $('pcTableCard').style.display=''; $('pcExport').disabled=false; render(); }
 
@@ -1067,8 +1123,15 @@ function sort(k){
   render();
 }
 window.PC = {sort: sort, run: run, refetch: refetch, exp: exp, cancel: cancel,
-             render: render, loadCache: loadCache, delCache: delCache};
-function boot(){ poll(); loadCache(); }
+             render: render, loadCache: loadCache, delCache: delCache, dim: dim};
+function boot(){
+  poll(); loadCache();
+  $('pcTable').addEventListener('click', function(e){
+    var th = e.target.closest('th');
+    if(!th || !th.getAttribute('data-key')) return;
+    sort(th.getAttribute('data-key'));
+  });
+}
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
 })();
@@ -1093,7 +1156,8 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     fields = paycomm.FIELDS if kind == "cps" else paycomm.SPEND_FIELDS
     init = {"mode": kind, "api": cfg["api"], "sort": cfg["sort"],
             "fields": [[k, lab, t] for k, lab, t in fields],
-            "webKeys": cfg["webKeys"], "kpis": cfg["kpis"], "showUnattr": cfg["showUnattr"]}
+            "webKeys": cfg["webKeys"], "kpis": cfg["kpis"], "showUnattr": cfg["showUnattr"],
+            "ratioKeys": cfg.get("ratioKeys", [])}
     unattr_html = """
 <div class="card" id="pcUnattrCard" style="display:none">
   <h2>未归因的关键词计划 <span class="tagline">快车关键词计划的商品挂在「单元」上，接口不返回 SKU</span></h2>
@@ -1155,9 +1219,13 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
 </div>
 
 <div class="card" id="pcTableCard" style="display:none">
-  <h2>SKU 明细 <span class="tagline">点表头可换排序</span></h2>
+  <h2><span id="pcTableTitle">SKU 明细</span> <span class="tagline">点表头可换排序</span></h2>
   <div class="toolbar">
-    <input id="pcFilter" placeholder="筛选 SKU / 商品名" oninput="PC.render()"
+    <span class="tabs" style="margin:0 12px 8px 0">
+      <button type="button" class="tab active" id="pcDimSku" onclick="PC.dim('sku')">按 SKU</button>
+      <button type="button" class="tab" id="pcDimCat" onclick="PC.dim('cat')">按品类</button>
+    </span>
+    <input id="pcFilter" placeholder="筛选 SKU / 商品名 / 品类" oninput="PC.render()"
            style="min-width:260px;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
     <span class="hint" id="pcCount"></span>
   </div>
