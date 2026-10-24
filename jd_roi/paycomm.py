@@ -25,6 +25,7 @@ import datetime as dt
 import io
 import json
 import random
+import re
 import threading
 import time
 from pathlib import Path
@@ -63,6 +64,7 @@ SPEND_FIELDS = [
     ("jztCost", "京准通花费合计(元)", "money"),
     ("jztJstCost", "智能投放花费(元)", "money"),
     ("jztShopCost", "全站智能推广花费(元)", "money"),
+    ("jztKwCost", "关键词计划花费(元)", "money"),
 ]
 
 _JS_FETCH = """
@@ -132,6 +134,77 @@ def _post(page, path: str, payload: dict, retries: int = 2) -> dict:
     raise RuntimeError(f"{path} 失败：{last}")
 
 
+# ---------------------------------------------------------------- 报表中心（创意报表）
+# 关键词计划的花费落在「创意」维度：每条创意绑定一个商品，落地页里就是 SKU。
+# 该报表还包含「已删除/已下线」的计划，比计划列表更全（8 月多出一个已删计划 6,012 元）。
+REPORT_BASE = "https://jzt-api.jd.com/reweb/msa"
+AD_LIST_API = f"{REPORT_BASE}/base/ad/list"
+
+_JS_REPORT = """
+async ({url, payload}) => {
+  const r = await fetch(url, {method:'POST', credentials:'include',
+    headers:{'Content-Type':'application/json',
+             'accept':'application/json, text/plain, */*',
+             'referer':'https://jzt.jd.com/report/index.html/',
+             'language':'zh_CN','siteid':'0','loginmode':'0'},
+    body: JSON.stringify(payload)});
+  return {status: r.status, text: await r.text()};
+}
+"""
+
+
+def _post_report(page, url: str, payload: dict, retries: int = 2) -> dict:
+    last = ""
+    for _ in range(retries + 1):
+        try:
+            res = page.evaluate(_JS_REPORT, {"url": url, "payload": payload})
+            if res["status"] != 200:
+                last = f"HTTP {res['status']}"
+            else:
+                data = json.loads(res["text"])
+                if str(data.get("code")) == "1":
+                    return data
+                last = json.dumps(data, ensure_ascii=False)[:200]
+        except Exception as exc:  # noqa: BLE001
+            last = f"{type(exc).__name__}: {exc}"
+        time.sleep(1.5)
+    raise RuntimeError(f"报表中心 {url.rsplit('/', 1)[-1]} 失败：{last}")
+
+
+def sku_from_creative(row: dict) -> int:
+    """从创意行解析 SKU：优先落地页 item.jd.com/<sku>.html，其次创意名里的数字。"""
+    for src in (row.get("landingPageUrl"), row.get("adName")):
+        s = str(src or "")
+        m = re.search(r"item\.jd\.com/(\d{6,})", s) or re.search(r"(\d{9,})", s)
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def fetch_creative_rows(page, start: str, end: str, account_id: int,
+                        page_size: int = 200) -> list[dict]:
+    """快车「创意」报表（含已删除计划），每行带 cost 与落地页 SKU。"""
+    rows: list[dict] = []
+    pno = 1
+    while pno <= 30:
+        payload = {
+            "isDaily": False, "startDay": start, "endDay": end,
+            "clickOrOrderCaliber": 0, "clickOrOrderDay": 30, "giftFlag": 0,
+            "orderStatusCategory": 1, "filters": [], "pinIds": [int(account_id)],
+            "creativeTypes": [], "deliveryType": 0,
+            "columns": ["cost", "clicks", "impressions", "totalOrderCnt", "totalOrderSum"],
+            "obys": "cost|desc", "page": pno, "pageSize": page_size,
+        }
+        d = _post_report(page, AD_LIST_API, payload)
+        batch = ((d.get("data") or {}).get("datas") or [])
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        pno += 1
+        _sleep(DELAY_PAGE)
+    return rows
+
+
 def list_goods(page, start: str, end: str, page_size: int = 100) -> list[dict]:
     rows: list[dict] = []
     idx = 1
@@ -161,7 +234,7 @@ def daily_total(page, start: str, end: str) -> list[dict]:
     return d.get("data") or []
 
 
-def fetch_spend(page, start: str, end: str) -> dict:
+def fetch_spend(page, start: str, end: str, account_id: int | None = None) -> dict:
     """按 SKU 抓京准通广告花费（智能投放 + 全站智能推广），并给出无法归因的部分。
 
     复用 jd_roi.scrape_jst_report（jst 商品报表，按 skuId 有 cost）与
@@ -170,6 +243,9 @@ def fetch_spend(page, start: str, end: str) -> dict:
     """
     from .scrape_jst_report import fetch as jst_fetch
     from .scrape_jzt import fetch_campaigns
+
+    if not account_id:
+        account_id = int(settings.get_account(None).get("account_id") or 0)
 
     # 快车计划列表：当前页面就在 msa 快车，直接取
     camps = fetch_campaigns(page, start, end)
@@ -187,7 +263,7 @@ def fetch_spend(page, start: str, end: str) -> dict:
     hints: dict[int, str] = {}
 
     def bucket(sku: int) -> dict:
-        return by_sku.setdefault(int(sku), {"jst": 0.0, "shop": 0.0})
+        return by_sku.setdefault(int(sku), {"jst": 0.0, "shop": 0.0, "kw": 0.0})
 
     for r in jst.get("rows") or []:
         sku = int(r.get("skuId") or 0)
@@ -198,6 +274,7 @@ def fetch_spend(page, start: str, end: str) -> dict:
 
     unattr = {"keyword": 0.0, "other": 0.0}
     kw_rows: list[dict] = []
+    kw_list_total = 0.0
     for c in camps.get("rows") or []:
         cost = float(c.get("cost") or 0)
         ctype = c.get("campaignType")
@@ -210,28 +287,64 @@ def fetch_spend(page, start: str, end: str) -> dict:
             if spu not in hints:
                 hints[spu] = _clean_name(c.get("campaignName"))
         elif ctype == 2:
-            # 关键词计划：商品挂在「单元」上，接口不返回 SKU → 只汇总 + 留明细
+            # 关键词计划：这里只累计总额（对账用）；真正的 SKU 归因走下面的创意报表
+            kw_list_total += cost
+        else:
+            unattr["other"] += cost
+
+    # 关键词：报表中心「创意」报表 —— 每条创意绑定一个商品（落地页带 SKU），
+    # 且包含已删除计划（比计划列表更全，8 月多出 6,012 元已删计划花费）
+    kw_total = 0.0
+    creatives: list[dict] = []
+    try:
+        creatives = fetch_creative_rows(page, start, end, account_id)
+    except Exception:  # noqa: BLE001
+        creatives = []
+    for r in creatives:
+        if r.get("campaignType") not in (2, None):
+            continue
+        cost = float(r.get("cost") or 0)
+        if cost <= 0:
+            continue
+        kw_total += cost
+        sku = sku_from_creative(r)
+        if sku:
+            bucket(sku)["kw"] += cost
+            if sku not in hints:
+                hints[sku] = _clean_name(r.get("adName") or r.get("campaignName"))
+        else:
             unattr["keyword"] += cost
-            if cost:
+            kw_rows.append({"campaignId": r.get("campaignId"),
+                            "campaignName": r.get("campaignName") or r.get("adName") or "",
+                            "cost": round(cost, 2)})
+    if not creatives:
+        # 创意报表取不到时退回计划列表口径：关键词花费如实记为「未归因」
+        kw_total = kw_list_total
+        unattr["keyword"] += kw_list_total
+        for c in camps.get("rows") or []:
+            cost = float(c.get("cost") or 0)
+            if c.get("campaignType") == 2 and cost:
                 kw_rows.append({"campaignId": c.get("campaignId"),
                                 "campaignName": c.get("campaignName") or "",
                                 "cost": round(cost, 2)})
-        else:
-            unattr["other"] += cost
 
     out: dict[int, dict] = {}
     for sku, v in by_sku.items():
         jst_cost, shop_cost = round(v["jst"], 2), round(v["shop"], 2)
-        out[sku] = {"jst": jst_cost, "shop": shop_cost, "total": round(jst_cost + shop_cost, 2)}
+        kw_cost = round(v["kw"], 2)
+        out[sku] = {"jst": jst_cost, "shop": shop_cost, "kw": kw_cost,
+                    "total": round(jst_cost + shop_cost + kw_cost, 2)}
 
     totals = {
         "jst": round(sum(v["jst"] for v in out.values()), 2),
         "shopSmart": round(sum(v["shop"] for v in out.values()), 2),
+        "keywordTotal": round(kw_total, 2),
+        "keywordListTotal": round(kw_list_total, 2),
         "keyword": round(unattr["keyword"], 2),
         "other": round(unattr["other"], 2),
         "skuCount": len(out),
     }
-    totals["total"] = round(totals["jst"] + totals["shopSmart"], 2)
+    totals["total"] = round(totals["jst"] + totals["shopSmart"] + totals["keywordTotal"], 2)
     ext = camps.get("ext") or {}
     try:
         totals["campaignTotal"] = round(float(ext.get("cost") or 0), 2)
@@ -389,14 +502,20 @@ def build_spend_xlsx(rows: list[dict], spend: dict, start: str, end: str,
     ws3.append(["统计区间", f"{start} ~ {end}"])
     ws3.append(["账号", account_label or "-"])
     ws3.append(["导出时间", time.strftime("%Y-%m-%d %H:%M:%S")])
-    ws3.append(["数据来源", "智能投放 = jst 商品报表（按 skuId）；全站智能推广 = 快车计划列表（计划上的 spuId）"])
+    ws3.append(["数据来源", "智能投放 = jst 商品报表（按 skuId）；"
+                          "关键词 = 报表中心创意报表（按创意落地页 SKU，含已删除计划）；"
+                          "全站智能推广 = 快车计划列表（计划上的 spuId）"])
     ws3.append(["花费合计", totals.get("total")])
     ws3.append(["  其中 智能投放", totals.get("jst")])
+    ws3.append(["  其中 关键词计划", totals.get("keywordTotal")])
     ws3.append(["  其中 全站智能推广", totals.get("shopSmart")])
-    ws3.append(["未归因 关键词计划", totals.get("keyword")])
+    ws3.append(["关键词-计划列表口径", totals.get("keywordListTotal")])
+    ws3.append(["未归因 关键词", totals.get("keyword")])
     ws3.append(["未归因 其他类型", totals.get("other")])
     ws3.append(["快车计划总花费", totals.get("campaignTotal")])
-    ws3.append(["未归因说明", "快车关键词计划的商品在「单元」维度，接口不返回 SKU，故无法按 SKU 归因，单列在「未归因关键词计划」"])
+    ws3.append(["未归因说明", "关键词花费按创意落地页的 SKU 归因；只有创意缺落地页时才无法归因，"
+                              "这类花费单列在「未归因关键词计划」sheet",
+                ])
     ws3.column_dimensions["A"].width = 20
     ws3.column_dimensions["B"].width = 95
 
@@ -707,7 +826,8 @@ class PayCommRunner:
 
                 if self.mode == "spend":
                     self._set(message="正在读取京准通广告花费（智能投放 + 全站智能推广）…")
-                    spend = fetch_spend(page, start, end)
+                    spend = fetch_spend(page, start, end,
+                                        settings.get_account(account).get("account_id"))
                     names: dict = {}
                     try:
                         # 只借商品列表补商品名（取不到不影响花费数据）
@@ -718,7 +838,7 @@ class PayCommRunner:
                     hints = spend.get("hints") or {}
                     rows = [{"skuId": sku, "itemName": names.get(sku) or hints.get(sku, ""),
                              "jztJstCost": v["jst"], "jztShopCost": v["shop"],
-                             "jztCost": v["total"]}
+                             "jztKwCost": v["kw"], "jztCost": v["total"]}
                             for sku, v in (spend.get("bySku") or {}).items()]
                     rows.sort(key=lambda r: (r.get("jztCost") or -1), reverse=True)
                     self._set(total=len(rows), done=len(rows))

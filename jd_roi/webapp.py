@@ -800,16 +800,19 @@ PAYCOMM_KINDS = {
         "api": "/api/paycomm/spend",
         "title": "京准通花费",
         "eyebrow": "花费一览 · 京准通",
-        "metaline": ["智能投放：商品报表按 skuId 取花费",
-                     "全站智能推广：计划上带 spuId 的花费",
-                     "只发 2~3 次请求，通常 20 秒内完成"],
+        "metaline": ["智能投放：商品报表按 skuId",
+                     "关键词：创意报表按落地页 SKU（含已删计划）",
+                     "全站智能推广：计划上的 spuId",
+                     "约 20 秒完成，结果写本地缓存"],
+        "grid": "g5",
         "switch": ("/paycomm", "看 CPS 花费 →"),
-        "webKeys": ["jztCost", "jztJstCost", "jztShopCost"],
+        "webKeys": ["jztCost", "jztJstCost", "jztKwCost", "jztShopCost"],
         "kpis": [
             {"label": "SKU 数", "key": None, "type": "int"},
             {"label": "京准通花费合计", "key": "jztCost", "type": "money", "subKind": "spend"},
-            {"label": "智能投放花费", "key": "jztJstCost", "type": "money"},
-            {"label": "全站智能推广花费", "key": "jztShopCost", "type": "money"},
+            {"label": "智能投放", "key": "jztJstCost", "type": "money"},
+            {"label": "关键词计划", "key": "jztKwCost", "type": "money"},
+            {"label": "全站智能推广", "key": "jztShopCost", "type": "money"},
         ],
         "sort": "jztCost",
         "showUnattr": True,
@@ -823,12 +826,13 @@ PAYCOMM_NOTES = {
 <p>区间内没有任何 CPS 成交的商品不会出现在列表里。抓取按 SKU 串行（每个 SKU 间隔 0.8~1.6 秒），
 100 个 SKU 约 2~3 分钟，全程占用浏览器登录态，期间不要同时扫码登录。</p>""",
     "spend": """
-<p><b>智能投放</b>：智能投放「商品报表」按 SKU 的花费（<code>/reweb/jst/account/sku/list</code>）；
-<b>全站智能推广</b>：快车计划列表里计划上带 <code>spuId</code> 的花费（<code>/dspad/msa/promolist/overview/campaign</code>，
-campaignType=153）。两者相加为「京准通花费合计」，实测同一智能投放计划的花费在两个接口里完全一致。</p>
-<p><b>未归因</b>：快车<b>关键词计划</b>（campaignType=2）的商品挂在「单元」上，接口不返回 SKU，
-无法按商品拆分，单独列在下方表格里，不计入任何 SKU 行。</p>
-<p>商品名优先用数据看板的商品名；该区间没有 CPS 成交时，用广告计划名里的商品名兜底显示。</p>""",
+<p><b>智能投放</b>：智能投放「商品报表」按 SKU 的花费（<code>/reweb/jst/account/sku/list</code>），含已下线计划。</p>
+<p><b>关键词计划</b>：取报表中心「创意」报表（<code>/reweb/msa/base/ad/list</code>），
+每条创意绑定一个商品、落地页就是 <code>item.jd.com/&lt;SKU&gt;.html</code>，因此可以按 SKU 拆分；
+这个报表<b>包含已删除的计划</b>，比快车计划列表更全（例如 8 月有一个已删关键词计划 6,012 元仍在花费）。</p>
+<p><b>全站智能推广</b>：快车计划列表里计划上带 <code>spuId</code> 的花费（campaignType=153）。</p>
+<p>三者相加为「京准通花费合计」。商品名优先用数据看板的商品名；该区间没有 CPS 成交时，
+用广告计划名里的商品名兜底显示。真正归不到 SKU 的（例如创意没有落地页）才会出现在下方「未归因」表格里。</p>""",
 }
 
 PAYCOMM_CSS = """
@@ -840,6 +844,10 @@ PAYCOMM_CSS = """
 td.nm{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 td.hot{font-weight:700;color:var(--ink)}
 .toolbar .fld{display:inline-flex;align-items:center;gap:6px;margin:0 10px 8px 0}
+#pcCacheBody .btn.danger{color:#fff;background:var(--red);border-color:var(--red)}
+#pcCacheBody .btn.danger:hover{background:var(--redink);border-color:var(--redink)}
+.grid.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
+@media(max-width:1100px){.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
 
 PAYCOMM_JS = """
@@ -899,8 +907,8 @@ function kpisHtml(){
     if(k.subKind === 'spend'){
       var st = SPEND.totals || {};
       var un = (num(st.keyword) || 0) + (num(st.other) || 0);
-      sub = un ? ('未归因关键词 ' + fmt(un,'money') + ' 元（无 SKU 维度）')
-               : ('快车计划总花费 ' + fmt(st.campaignTotal || 0,'money') + ' 元');
+      sub = un ? ('未归因 ' + fmt(un,'money') + ' 元（无 SKU）')
+               : '全部已按 SKU 归因';
     }
     out += kpi(k.label, val, sub);
   });
@@ -1130,7 +1138,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
   <div class="pcbar" id="pcBarWrap"><i id="pcBar"></i></div>
 </div>
 
-<div class="grid g4" id="pcKpis" style="display:none;margin-top:18px"></div>
+<div class="grid {cfg.get("grid", "g4")}" id="pcKpis" style="display:none;margin-top:18px"></div>
 
 <div class="card" id="pcCacheCard">
   <h2>本地缓存 <span class="tagline">不自动清理，删除由你决定</span></h2>

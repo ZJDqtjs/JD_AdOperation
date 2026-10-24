@@ -47,7 +47,8 @@ def _cps(page, start: str, end: str, account: str) -> dict:
 
 def _spend(page, start: str, end: str, account: str) -> dict:
     print("[spend] 读取京准通广告花费…")
-    spend = paycomm.fetch_spend(page, start, end)
+    spend = paycomm.fetch_spend(page, start, end,
+                                settings.get_account(account).get("account_id"))
     names: dict = {}
     try:
         names = {int(g["itemId"]): (g.get("itemName") or "")
@@ -56,7 +57,8 @@ def _spend(page, start: str, end: str, account: str) -> dict:
         names = {}
     hints = spend.get("hints") or {}
     rows = [{"skuId": sku, "itemName": names.get(sku) or hints.get(sku, ""),
-             "jztJstCost": v["jst"], "jztShopCost": v["shop"], "jztCost": v["total"]}
+             "jztJstCost": v["jst"], "jztShopCost": v["shop"], "jztKwCost": v["kw"],
+             "jztCost": v["total"]}
             for sku, v in (spend.get("bySku") or {}).items()]
     rows.sort(key=lambda r: (r.get("jztCost") or -1), reverse=True)
     return {"rows": rows, "spend": spend}
