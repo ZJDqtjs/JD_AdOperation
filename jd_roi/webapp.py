@@ -8,7 +8,8 @@
     /            控制台（区间选择、数据覆盖、立即抓取、扫码登录）
     /report      任意区间的聚合分析报表（自带区间选择器）
     /ai          独立 AI 分析台：每日 AI 报告 + 可追问对话框（含思考过程流式展示）
-    /paycomm     花费一览：按 SKU 看 CPS 付款佣金金额，可导出 Excel
+    /paycomm     CPS 花费：按 SKU 看付款佣金金额，可导出 Excel
+    /paycomm/spend  京准通花费：按 SKU 看广告花费（智能投放 + 全站智能推广），可导出 Excel
     /login       扫码登录
 
 API：
@@ -768,15 +769,71 @@ def ai_console(request: Request):
 
 
 # ================================================================ 花费一览
-# 京准通「数据看板 → 商品数据」按 SKU 抓 CPS 花费（付款佣金金额），可导出 Excel。
+# 两个独立页面（不混在一张表里）：
+#   /paycomm        CPS 花费（数据看板 → 商品数据的付款佣金）
+#   /paycomm/spend  京准通花费（智能投放 + 全站智能推广，按 SKU）
 # 抓取/限速/导出的实现在 jd_roi/paycomm.py，这里只做页面与接口。
-PAYCOMM_WEB_KEYS = ["payCommAmount", "payCommRate", "preCommAmount", "clicks", "uv",
-                    "orderCnt", "orderGmv", "fiOrderCnt", "orderUserCnt", "roi"]
+PAYCOMM_KINDS = {
+    "cps": {
+        "nav": "/paycomm",
+        "api": "/api/paycomm",
+        "title": "CPS 花费",
+        "eyebrow": "花费一览 · CPS",
+        "metaline": ["京准通「数据看板 → 商品数据」口径",
+                     "按 SKU 逐个取「付款佣金金额」",
+                     "请求已限速（每个 SKU 间隔 0.8~1.6 秒）"],
+        "switch": ("/paycomm/spend", "看京准通花费 →"),
+        "webKeys": ["payCommAmount", "payCommRate", "preCommAmount", "clicks", "uv",
+                    "orderCnt", "orderGmv", "fiOrderCnt", "orderUserCnt", "roi"],
+        "kpis": [
+            {"label": "SKU 数", "key": None, "type": "int"},
+            {"label": "付款佣金合计", "key": "payCommAmount", "type": "money",
+             "sub": "与页面「商品数据」同口径"},
+            {"label": "预估佣金合计", "key": "preCommAmount", "type": "money"},
+            {"label": "下单订单金额", "key": "orderGmv", "type": "money"},
+        ],
+        "sort": "payCommAmount",
+        "showUnattr": False,
+    },
+    "spend": {
+        "nav": "/paycomm/spend",
+        "api": "/api/paycomm/spend",
+        "title": "京准通花费",
+        "eyebrow": "花费一览 · 京准通",
+        "metaline": ["智能投放：商品报表按 skuId 取花费",
+                     "全站智能推广：计划上带 spuId 的花费",
+                     "只发 2~3 次请求，通常 20 秒内完成"],
+        "switch": ("/paycomm", "看 CPS 花费 →"),
+        "webKeys": ["jztCost", "jztJstCost", "jztShopCost"],
+        "kpis": [
+            {"label": "SKU 数", "key": None, "type": "int"},
+            {"label": "京准通花费合计", "key": "jztCost", "type": "money", "subKind": "spend"},
+            {"label": "智能投放花费", "key": "jztJstCost", "type": "money"},
+            {"label": "全站智能推广花费", "key": "jztShopCost", "type": "money"},
+        ],
+        "sort": "jztCost",
+        "showUnattr": True,
+    },
+}
+
+PAYCOMM_NOTES = {
+    "cps": """
+<p><b>付款佣金金额</b> = 已结算/付款口径的佣金（接口 <code>payCommAmount</code>），与「数据看板 → 商品数据」页面一致；
+<b>预估佣金</b>是下单时预估、后续可能因退款变化。</p>
+<p>区间内没有任何 CPS 成交的商品不会出现在列表里。抓取按 SKU 串行（每个 SKU 间隔 0.8~1.6 秒），
+100 个 SKU 约 2~3 分钟，全程占用浏览器登录态，期间不要同时扫码登录。</p>""",
+    "spend": """
+<p><b>智能投放</b>：智能投放「商品报表」按 SKU 的花费（<code>/reweb/jst/account/sku/list</code>）；
+<b>全站智能推广</b>：快车计划列表里计划上带 <code>spuId</code> 的花费（<code>/dspad/msa/promolist/overview/campaign</code>，
+campaignType=153）。两者相加为「京准通花费合计」，实测同一智能投放计划的花费在两个接口里完全一致。</p>
+<p><b>未归因</b>：快车<b>关键词计划</b>（campaignType=2）的商品挂在「单元」上，接口不返回 SKU，
+无法按商品拆分，单独列在下方表格里，不计入任何 SKU 行。</p>
+<p>商品名优先用数据看板的商品名；该区间没有 CPS 成交时，用广告计划名里的商品名兜底显示。</p>""",
+}
 
 PAYCOMM_CSS = """
 .pcbar{height:8px;background:var(--hair);border-radius:9999px;overflow:hidden;margin-top:14px}
 .pcbar i{display:block;height:100%;width:0;background:var(--primary);transition:width .35s ease}
-.pcbar.done i{background:var(--green)}
 #pcTable th{cursor:pointer;user-select:none;white-space:nowrap}
 .tblwrap.long{max-height:72vh;overflow:auto}
 .tblwrap.long thead th{position:sticky;top:0;background:var(--canvas);z-index:1}
@@ -788,11 +845,13 @@ td.hot{font-weight:700;color:var(--ink)}
 PAYCOMM_JS = """
 (function(){
 var INIT = window.PC_INIT || {};
+var API = INIT.api || '/api/paycomm';
 var FIELDS = INIT.fields || [];
 var WEB = INIT.webKeys || [];
+var KPIS = INIT.kpis || [];
 var LBL = {}, TYP = {};
 FIELDS.forEach(function(f){ LBL[f[0]] = f[1]; TYP[f[0]] = f[2]; });
-var JOB = null, ROWS = [], SORT = {k:'payCommAmount', d:-1}, TIMER = null;
+var JOB = null, ROWS = [], SPEND = {}, SORT = {k: (INIT.sort || 'payCommAmount'), d: -1}, TIMER = null;
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
@@ -819,11 +878,33 @@ function rowsHtml(list){
   if(!list.length) return '<tr><td colspan="'+(WEB.length+2)+'" class="l">没有匹配的行</td></tr>';
   return list.map(function(r){
     var tds = WEB.map(function(k){
-      return '<td class="n'+(k==='payCommAmount'?' hot':'')+'">'+fmt(r[k],TYP[k])+'</td>';
+      var hot = (k==='payCommAmount'||k==='jztCost') ? ' hot' : '';
+      return '<td class="n'+hot+'">'+fmt(r[k],TYP[k])+'</td>';
     }).join('');
     return '<tr><td class="l"><b>'+esc(r.skuId)+'</b></td>'
-      + '<td class="l nm" title="'+esc(r.itemName)+'">'+esc(r.itemName)+'</td>'+tds+'</tr>';
+      + '<td class="l nm" title="'+esc(r.itemName)+'">'+esc(r.itemName || '—')+'</td>'+tds+'</tr>';
   }).join('');
+}
+function kpisHtml(){
+  var out = '';
+  KPIS.forEach(function(k){
+    var val, sub = k.sub || '';
+    if(!k.key){
+      val = ROWS.length.toLocaleString('zh-CN');
+    } else {
+      var s = 0;
+      ROWS.forEach(function(r){ s += num(r[k.key]) || 0; });
+      val = (k.type === 'int' ? fmt(s,'int') : ('¥' + fmt(s,'money')));
+    }
+    if(k.subKind === 'spend'){
+      var st = SPEND.totals || {};
+      var un = (num(st.keyword) || 0) + (num(st.other) || 0);
+      sub = un ? ('未归因关键词 ' + fmt(un,'money') + ' 元（无 SKU 维度）')
+               : ('快车计划总花费 ' + fmt(st.campaignTotal || 0,'money') + ' 元');
+    }
+    out += kpi(k.label, val, sub);
+  });
+  return out;
 }
 function render(){
   var kw = ($('pcFilter').value||'').trim().toLowerCase();
@@ -841,25 +922,35 @@ function render(){
   });
   $('pcHead').innerHTML = head();
   $('pcBody').innerHTML = rowsHtml(list);
-  var tp=0, tpre=0, tgmv=0;
-  ROWS.forEach(function(r){ tp += num(r.payCommAmount)||0; tpre += num(r.preCommAmount)||0;
-                            tgmv += num(r.orderGmv)||0; });
-  $('pcKpis').innerHTML = kpi('SKU 数', ROWS.length)
-    + kpi('付款佣金合计', '¥'+fmt(tp,'money'), '与页面「商品数据」同口径')
-    + kpi('预估佣金合计', '¥'+fmt(tpre,'money'))
-    + kpi('下单订单金额', '¥'+fmt(tgmv,'money'));
+  $('pcKpis').innerHTML = kpisHtml();
   $('pcKpis').style.display = '';
   $('pcCount').textContent = '共 '+ROWS.length+' 个 SKU'
     + (list.length!==ROWS.length ? ('，筛选后 '+list.length+' 行') : '');
+
+  var kws = SPEND.keywordRows || [];
+  if(INIT.showUnattr && kws.length){
+    var kh = kws.map(function(c){
+      return '<tr><td class="l">'+esc(c.campaignId)+'</td><td class="l nm">'+esc(c.campaignName)
+        + '</td><td class="n">'+fmt(c.cost,'money')+'</td></tr>';
+    }).join('');
+    var kt = 0; kws.forEach(function(c){ kt += num(c.cost)||0; });
+    kh += '<tr><td class="l"><b>合计</b></td><td class="l">'+kws.length+' 个计划</td>'
+        + '<td class="n"><b>'+fmt(kt,'money')+'</b></td></tr>';
+    $('pcUnattrBody').innerHTML = kh;
+    $('pcUnattrCard').style.display = '';
+  } else if($('pcUnattrCard')){
+    $('pcUnattrCard').style.display = 'none';
+  }
 }
 function showTable(){ $('pcTableCard').style.display=''; $('pcExport').disabled=false; render(); }
 
 function poll(){
-  fetch('/api/paycomm/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
+  fetch(API + '/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
     if(!j.ok){ msg(j.error||'状态查询失败','bad'); return; }
     if(j.active){
       if(j.jobId) JOB = j.jobId;
       $('pcRun').disabled = true;
+      $('pcRefetch').disabled = true;
       $('pcCancel').style.display = '';
       var pct = j.total ? Math.round(j.done*100/j.total) : 0;
       $('pcBar').style.width = pct+'%';
@@ -868,52 +959,116 @@ function poll(){
       return;
     }
     $('pcRun').disabled = false;
+    $('pcRefetch').disabled = false;
     $('pcCancel').style.display = 'none';
     $('pcBar').style.width = j.error ? '0' : '100%';
     if(j.error){ msg(j.message || j.error, 'bad'); }
     else if(j.message){ msg(j.message, 'ok'); }
-    if(j.rows && j.rows.length){ JOB = j.jobId; ROWS = j.rows; showTable(); }
+    if(j.rows && j.rows.length){
+      var rg = j.range || [];
+      var same = rg.length ? (rg[0] === $('pcStart').value && rg[1] === $('pcEnd').value) : true;
+      if(same){
+        JOB = j.jobId; ROWS = j.rows; SPEND = j.spend || {}; showTable();
+      } else {
+        msg('本页最近一次结果是 ' + rg[0] + ' ~ ' + rg[1] + '；当前区间点「查询」即可（有缓存秒出）');
+      }
+    }
   }).catch(function(e){ msg('状态查询失败 '+e,'bad'); });
 }
-function run(){
+function run(force){
   var acc = $('pcAcc').value, s = $('pcStart').value, e = $('pcEnd').value;
   if(!s || !e){ msg('请选择起止日期','bad'); return; }
   if(s > e){ msg('起始日期不能晚于结束日期','bad'); return; }
-  ROWS = []; JOB = null;
+  ROWS = []; JOB = null; SPEND = {};
   $('pcTableCard').style.display = 'none';
   $('pcExport').disabled = true;
   $('pcRun').disabled = true;
+  $('pcRefetch').disabled = true;
   $('pcBar').style.width = '0';
-  msg('已提交，正在启动…');
+  msg(force ? '正在重新抓取（会覆盖该区间的本地缓存）…' : '查询中（先看本地缓存）…');
   var qs = new URLSearchParams({account: acc, start: s, end: e});
-  fetch('/api/paycomm/run?'+qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
+  if(force) qs.set('force', '1');
+  fetch(API + '/run?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
     .then(function(j){
-      if(!j.ok){ msg('启动失败：'+(j.error||''),'bad'); $('pcRun').disabled=false; return; }
-      JOB = j.jobId; poll();
-    }).catch(function(e){ msg('请求失败 '+e,'bad'); $('pcRun').disabled=false; });
+      if(!j.ok){
+        msg('失败：'+(j.error||''),'bad');
+        $('pcRun').disabled=false; $('pcRefetch').disabled=false; return;
+      }
+      JOB = j.jobId;
+      if(j.cached){ msg('命中本地缓存（'+(j.savedAt||'')+' 抓取，共 '+(j.rows||0)+' 个 SKU），未请求京准通'); }
+      poll(); loadCache();
+    }).catch(function(e){
+      msg('请求失败 '+e,'bad');
+      $('pcRun').disabled=false; $('pcRefetch').disabled=false;
+    });
+}
+function refetch(){
+  var s = $('pcStart').value, e = $('pcEnd').value;
+  var tip = '重新抓取 ' + s + ' ~ ' + e + '，会真实请求京准通并覆盖该区间缓存。继续？';
+  if(!confirm(tip)) return;
+  run(true);
+}
+function loadCache(){
+  fetch(API + '/cache').then(function(r){ return r.json(); }).then(function(j){
+    if(!j.ok || !j.entries){ return; }
+    var list = j.entries;
+    if(!list.length){
+      $('pcCacheBody').innerHTML = '<tr><td colspan="7" class="l">还没有缓存，点「查询」抓一次就会存下来</td></tr>';
+      return;
+    }
+    var html = list.map(function(en){
+      return '<tr><td class="l">'+esc(en.accountLabel || en.account)+'</td>'
+        + '<td class="l">'+esc(en.start)+' ~ '+esc(en.end)+'</td>'
+        + '<td class="n">'+esc(en.rows)+'</td>'
+        + '<td class="n">'+fmt(en.total,'money')+'</td>'
+        + '<td class="l">'+esc(en.savedAt)+'</td>'
+        + '<td class="n">'+esc(en.sizeKB)+' KB</td>'
+        + '<td class="n"><button class="btn danger mini" data-acc="'+esc(en.account)+'" '
+        + 'data-start="'+esc(en.start)+'" data-end="'+esc(en.end)+'" '
+        + 'onclick="PC.delCache(this)">删除</button></td></tr>';
+    }).join('');
+    $('pcCacheBody').innerHTML = html;
+  }).catch(function(){});
+}
+function delCache(btn){
+  var account = btn.getAttribute('data-acc');
+  var start = btn.getAttribute('data-start');
+  var end = btn.getAttribute('data-end');
+  if(!confirm('删除 ' + account + ' ' + start + ' ~ ' + end + ' 的本地缓存？删掉后下次查询会重新请求京准通。')) return;
+  var qs = new URLSearchParams({account: account, start: start, end: end});
+  fetch(API + '/cache/delete?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
+    .then(function(j){
+      msg(j.ok && (j.deleted||[]).length ? ('已删除：'+j.deleted.join('、')) : (j.error||'删除失败'),
+          j.ok ? 'ok' : 'bad');
+      loadCache();
+    }).catch(function(e){ msg('删除失败 '+e,'bad'); });
 }
 function cancel(){
-  fetch('/api/paycomm/cancel', {method:'POST'}).then(function(r){ return r.json(); })
+  fetch(API + '/cancel', {method:'POST'}).then(function(r){ return r.json(); })
     .then(function(j){ msg(j.cancelRequested ? '已请求取消，当前 SKU 取完后停止' : '当前没有任务'); });
 }
 function exp(){
-  if(!JOB){ msg('还没有数据，先点「查询」','bad'); return; }
-  window.location = '/api/paycomm/export?job=' + encodeURIComponent(JOB);
+  var s = $('pcStart').value, e = $('pcEnd').value;
+  if(!JOB && !s){ msg('还没有数据，先点「查询」','bad'); return; }
+  var qs = new URLSearchParams({job: JOB || '', account: $('pcAcc').value, start: s, end: e});
+  window.location = API + '/export?' + qs.toString();
 }
 function sort(k){
   if(SORT.k === k) SORT.d = -SORT.d;
   else SORT = {k: k, d: (k==='itemName'||k==='skuId') ? 1 : -1};
   render();
 }
-window.PC = {sort: sort, run: run, exp: exp, cancel: cancel, render: render};
-if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', poll);
-else poll();
+window.PC = {sort: sort, run: run, refetch: refetch, exp: exp, cancel: cancel,
+             render: render, loadCache: loadCache, delCache: delCache};
+function boot(){ poll(); loadCache(); }
+if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
 })();
 """
 
 
-@app.get("/paycomm", response_class=HTMLResponse)
-def paycomm_page(request: Request):
+def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
+    cfg = PAYCOMM_KINDS[kind]
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = q.get("account") or settings.MAIN_ACCOUNT
@@ -927,21 +1082,36 @@ def paycomm_page(request: Request):
             pass
     opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
                    f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
-    init = {"fields": [[k, lab, t] for k, lab, t in paycomm.FIELDS],
-            "webKeys": PAYCOMM_WEB_KEYS}
+    fields = paycomm.FIELDS if kind == "cps" else paycomm.SPEND_FIELDS
+    init = {"mode": kind, "api": cfg["api"], "sort": cfg["sort"],
+            "fields": [[k, lab, t] for k, lab, t in fields],
+            "webKeys": cfg["webKeys"], "kpis": cfg["kpis"], "showUnattr": cfg["showUnattr"]}
+    unattr_html = """
+<div class="card" id="pcUnattrCard" style="display:none">
+  <h2>未归因的关键词计划 <span class="tagline">快车关键词计划的商品挂在「单元」上，接口不返回 SKU</span></h2>
+  <p class="hint">这些花费无法落到具体 SKU，因此不计入上方任何一行，仅列出计划名供人工对应商品。</p>
+  <div class="tblwrap short">
+    <table><thead><tr><th class="l noSort">计划ID</th><th class="l noSort">计划名称</th>
+      <th class="n noSort">花费(元)</th></tr></thead><tbody id="pcUnattrBody"></tbody></table>
+  </div>
+</div>""" if cfg["showUnattr"] else ""
+    metaline = "".join(
+        f'<span>{_e(t)}</span>'
+        + ('<span class="dot"></span>' if i < len(cfg["metaline"]) - 1 else "")
+        for i, t in enumerate(cfg["metaline"]))
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>花费一览 · 京东广告运营</title>
+<title>{_e(cfg["title"])} · 京东广告运营</title>
 <style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
 </head><body>
-{report2.navtop("/paycomm")}
+{report2.navtop(cfg["nav"])}
 <header class="top"><div class="wrap pagehead">
-  <div class="eyebrow">{report2.SPIKE_SVG}花费一览</div>
-  <h1>CPS 花费一览</h1>
-  <div class="metaline">
-    <span>京准通「数据看板 → 商品数据」口径</span><span class="dot"></span>
-    <span>按 SKU 逐个取「付款佣金金额」</span><span class="dot"></span>
-    <span>请求已限速（每个 SKU 间隔 0.8~1.6 秒）</span>
+  <div class="eyebrow">{report2.SPIKE_SVG}{_e(cfg["eyebrow"])}</div>
+  <h1>{_e(cfg["title"])}</h1>
+  <div class="metaline">{metaline}</div>
+  <div class="actions">
+    <a class="btn ghost mini" href="{_e(cfg["switch"][0])}">{_e(cfg["switch"][1])}</a>
+    <a class="btn ghost mini" href="/login">登录 / 检查登录态</a>
   </div>
 </div></header>
 <div class="wrap">
@@ -952,20 +1122,34 @@ def paycomm_page(request: Request):
     <label class="fld">起 <input type="date" id="pcStart" value="{_e(start)}"></label>
     <label class="fld">止 <input type="date" id="pcEnd" value="{_e(end)}"></label>
     <button class="btn" id="pcRun" onclick="PC.run()">查询</button>
+    <button class="btn ghost" id="pcRefetch" onclick="PC.refetch()" title="忽略本地缓存，重新请求京准通">重新抓取</button>
     <button class="btn sec" id="pcExport" onclick="PC.exp()" disabled>导出 Excel</button>
     <button class="btn ghost" id="pcCancel" onclick="PC.cancel()" style="display:none">取消</button>
-    <a class="btn ghost mini" href="/login">登录 / 检查登录态</a>
   </div>
-  <div class="hint" id="pcMsg" style="min-height:20px">选账号与区间后点「查询」；默认取上一个自然月。</div>
+  <div class="hint" id="pcMsg" style="min-height:20px">选账号与区间后点「查询」：有缓存直接读本地（不请求京准通），没有才去抓。</div>
   <div class="pcbar" id="pcBarWrap"><i id="pcBar"></i></div>
 </div>
 
 <div class="grid g4" id="pcKpis" style="display:none;margin-top:18px"></div>
 
+<div class="card" id="pcCacheCard">
+  <h2>本地缓存 <span class="tagline">不自动清理，删除由你决定</span></h2>
+  <p class="hint">抓一次存一份：<code>{_e(str(settings.DATA_DIR))}/reports/</code>。
+  同一账号 + 同一区间再点「查询」直接读文件，<b>不会请求京准通</b>；需要最新数据时点「重新抓取」覆盖这一份。
+  这里没有任何自动过期、也没有自动清理逻辑。</p>
+  <div class="tblwrap short">
+    <table><thead><tr>
+      <th class="l noSort">账号</th><th class="l noSort">区间</th><th class="n noSort">SKU</th>
+      <th class="n noSort">合计(元)</th><th class="l noSort">抓取时间</th>
+      <th class="n noSort">大小</th><th class="n noSort">操作</th>
+    </tr></thead><tbody id="pcCacheBody"></tbody></table>
+  </div>
+</div>
+
 <div class="card" id="pcTableCard" style="display:none">
-  <h2>SKU 明细 <span class="tagline">按付款佣金金额降序，点表头可换排序</span></h2>
+  <h2>SKU 明细 <span class="tagline">点表头可换排序</span></h2>
   <div class="toolbar">
-    <input id="pcFilter" placeholder="筛选 SKU / 商品名" oninput="PC.render && PC.render()"
+    <input id="pcFilter" placeholder="筛选 SKU / 商品名" oninput="PC.render()"
            style="min-width:260px;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
     <span class="hint" id="pcCount"></span>
   </div>
@@ -973,11 +1157,13 @@ def paycomm_page(request: Request):
     <table id="pcTable"><thead id="pcHead"></thead><tbody id="pcBody"></tbody></table>
   </div>
 </div>
+{unattr_html}
 
-<div class="note" style="margin-top:18px">
-  说明：<b>付款佣金金额</b> = 已结算/付款口径的佣金（接口字段 <code>payCommAmount</code>），
-  与「数据看板 → 商品数据」页面显示的数值一致；<b>预估佣金</b>是下单时预估、后续可能因退款变化。
-  区间内没有任何 CPS 成交的商品不会出现在列表里。抓取全程占用浏览器登录态，期间不要同时扫码登录。
+
+
+<div class="note" style="margin-top:18px">{PAYCOMM_NOTES[kind]}
+<p><a href="{_e(cfg["switch"][0])}">{_e(cfg["switch"][1])}</a>　·　
+<a href="/login">登录 / 检查登录态</a></p>
 </div>
 
 </div>
@@ -986,34 +1172,56 @@ def paycomm_page(request: Request):
 </body></html>""")
 
 
-@app.post("/api/paycomm/run")
-def api_paycomm_run(account: str | None = None, start: str = "", end: str = ""):
-    """启动后台抓取（单任务串行，返回 jobId）。"""
+@app.get("/paycomm", response_class=HTMLResponse)
+def paycomm_page(request: Request):
+    """CPS 花费：数据看板 → 商品数据的付款佣金（按 SKU）。"""
+    return _paycomm_page("cps", request)
+
+
+@app.get("/paycomm/spend", response_class=HTMLResponse)
+def paycomm_spend_page(request: Request):
+    """京准通花费：智能投放 + 全站智能推广（按 SKU）。"""
+    return _paycomm_page("spend", request)
+
+
+def _paycomm_other_running(mode: str) -> str | None:
+    other = _paycomm_spend if mode == "cps" else _paycomm
+    if other.snapshot().get("running"):
+        label = "「京准通花费」" if mode == "cps" else "「CPS 花费」"
+        return f"{label}任务正在运行，等它结束再查（两者都要占用浏览器登录态）"
+    return None
+
+
+def _paycomm_start(runner, account, start, end, force: bool = False) -> dict:
+    """查询入口：默认先吃本地缓存（同账号+同区间），force=1 才重新请求京准通。"""
+    acc = account or settings.MAIN_ACCOUNT
     try:
-        return _paycomm.run_background(account or settings.MAIN_ACCOUNT, start, end)
+        if not force:
+            hit = runner.use_cache(acc, start, end)
+            if hit is not None:
+                return hit
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    busy = _paycomm_other_running(runner.mode)
+    if busy:
+        return {"ok": False, "error": busy}
+    try:
+        return runner.run_background(acc, start, end)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
 
-@app.get("/api/paycomm/status")
-def api_paycomm_status(rows: int = 0):
-    """进度快照；rows=1 时附带最近一次结果（刷新页面后可自动恢复表格）。"""
-    snap = _paycomm.snapshot(with_rows=bool(rows))
+def _paycomm_snapshot(runner, rows: int) -> dict:
+    snap = runner.snapshot(with_rows=bool(rows))
     snap["ok"] = True
     snap["active"] = snap.pop("running", False)
     return snap
 
 
-@app.post("/api/paycomm/cancel")
-def api_paycomm_cancel():
-    return _paycomm.cancel()
-
-
-@app.get("/api/paycomm/export")
-def api_paycomm_export(job: str | None = None):
-    """把某次抓取结果导出成 xlsx（内存优先，回退到 data/reports 里的落盘 JSON）。"""
+def _paycomm_export(runner, job: str | None, account: str | None = None,
+                    start: str | None = None, end: str | None = None):
     from urllib.parse import quote
-    got = _paycomm.export(job)
+    got = runner.export(job, account=account, start=start, end=end)
     if not got:
         return JSONResponse({"ok": False, "error": "没有可导出的结果，请先查询一次"}, status_code=404)
     data, fname = got
@@ -1022,6 +1230,78 @@ def api_paycomm_export(job: str | None = None):
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
+
+
+@app.post("/api/paycomm/run")
+def api_paycomm_run(account: str | None = None, start: str = "", end: str = "", force: int = 0):
+    """CPS 花费查询：默认命中缓存直接返回，force=1 才重新抓取。"""
+    return _paycomm_start(_paycomm, account, start, end, force=bool(force))
+
+
+@app.get("/api/paycomm/status")
+def api_paycomm_status(rows: int = 0):
+    """CPS 花费进度；rows=1 时附带最近一次结果。"""
+    return _paycomm_snapshot(_paycomm, rows)
+
+
+@app.post("/api/paycomm/cancel")
+def api_paycomm_cancel():
+    return _paycomm.cancel()
+
+
+@app.get("/api/paycomm/export")
+def api_paycomm_export(job: str | None = None, account: str | None = None,
+                       start: str | None = None, end: str | None = None):
+    return _paycomm_export(_paycomm, job, account, start, end)
+
+
+@app.post("/api/paycomm/spend/run")
+def api_paycomm_spend_run(account: str | None = None, start: str = "", end: str = "", force: int = 0):
+    """京准通花费查询：默认命中缓存直接返回，force=1 才重新抓取。"""
+    return _paycomm_start(_paycomm_spend, account, start, end, force=bool(force))
+
+
+@app.get("/api/paycomm/spend/status")
+def api_paycomm_spend_status(rows: int = 0):
+    return _paycomm_snapshot(_paycomm_spend, rows)
+
+
+@app.post("/api/paycomm/spend/cancel")
+def api_paycomm_spend_cancel():
+    return _paycomm_spend.cancel()
+
+
+@app.get("/api/paycomm/spend/export")
+def api_paycomm_spend_export(job: str | None = None, account: str | None = None,
+                             start: str | None = None, end: str | None = None):
+    return _paycomm_export(_paycomm_spend, job, account, start, end)
+
+
+# ---------------------------------------------------------------- 本地缓存
+# 缓存 = data/reports/<mode>_<账号>_<区间>.json，一次抓取一份；
+# 不会自动过期、不会自动清理，删除只由用户显式触发。
+@app.get("/api/paycomm/cache")
+def api_paycomm_cache():
+    return {"ok": True, "mode": "cps", "entries": _paycomm.cache_entries()}
+
+
+@app.post("/api/paycomm/cache/delete")
+def api_paycomm_cache_delete(account: str | None = None, start: str = "", end: str = ""):
+    if not (account and start and end):
+        return {"ok": False, "error": "缺少 account / start / end"}
+    return _paycomm.delete_cache(account, start, end)
+
+
+@app.get("/api/paycomm/spend/cache")
+def api_paycomm_spend_cache():
+    return {"ok": True, "mode": "spend", "entries": _paycomm_spend.cache_entries()}
+
+
+@app.post("/api/paycomm/spend/cache/delete")
+def api_paycomm_spend_cache_delete(account: str | None = None, start: str = "", end: str = ""):
+    if not (account and start and end):
+        return {"ok": False, "error": "缺少 account / start / end"}
+    return _paycomm_spend.delete_cache(account, start, end)
 
 
 # ================================================================ API
@@ -2015,8 +2295,9 @@ class LoginSession:
 
 
 _login = LoginSession()
-# 花费一览（按 SKU 抓 CPS 付款佣金）：与登录 / 保活共用同一把 Profile 锁
-_paycomm = paycomm.PayCommRunner(profile_lock=_login._profile_lock)
+# 花费一览两个独立任务（CPS 付款佣金 / 京准通广告花费）：与登录 / 保活共用同一把 Profile 锁
+_paycomm = paycomm.PayCommRunner("cps", profile_lock=_login._profile_lock)
+_paycomm_spend = paycomm.PayCommRunner("spend", profile_lock=_login._profile_lock)
 
 
 class AiRunner:
