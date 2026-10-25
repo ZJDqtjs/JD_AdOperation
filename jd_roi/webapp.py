@@ -1462,6 +1462,14 @@ function msg(s,kind){ var el=$('pfMsg'); if(!el) return; el.textContent=s||'';
 function kpi(lbl,val,sub){ return '<div class="kpi"><div class="lbl">'+esc(lbl)+'</div><div class="val">'+val+'</div>'
   + (sub?'<div class="sub">'+esc(sub)+'</div>':'') + '</div>'; }
 function cols(){ return (DIM==='cat') ? WEB.filter(function(k){ return RATIO.indexOf(k)<0; }) : WEB; }
+function accTip(r){
+  var L = INIT.labels || {};
+  function j(a){ return (a||[]).map(function(k){ return L[k] || k; }).join('、'); }
+  var sale = j(r.accts), spend = j(r.spendAccts);
+  var nm = r.itemName || '';
+  if(!sale && !spend) return nm;
+  return nm + ' ｜ 成交账号：' + (sale||'—') + ' ｜ 花费账号：' + (spend||'—');
+}
 
 function aggregate(list){
   var map = {}, order = [];
@@ -1513,7 +1521,7 @@ function rowsHtml(list){
       op = '<span class="hint">纯广告无成交</span>';
     }
     return '<tr><td class="l"><b>'+esc(r.skuId)+'</b></td>'
-      + '<td class="l nm" title="'+esc(r.itemName)+'">'+esc(r.itemName||'—')+'</td>'+tds
+      + '<td class="l nm" title="'+esc(accTip(r))+'">'+esc(r.itemName||'—')+'</td>'+tds
       + '<td class="l">'+op+'</td></tr>';
   }).join('');
 }
@@ -1739,7 +1747,7 @@ def profit_page(request: Request):
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = q.get("account") or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     start, end = _last_month_range()
     if q.get("start") and q.get("end"):
@@ -1747,9 +1755,12 @@ def profit_page(request: Request):
             start, end = profit.norm_range(q.get("start"), q.get("end"))
         except ValueError:
             pass
-    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-                   f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    opts = ('<option value="all"' + (' selected' if acc == "all" else '') + '>'
+            + '全部账号（按 SKU 合并）</option>')
+    opts += "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+                    f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
     init = {"api": "/api/profit", "fields": [[k, lab, t] for k, lab, t in profit.FIELDS],
+            "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
             "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -1834,8 +1845,14 @@ def profit_page(request: Request):
 
 
 @app.post("/api/profit/run")
-def api_profit_run(account: str | None = None, start: str = "", end: str = "", force: int = 0):
+def api_profit_run(account: str | None = None, start: str = "", end: str = "", force: int = 0,
+                   accounts: str = ""):
+    """account=all 或 accounts=a,b 时，按 SKU 跨账号合并（花费跟着成交走）。"""
     try:
+        wanted = [x for x in (accounts or "").split(",") if x.strip()]
+        if account == "all" or len(wanted) > 1:
+            keys = wanted or [a["key"] for a in settings.ACCOUNTS]
+            return _profit.run_background(keys[0], start, end, force=bool(force), accounts=keys)
         return _profit.run_background(account or settings.MAIN_ACCOUNT, start, end,
                                       force=bool(force))
     except ValueError as exc:

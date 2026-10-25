@@ -100,73 +100,23 @@ def _cost_map(cps_data: dict | None, jzt_data: dict | None) -> tuple[dict, dict]
     return _one(cps_data, "payCommAmount"), _one(jzt_data, "jztCost")
 
 
-def allocate_orphans(rows: list[dict]) -> tuple[list[dict], list[dict]]:
-    """把「只有广告花费、商智无成交」的行，按成交额分摊给同品类的成交 SKU。
+def collect(sz_rows: list[dict], cps: dict, jzt: dict,
+            names: dict | None = None, accounts: list[str] | None = None) -> dict[int, dict]:
+    """把一个账号的商智成交与花费汇总成 {skuId: 原始量}（不做成本/利润计算）。
 
-    典型场景：全站智能推广是按 SPU 投放的（spuId 不是成交 SKU），商智里那个 id 没有销量，
-    如果不处理，页面上就会「一个 SKU 纯负数、同款其它 SKU 利润虚高」。
-    人工在页面上做的归并（config/sku_map.json）会先执行，剩下的才在这里分摊。
+    单独拆出来是为了多账号按 SKU 合并：同一个 SKU 可能在 A 账号成交、在 B 账号投广告。
     """
-    orphans = [r for r in rows
-               if not r.get("qty") and float(r.get("jztCost") or 0) > 0
-               and not float(r.get("cpsCost") or 0)]
-    if not orphans:
-        return rows, []
-    info: list[dict] = []
-    for o in orphans:
-        cat = o.get("category") or ""
-        if not cat or cat == "未分类":
-            continue
-        cands = [r for r in rows if r.get("qty") and (r.get("category") or "") == cat]
-        if not cands:
-            continue
-        weights = [(float(r.get("szAmt") or 0) or float(r.get("qty") or 0)) for r in cands]
-        total_w = sum(weights)
-        if total_w <= 0:
-            continue
-        cost = float(o.get("jztCost") or 0)
-        acc = 0.0
-        for i, r in enumerate(cands):
-            share = (round(cost * weights[i] / total_w, 2) if i < len(cands) - 1
-                     else round(cost - acc, 2))
-            acc = round(acc + share, 2)
-            r["jztCost"] = round(float(r.get("jztCost") or 0) + share, 2)
-            r.setdefault("allocFrom", []).append(int(o["skuId"]))
-            _recalc(r)
-        o["jztCost"] = 0.0
-        _recalc(o)
-        info.append({"from": int(o["skuId"]), "name": o.get("itemName") or "",
-                     "category": cat, "cost": round(cost, 2), "to": len(cands)})
-    rows = [r for r in rows
-            if r.get("qty") or float(r.get("jztCost") or 0) > 0 or float(r.get("cpsCost") or 0) > 0]
-    rows.sort(key=lambda x: -(x.get("gross") or 0))
-    return rows, info
+    accs = list(accounts or [])
+    out: dict[int, dict] = {}
 
-
-def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
-               costs: dict | None = None, names: dict | None = None) -> list[dict]:
-    """把商智销量、ERP 成本、CPS/京准通花费拼成利润行（含只有花费没有销量的 SKU）。
-
-    names：花费侧带来的商品名（商智里没有成交的 SKU 靠它显示，否则整行只有一个 SKU 号）。
-    """
-    costs = settings.load_costs() if costs is None else costs
-    model = analyze2.load_cost_model()
-    units = settings.costs_unit_map()
-    rows: dict[int, dict] = {}
-
-    def _ensure(sid: int, name: str = "") -> dict:
-        r = rows.get(sid)
+    def _slot(sid: int, name: str = "") -> dict:
+        r = out.get(sid)
         if r is None:
-            r = {"skuId": sid, "itemName": name or "",
-                 "category": catalog.category_of(name), "qty": 0, "szAmt": 0.0,
-                 "frontPrice": 0.0, "supply": 0.0, "arrival": None,
-                 "grossPerOrder": 0.0, "gross": 0.0,
-                 "cpsCost": 0.0, "jztCost": 0.0, "net": 0.0, "netRate": None,
-                 "costSource": ""}
-            rows[sid] = r
-        elif name and not r["itemName"]:
+            r = {"skuId": int(sid), "itemName": "", "qty": 0, "szAmt": 0.0,
+                 "cpsCost": 0.0, "jztCost": 0.0, "accts": [], "spendAccts": []}
+            out[int(sid)] = r
+        if name and not r["itemName"]:
             r["itemName"] = name
-            r["category"] = catalog.category_of(name)
         return r
 
     for raw in sz_rows:
@@ -181,37 +131,90 @@ def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
         amt = float(raw.get(ind.SZ_AMT) or 0)
         if qty <= 0 and amt <= 0:
             continue
-        r = _ensure(sid, str(raw.get("name") or ""))
-        r["qty"] = qty
-        r["szAmt"] = round(amt, 2)
+        r = _slot(sid, str(raw.get("name") or ""))
+        r["qty"] += qty
+        r["szAmt"] += amt
+        for a in accs:
+            if a not in r["accts"]:
+                r["accts"].append(a)
 
-    # 只有广告花费、没有销量的 SKU 也要出现（那是纯亏）
-    for sid in set(cps) | set(jzt):
-        _ensure(int(sid), (names or {}).get(int(sid), ""))
+    for sid, cost in (cps or {}).items():
+        r = _slot(int(sid), (names or {}).get(int(sid), ""))
+        r["cpsCost"] += float(cost or 0)
+        for a in accs:
+            if a not in r["spendAccts"]:
+                r["spendAccts"].append(a)
+    for sid, cost in (jzt or {}).items():
+        r = _slot(int(sid), (names or {}).get(int(sid), ""))
+        r["jztCost"] += float(cost or 0)
+        for a in accs:
+            if a not in r["spendAccts"]:
+                r["spendAccts"].append(a)
+    return out
 
-    for sid, r in rows.items():
-        qty = int(r["qty"] or 0)
-        front = round(r["szAmt"] / qty, 2) if qty else 0.0
+
+def merge_collected(parts: list[dict]) -> dict[int, dict]:
+    """把多个账号的 collect 结果按 SKU 合并（成交与花费都累加）。"""
+    out: dict[int, dict] = {}
+    for part in parts:
+        for sid, r in (part or {}).items():
+            tgt = out.get(sid)
+            if tgt is None:
+                tgt = {"skuId": int(sid), "itemName": "", "qty": 0, "szAmt": 0.0,
+                       "cpsCost": 0.0, "jztCost": 0.0, "accts": [], "spendAccts": []}
+                out[int(sid)] = tgt
+            if r.get("itemName") and not tgt["itemName"]:
+                tgt["itemName"] = r["itemName"]
+            tgt["qty"] += int(r.get("qty") or 0)
+            tgt["szAmt"] += float(r.get("szAmt") or 0)
+            tgt["cpsCost"] += float(r.get("cpsCost") or 0)
+            tgt["jztCost"] += float(r.get("jztCost") or 0)
+            for a in r.get("accts") or []:
+                if a not in tgt["accts"]:
+                    tgt["accts"].append(a)
+            for a in r.get("spendAccts") or []:
+                if a not in tgt["spendAccts"]:
+                    tgt["spendAccts"].append(a)
+    return out
+
+
+def finalize(collected: dict[int, dict], costs: dict | None = None) -> list[dict]:
+    """把合并后的原始量算成利润行（成本、毛利、净利）。"""
+    costs = settings.load_costs() if costs is None else costs
+    model = analyze2.load_cost_model()
+    units = settings.costs_unit_map()
+    rows: list[dict] = []
+    for sid, c in collected.items():
+        qty = int(c.get("qty") or 0)
+        amt = float(c.get("szAmt") or 0)
+        name = c.get("itemName") or ""
+        front = round(amt / qty, 2) if qty else 0.0
         cp = analyze2.sku_cost_of(str(sid), front, model, costs, units)
         supply = float(cp.get("supply") or 0)
         gpo = float(cp.get("grossPerOrder") or 0)
-        r["frontPrice"] = front
-        r["supply"] = round(supply, 2)
-        r["grossPerOrder"] = round(gpo, 2)
-        r["costSource"] = cp.get("costSource") or ""
-        r["arrival"] = round(qty * supply, 2) if (qty and supply > 0) else None
-        r["gross"] = round(qty * gpo, 2)
-        r["cpsCost"] = round(cps.get(sid, 0.0), 2)
-        r["jztCost"] = round(jzt.get(sid, 0.0), 2)
+        r = {"skuId": int(sid), "itemName": name, "category": catalog.category_of(name),
+             "qty": qty, "szAmt": round(amt, 2), "frontPrice": front,
+             "supply": round(supply, 2),
+             "arrival": round(qty * supply, 2) if (qty and supply > 0) else None,
+             "grossPerOrder": round(gpo, 2), "gross": round(qty * gpo, 2),
+             "cpsCost": round(float(c.get("cpsCost") or 0), 2),
+             "jztCost": round(float(c.get("jztCost") or 0), 2),
+             "costSource": cp.get("costSource") or "",
+             "accts": list(c.get("accts") or []),
+             "spendAccts": list(c.get("spendAccts") or [])}
         _recalc(r)
+        if r["qty"] or r["cpsCost"] or r["jztCost"]:
+            rows.append(r)
+    rows.sort(key=lambda x: -(x.get("gross") or 0))
+    return apply_map(rows)
 
-    out = [r for r in rows.values() if r["qty"] or r["cpsCost"] or r["jztCost"]]
-    out.sort(key=lambda x: -(x["gross"] or 0))
-    out = apply_map(out)            # 1) 人工归并优先
-    out, alloc = allocate_orphans(out)   # 2) 剩余的孤儿花费按成交额分摊
-    for r in out:
-        r["alloc"] = alloc if r.get("allocFrom") else None
-    return out
+
+def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
+               costs: dict | None = None, names: dict | None = None,
+               accounts: list[str] | None = None) -> list[dict]:
+    """单账号口径：商智成交 + CPS/京准通花费 → 利润行（不做自动分摊）。"""
+    got = collect(sz_rows, cps, jzt, names=names, accounts=accounts)
+    return finalize(got, costs=costs)
 
 
 def totals_of(rows: list[dict]) -> dict:
@@ -418,7 +421,8 @@ class ProfitRunner:
         return base / f"profit_{account}_{start}_{end}.json"
 
     def load_cached(self, account: str, start: str, end: str) -> dict | None:
-        fp = self._paths(settings.get_account(account)["key"], start, end)
+        key = account if account == "all" else settings.get_account(account)["key"]
+        fp = self._paths(key, start, end)
         if not fp.exists():
             return None
         try:
@@ -434,9 +438,11 @@ class ProfitRunner:
                 r["category"] = catalog.category_of(r.get("itemName") or "")
         return data
 
-    def run_background(self, account: str, start: str, end: str, force: bool = False) -> dict:
+    def run_background(self, account: str, start: str, end: str, force: bool = False,
+                       accounts: list[str] | None = None) -> dict:
         start, end = norm_range(start, end)
-        key = settings.get_account(account)["key"]
+        keys = [settings.get_account(a)["key"] for a in (accounts or [account])]
+        key = keys[0] if len(keys) == 1 else "all"
         with self._lock:
             if self._state.get("running"):
                 return {"ok": False, "error": "已有「月度利润分析」任务在运行"}
@@ -446,7 +452,7 @@ class ProfitRunner:
                     job_id = cached.get("jobId") or f"profit-cache-{key}-{start}_{end}"
                     self._results[job_id] = cached
                     self._state.update({"running": False, "cached": True, "jobId": job_id,
-                                        "account": key, "range": [start, end],
+                                        "account": key, "accounts": keys, "range": [start, end],
                                         "total": len(cached["rows"]), "done": len(cached["rows"]),
                                         "error": None, "finishedAt": settings.now_iso(),
                                         "message": f"命中本地缓存（{cached.get('savedAt')} 计算），"
@@ -455,15 +461,16 @@ class ProfitRunner:
                             "savedAt": cached.get("savedAt"), "rows": len(cached["rows"])}
             job_id = time.strftime("%Y%m%d%H%M%S") + "-profit-" + key
             self._state.update({"running": True, "cached": False, "jobId": job_id,
-                                "account": key, "range": [start, end], "total": 0, "done": 0,
+                                "account": key, "accounts": keys,
+                                "range": [start, end], "total": 0, "done": 0,
                                 "message": "正在启动浏览器…", "error": None,
                                 "startedAt": settings.now_iso(), "finishedAt": None})
-        t = threading.Thread(target=self._work, args=(job_id, key, start, end),
+        t = threading.Thread(target=self._work, args=(job_id, keys, start, end),
                              name=f"profit-{key}", daemon=True)
         self._thread = t
         t.start()
         return {"ok": True, "cached": False, "jobId": job_id, "account": key,
-                "start": start, "end": end}
+                "accounts": keys, "start": start, "end": end}
 
     def export(self, job_id: str | None = None, account: str | None = None,
                start: str | None = None, end: str | None = None,
@@ -588,72 +595,86 @@ class ProfitRunner:
         with self._lock:
             self._state.update(kw)
 
-    def _work(self, job_id: str, account: str, start: str, end: str) -> None:
+    def _work(self, job_id: str, accounts: list[str], start: str, end: str) -> None:
+        """逐账号抓商智、读花费缓存，最后按 SKU 合并成一张利润表。
+
+        为什么要跨账号：京准通的花费是「谁投的广告」记在谁的账户下，
+        而商智的成交是「谁卖出去的」记在谁的店铺下。实测账号B 的京准通里
+        有主账号的商品（拇指小玉米等）在跑，按 SKU 归集才对得上。
+        """
         pw = ctx = None
         try:
             lock = self._profile_lock
-            self._set(message="等待浏览器登录态空闲…")
-            if not lock.acquire(timeout=600):
-                raise RuntimeError("浏览器登录态被占用（登录/抓取/其他花费任务），请稍后重试")
-            try:
-                self._set(message="正在启动浏览器…")
-                pw, ctx = launch_persistent(headless=True, account=account)
-                page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
-                page.goto(BOARD_PAGE, wait_until="domcontentloaded", timeout=90000)
-                page.wait_for_timeout(8000)
-                if not session_ok(page):
-                    raise RuntimeError("登录态失效：请先到「登录」页扫码，或点控制台的「立即续期」")
+            parts: list[dict] = []
+            notes: list[str] = []
+            per_acc: dict[str, dict] = {}
+            for idx, account in enumerate(accounts, 1):
+                self._set(message=f"等待浏览器登录态（{account}，{idx}/{len(accounts)}）…")
+                if not lock.acquire(timeout=900):
+                    raise RuntimeError("浏览器登录态被占用（登录/抓取/其他任务），请稍后重试")
+                pw = ctx = None
+                try:
+                    self._set(message=f"正在启动浏览器（{account}）…")
+                    pw, ctx = launch_persistent(headless=True, account=account)
+                    page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
+                    page.goto(BOARD_PAGE, wait_until="domcontentloaded", timeout=90000)
+                    page.wait_for_timeout(8000)
+                    if not session_ok(page):
+                        raise RuntimeError(f"{account} 登录态失效：请先到「登录」页扫码，或点控制台的「立即续期」")
 
-                self._set(message=f"正在取商智成交件数（{start} ~ {end}）…")
-                sz_rows = fetch_sz_rows(page, start, end)
-                self._set(total=len(sz_rows), done=0,
-                          message=f"商智返回 {len(sz_rows)} 行，正在读取 ERP 成本与花费缓存…")
-            finally:
-                for closer in (lambda: ctx and ctx.close(), lambda: pw and pw.stop()):
+                    self._set(message=f"正在取商智成交件数（{account}，{start} ~ {end}）…")
+                    sz_rows = fetch_sz_rows(page, start, end)
+                    self._set(message=f"{account} 商智返回 {len(sz_rows)} 行，读取花费缓存…")
+                finally:
+                    for closer in (lambda: ctx and ctx.close(), lambda: pw and pw.stop()):
+                        try:
+                            closer()
+                        except Exception:  # noqa: BLE001
+                            pass
                     try:
-                        closer()
+                        lock.release()
                     except Exception:  # noqa: BLE001
                         pass
-                lock.release()
 
-            notes: list[str] = []
+                cps_data = paycomm.read_cached("cps", account, start, end)
+                jzt_data = paycomm.read_cached("spend", account, start, end)
+                if cps_data is None:
+                    notes.append(f"{account} 的 CPS 花费没有本地缓存（{start} ~ {end}）："
+                                 f"到「CPS花费」页查一次该区间即可。")
+                if cps_data is None and jzt_data is None:
+                    notes.append(f"{account} 没有任何花费缓存，本次只统计成交与毛利。")
+                cps, jzt = _cost_map(cps_data, jzt_data)
+                names: dict[int, str] = {}
+                for src in (jzt_data, cps_data):
+                    for r in (src or {}).get("rows") or []:
+                        try:
+                            sid = int(r.get("skuId") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if sid and r.get("itemName"):
+                            names.setdefault(sid, r["itemName"])
+                per_acc[account] = {"rows": len(sz_rows), "spend": round(sum(jzt.values()), 2)}
+                parts.append(collect(sz_rows, cps, jzt, names=names, accounts=[account]))
+
             self._set(message="正在读取 ERP 到手结算价…")
             costs = settings.load_costs(start, end)
             if not (costs or {}).get("skus"):
                 notes.append("ERP 成本接口没有返回任何 SKU（可能 Token 失效或区间无数据），"
                              "到手结算价按 0 处理，请检查成本接口。")
 
-            cps_data = paycomm.read_cached("cps", account, start, end)
-            jzt_data = paycomm.read_cached("spend", account, start, end)
-            if cps_data is None:
-                notes.append(f"CPS 花费没有本地缓存（{start} ~ {end}）："
-                             f"请到「CPS花费」页查询一次该区间（或相邻月份）再来算。")
-            if jzt_data is None:
-                notes.append(f"京准通花费没有本地缓存（{start} ~ {end}）："
-                             f"请到「京准通花费」页查询一次该区间再来算。")
-            cps, jzt = _cost_map(cps_data, jzt_data)
-            names: dict[int, str] = {}
-            for src in (jzt_data, cps_data):
-                for r in (src or {}).get("rows") or []:
-                    try:
-                        sid = int(r.get("skuId") or 0)
-                    except (TypeError, ValueError):
-                        continue
-                    if sid and r.get("itemName"):
-                        names.setdefault(sid, r["itemName"])
-
-            self._set(message="正在计算到手金额 / 毛利 / 净利…")
-            rows = build_rows(sz_rows, cps, jzt, costs=costs, names=names)
+            self._set(message="正在按 SKU 合并各账号成交与花费…")
+            merged = merge_collected(parts)
+            rows = finalize(merged, costs=costs)
             if not rows:
                 raise RuntimeError("该区间没有任何成交/花费数据（商智可能还没出数，或区间选到了今天）")
 
-            allocated = [r for r in rows if r.get("allocFrom")]
-            if allocated:
-                srcs = sorted({s for r in allocated for s in (r.get("allocFrom") or [])})
-                notes.append(
-                    f"有 {len(srcs)} 个广告实体（全站智能推广的 SPU / 无成交 SKU）在商智里查不到成交，"
-                    f"其花费已按同品类各 SKU 的成交额占比分摊到 {len(allocated)} 行"
-                    f"（明细里标「含分摊」；想指定到某个 SKU 可用行尾的「归并到」）。")
+            if len(accounts) > 1:
+                cross = [r for r in rows if len(set(r.get("accts") or []) | set(r.get("spendAccts") or [])) > 1]
+                if cross:
+                    notes.append(
+                        f"已按 SKU 跨账号合并：{len(cross)} 个 SKU 的成交与广告花费来自不同账号"
+                        f"（例如某账号投了另一个店铺的商品），花费统一归到该 SKU 的成交行上，"
+                        f"因此单账号视图里会看到「有花费没成交」，那是别的账号在卖。")
 
             no_supply = sum(1 for r in rows if not r.get("arrival"))
             if no_supply:
@@ -664,22 +685,27 @@ class ProfitRunner:
                 notes.append(f"成本口径：{src.get('kind')}（{src.get('detail')}）")
 
             totals = totals_of(rows)
-            label = settings.get_account(account).get("label") or account
-            payload = {"jobId": job_id, "account": account, "accountLabel": label,
+            label = " + ".join(settings.get_account(a).get("label") or a for a in accounts)
+            payload = {"jobId": job_id, "account": "all" if len(accounts) > 1 else accounts[0],
+                       "accounts": accounts, "accountLabel": label,
                        "start": start, "end": end, "rows": rows, "totals": totals,
                        "notes": notes, "finishedAt": settings.now_iso(),
-                       "costSource": settings.COSTS_SOURCE,
-                       "hasCps": cps_data is not None, "hasJzt": jzt_data is not None}
+                       "costSource": settings.COSTS_SOURCE, "perAccount": per_acc,
+                       "hasCps": any(paycomm.read_cached("cps", a, start, end) is not None
+                                     for a in accounts),
+                       "hasJzt": any(paycomm.read_cached("spend", a, start, end) is not None
+                                     for a in accounts)}
             self._results[job_id] = payload
             try:
-                self._paths(account, start, end).write_text(
+                self._paths(payload["account"], start, end).write_text(
                     json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             except Exception:  # noqa: BLE001
                 pass
-            self._set(running=False, finishedAt=settings.now_iso(),
-                      total=len(rows), done=len(rows), error=None,
-                      message=(f"完成：{len(rows)} 个 SKU，到手金额 {totals['arrival']:,.2f}，"
+            self._set(running=False, finishedAt=settings.now_iso(), error=None,
+                      total=len(rows), done=len(rows),
+                      message=(f"完成：{len(rows)} 个 SKU（{label}），到手金额 {totals['arrival']:,.2f}，"
                                f"毛利 {totals['gross']:,.2f}，净利 {totals['net']:,.2f} 元"))
         except Exception as exc:  # noqa: BLE001
             self._set(running=False, error=f"{type(exc).__name__}: {exc}",
                       finishedAt=settings.now_iso(), message=f"失败：{exc}")
+
