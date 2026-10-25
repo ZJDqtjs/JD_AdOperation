@@ -100,9 +100,55 @@ def _cost_map(cps_data: dict | None, jzt_data: dict | None) -> tuple[dict, dict]
     return _one(cps_data, "payCommAmount"), _one(jzt_data, "jztCost")
 
 
+def allocate_orphans(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """把「只有广告花费、商智无成交」的行，按成交额分摊给同品类的成交 SKU。
+
+    典型场景：全站智能推广是按 SPU 投放的（spuId 不是成交 SKU），商智里那个 id 没有销量，
+    如果不处理，页面上就会「一个 SKU 纯负数、同款其它 SKU 利润虚高」。
+    人工在页面上做的归并（config/sku_map.json）会先执行，剩下的才在这里分摊。
+    """
+    orphans = [r for r in rows
+               if not r.get("qty") and float(r.get("jztCost") or 0) > 0
+               and not float(r.get("cpsCost") or 0)]
+    if not orphans:
+        return rows, []
+    info: list[dict] = []
+    for o in orphans:
+        cat = o.get("category") or ""
+        if not cat or cat == "未分类":
+            continue
+        cands = [r for r in rows if r.get("qty") and (r.get("category") or "") == cat]
+        if not cands:
+            continue
+        weights = [(float(r.get("szAmt") or 0) or float(r.get("qty") or 0)) for r in cands]
+        total_w = sum(weights)
+        if total_w <= 0:
+            continue
+        cost = float(o.get("jztCost") or 0)
+        acc = 0.0
+        for i, r in enumerate(cands):
+            share = (round(cost * weights[i] / total_w, 2) if i < len(cands) - 1
+                     else round(cost - acc, 2))
+            acc = round(acc + share, 2)
+            r["jztCost"] = round(float(r.get("jztCost") or 0) + share, 2)
+            r.setdefault("allocFrom", []).append(int(o["skuId"]))
+            _recalc(r)
+        o["jztCost"] = 0.0
+        _recalc(o)
+        info.append({"from": int(o["skuId"]), "name": o.get("itemName") or "",
+                     "category": cat, "cost": round(cost, 2), "to": len(cands)})
+    rows = [r for r in rows
+            if r.get("qty") or float(r.get("jztCost") or 0) > 0 or float(r.get("cpsCost") or 0) > 0]
+    rows.sort(key=lambda x: -(x.get("gross") or 0))
+    return rows, info
+
+
 def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
-               costs: dict | None = None) -> list[dict]:
-    """把商智销量、ERP 成本、CPS/京准通花费拼成利润行（含只有花费没有销量的 SKU）。"""
+               costs: dict | None = None, names: dict | None = None) -> list[dict]:
+    """把商智销量、ERP 成本、CPS/京准通花费拼成利润行（含只有花费没有销量的 SKU）。
+
+    names：花费侧带来的商品名（商智里没有成交的 SKU 靠它显示，否则整行只有一个 SKU 号）。
+    """
     costs = settings.load_costs() if costs is None else costs
     model = analyze2.load_cost_model()
     units = settings.costs_unit_map()
@@ -141,7 +187,7 @@ def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
 
     # 只有广告花费、没有销量的 SKU 也要出现（那是纯亏）
     for sid in set(cps) | set(jzt):
-        _ensure(int(sid))
+        _ensure(int(sid), (names or {}).get(int(sid), ""))
 
     for sid, r in rows.items():
         qty = int(r["qty"] or 0)
@@ -157,12 +203,14 @@ def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
         r["gross"] = round(qty * gpo, 2)
         r["cpsCost"] = round(cps.get(sid, 0.0), 2)
         r["jztCost"] = round(jzt.get(sid, 0.0), 2)
-        r["net"] = round(r["gross"] - r["cpsCost"] - r["jztCost"], 2)
-        base = r["arrival"] if r["arrival"] else (r["gross"] if r["gross"] else 0)
-        r["netRate"] = round(r["net"] / base * 100, 2) if base else None
+        _recalc(r)
 
     out = [r for r in rows.values() if r["qty"] or r["cpsCost"] or r["jztCost"]]
     out.sort(key=lambda x: -(x["gross"] or 0))
+    out = apply_map(out)            # 1) 人工归并优先
+    out, alloc = allocate_orphans(out)   # 2) 剩余的孤儿花费按成交额分摊
+    for r in out:
+        r["alloc"] = alloc if r.get("allocFrom") else None
     return out
 
 
@@ -181,6 +229,88 @@ def totals_of(rows: list[dict]) -> dict:
             "cpsCost": _sum("cpsCost"), "jztCost": _sum("jztCost"),
             "net": net, "netRate": net_rate,
             "noSupply": len(rows) - len(with_arr)}
+
+
+# ================================================================ SKU 归并映射
+# 广告实体（智能投放的 sku、全站智能推广的 spu）与商智成交的 sku 往往不是同一个：
+#   例：雪莲果广告挂在 spu 100213359219 上，成交却分在同款其他 sku；
+#       拇指小玉米广告挂在 1 斤装(100092922428)，成交主要在 2 斤装(100024877397)。
+# 因此提供一张人工确认的映射表：广告 SKU → 成交 SKU，把花费并到真正出单的那一行。
+MAPPING_FILE = Path(settings.CONFIG_DIR) / "sku_map.json"
+
+
+def load_map() -> dict[int, int]:
+    try:
+        raw = json.loads(MAPPING_FILE.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[int, int] = {}
+    for k, v in (raw or {}).items():
+        try:
+            out[int(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return {k: v for k, v in out.items() if k != v}
+
+
+def save_map(mp: dict[int, int]) -> None:
+    MAPPING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MAPPING_FILE.with_name(MAPPING_FILE.name + ".tmp")
+    tmp.write_text(json.dumps({str(k): v for k, v in sorted(mp.items())},
+                              ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(MAPPING_FILE)
+
+
+def _recalc(r: dict) -> None:
+    r["net"] = round(float(r.get("gross") or 0) - float(r.get("cpsCost") or 0)
+                     - float(r.get("jztCost") or 0), 2)
+    base = r.get("arrival") if r.get("arrival") else (r.get("gross") if r.get("gross") else 0)
+    r["netRate"] = round(r["net"] / base * 100, 2) if base else None
+
+
+def apply_map(rows: list[dict], mp: dict[int, int] | None = None) -> list[dict]:
+    """把映射表里「广告 SKU」的京准通花费并到「成交 SKU」，返回合并后的行列表。"""
+    mp = load_map() if mp is None else mp
+    if not mp:
+        return rows
+    idx = {int(r["skuId"]): r for r in rows}
+    for src, dst in mp.items():
+        s, t = idx.get(int(src)), idx.get(int(dst))
+        if not s or not t or s is t:
+            continue
+        cost = float(s.get("jztCost") or 0)
+        if cost:
+            t["jztCost"] = round(float(t.get("jztCost") or 0) + cost, 2)
+            s["jztCost"] = 0.0
+            t.setdefault("mergedFrom", []).append(int(src))
+            _recalc(t)
+        _recalc(s)
+        if not s.get("qty") and not s.get("cpsCost") and not float(s.get("jztCost") or 0):
+            rows = [r for r in rows if r is not s]
+    rows.sort(key=lambda x: -(x.get("gross") or 0))
+    return rows
+
+
+def suggest_targets(rows: list[dict], src_sku: int, limit: int = 5) -> list[dict]:
+    """给「纯广告行」推荐同品类里有成交的 SKU（按商品名相似度排序）。"""
+    import difflib
+    src = next((r for r in rows if int(r["skuId"]) == int(src_sku)), None)
+    if not src:
+        return []
+    base = catalog.clean_name(src.get("itemName") or "") or (src.get("category") or "")
+    cands = []
+    for r in rows:
+        if int(r["skuId"]) == int(src_sku) or not r.get("qty"):
+            continue
+        if (r.get("category") or "") != (src.get("category") or "") and src.get("category"):
+            continue
+        name = catalog.clean_name(r.get("itemName") or "") or (r.get("itemName") or "")
+        score = difflib.SequenceMatcher(None, base, name).ratio() if base else 0.0
+        cands.append({"skuId": int(r["skuId"]), "itemName": r.get("itemName") or "",
+                      "qty": r.get("qty"), "gross": r.get("gross"),
+                      "score": round(score, 3)})
+    cands.sort(key=lambda x: (-x["score"], -(x["qty"] or 0)))
+    return cands[:limit]
 
 
 # ================================================================ Excel
@@ -279,6 +409,7 @@ class ProfitRunner:
             state["rows"] = data.get("rows") or []
             state["totals"] = data.get("totals") or {}
             state["notes"] = data.get("notes") or []
+            state["merges"] = data.get("merges") or []
         return state
 
     def _paths(self, account: str, start: str, end: str) -> Path:
@@ -366,6 +497,92 @@ class ProfitRunner:
         suffix = "_品类" if dim == "cat" else ""
         return xlsx, f"月度利润{suffix}_{data.get('account')}_{data['start']}_{data['end']}.xlsx"
 
+
+    # ---------------- 归并（广告 SKU → 成交 SKU）
+    def _payload(self, job_id: str | None = None, account: str | None = None,
+                 start: str | None = None, end: str | None = None) -> dict | None:
+        data = self._results.get(job_id or "") or None
+        if data is None and account and start and end:
+            data = self.load_cached(account, start, end)
+        return data
+
+    def _persist(self, data: dict) -> None:
+        try:
+            self._paths(data["account"], data["start"], data["end"]).write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def map_cost(self, src: int, dst: int, job_id: str | None = None,
+                 account: str | None = None, start: str | None = None,
+                 end: str | None = None) -> dict:
+        """把 src（广告 SKU）的京准通花费并到 dst（成交 SKU）。"""
+        data = self._payload(job_id, account, start, end)
+        if not data:
+            return {"ok": False, "error": "没有可操作的结果，请先查询一次"}
+        rows = data.get("rows") or []
+        idx = {int(r["skuId"]): r for r in rows}
+        s, t = idx.get(int(src)), idx.get(int(dst))
+        if not s or not t:
+            return {"ok": False, "error": "SKU 不存在（可能已被归并）"}
+        if s is t:
+            return {"ok": False, "error": "不能归并到自己"}
+        cost = float(s.get("jztCost") or 0)
+        if cost <= 0:
+            return {"ok": False, "error": "这个 SKU 没有京准通花费可归并"}
+        t["jztCost"] = round(float(t.get("jztCost") or 0) + cost, 2)
+        s["jztCost"] = 0.0
+        t.setdefault("mergedFrom", []).append(int(src))
+        _recalc(t)
+        _recalc(s)
+        data.setdefault("merges", []).append({"from": int(src), "to": int(dst),
+                                             "cost": round(cost, 2)})
+        if not s.get("qty") and not s.get("cpsCost") and float(s.get("jztCost") or 0) <= 0:
+            rows = [r for r in rows if r is not s]
+        rows.sort(key=lambda x: -(x.get("gross") or 0))
+        data["rows"] = rows
+        data["totals"] = totals_of(rows)
+        mp = load_map()
+        mp[int(src)] = int(dst)
+        save_map(mp)
+        self._persist(data)
+        return {"ok": True, "moved": round(cost, 2), "from": int(src), "to": int(dst)}
+
+    def unmap_cost(self, src: int, job_id: str | None = None, account: str | None = None,
+                   start: str | None = None, end: str | None = None) -> dict:
+        """撤销某条归并（从映射表删除，并把已移动的花费还回去）。"""
+        mp = load_map()
+        dst = mp.pop(int(src), None)
+        if dst is None:
+            return {"ok": False, "error": "没有这条归并记录"}
+        save_map(mp)
+        data = self._payload(job_id, account, start, end)
+        if not data:
+            return {"ok": True, "removed": int(src), "note": "已从映射表删除，重新计算后生效"}
+        rows = data.get("rows") or []
+        moved = 0.0
+        for m in list(data.get("merges") or []):
+            if int(m.get("from", 0)) != int(src):
+                continue
+            moved += float(m.get("cost") or 0)
+            data["merges"].remove(m)
+        t = next((r for r in rows if int(r["skuId"]) == int(dst)), None)
+        if t and moved:
+            t["jztCost"] = round(max(0.0, float(t.get("jztCost") or 0) - moved), 2)
+            _recalc(t)
+            t["mergedFrom"] = [x for x in (t.get("mergedFrom") or []) if int(x) != int(src)]
+        if not any(int(r["skuId"]) == int(src) for r in rows):
+            rows.append({"skuId": int(src), "itemName": "", "category": "未分类", "qty": 0,
+                         "szAmt": 0.0, "frontPrice": 0.0, "supply": 0.0, "arrival": None,
+                         "grossPerOrder": 0.0, "gross": 0.0, "cpsCost": 0.0,
+                         "jztCost": round(moved, 2), "net": round(-moved, 2),
+                         "netRate": None, "costSource": ""})
+        rows.sort(key=lambda x: -(x.get("gross") or 0))
+        data["rows"] = rows
+        data["totals"] = totals_of(rows)
+        self._persist(data)
+        return {"ok": True, "restored": round(moved, 2), "from": int(src), "to": int(dst)}
+
     # ---------------- 内部
     def _set(self, **kw) -> None:
         with self._lock:
@@ -415,11 +632,28 @@ class ProfitRunner:
                 notes.append(f"京准通花费没有本地缓存（{start} ~ {end}）："
                              f"请到「京准通花费」页查询一次该区间再来算。")
             cps, jzt = _cost_map(cps_data, jzt_data)
+            names: dict[int, str] = {}
+            for src in (jzt_data, cps_data):
+                for r in (src or {}).get("rows") or []:
+                    try:
+                        sid = int(r.get("skuId") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if sid and r.get("itemName"):
+                        names.setdefault(sid, r["itemName"])
 
             self._set(message="正在计算到手金额 / 毛利 / 净利…")
-            rows = build_rows(sz_rows, cps, jzt, costs=costs)
+            rows = build_rows(sz_rows, cps, jzt, costs=costs, names=names)
             if not rows:
                 raise RuntimeError("该区间没有任何成交/花费数据（商智可能还没出数，或区间选到了今天）")
+
+            allocated = [r for r in rows if r.get("allocFrom")]
+            if allocated:
+                srcs = sorted({s for r in allocated for s in (r.get("allocFrom") or [])})
+                notes.append(
+                    f"有 {len(srcs)} 个广告实体（全站智能推广的 SPU / 无成交 SKU）在商智里查不到成交，"
+                    f"其花费已按同品类各 SKU 的成交额占比分摊到 {len(allocated)} 行"
+                    f"（明细里标「含分摊」；想指定到某个 SKU 可用行尾的「归并到」）。")
 
             no_supply = sum(1 for r in rows if not r.get("arrival"))
             if no_supply:
