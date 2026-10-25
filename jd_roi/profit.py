@@ -217,6 +217,97 @@ def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
     return finalize(got, costs=costs)
 
 
+
+def attribute_spend(parts: dict[str, dict[int, dict]]) -> dict[int, dict]:
+    """把各账号的花费按 SKU 归给「真正卖出这个 SKU 的账号」。
+
+    规则（按优先级）：
+      1) SKU 在哪个账号有商智成交（件数最多者；件数相同看成交额）→ 该 SKU 的
+         CPS / 京准通花费整体归到那个账号；
+      2) 所有账号都没有成交（例如全站智能推广的 spu）→ 各自保留自己投的那份，不合并。
+    返回 {skuId: {"owner", "cps", "jzt", "byAcc": {acc: {"cps", "jzt"}}}}。
+    """
+    owners: dict[int, str] = {}
+    weights: dict[int, tuple] = {}
+    for acc, coll in parts.items():
+        for sid, c in coll.items():
+            qty = int(c.get("qty") or 0)
+            if qty <= 0:
+                continue
+            w = (qty, float(c.get("szAmt") or 0))
+            if sid not in weights or w > weights[sid]:
+                weights[sid] = w
+                owners[sid] = acc
+
+    out: dict[int, dict] = {}
+    for acc, coll in parts.items():
+        for sid, c in coll.items():
+            slot = out.setdefault(int(sid), {"cps": 0.0, "jzt": 0.0,
+                                             "byAcc": {}, "spendAccts": []})
+            cps = float(c.get("cpsCost") or 0)
+            jzt = float(c.get("jztCost") or 0)
+            slot["cps"] += cps
+            slot["jzt"] += jzt
+            slot["byAcc"][acc] = {"cps": round(cps, 2), "jzt": round(jzt, 2)}
+            if cps or jzt:
+                slot["spendAccts"].append(acc)
+    for sid, slot in out.items():
+        slot["owner"] = owners.get(sid) or ""
+        slot["cps"] = round(slot["cps"], 2)
+        slot["jzt"] = round(slot["jzt"], 2)
+    return out
+
+
+def rows_for_account(parts: dict[str, dict[int, dict]], attributed: dict[int, dict],
+                     acc: str, costs: dict | None = None) -> list[dict]:
+    """生成某个账号的利润行：成交取自己的，花费取「归集到自己」的那份。
+
+    有归属人的 SKU：花费整体归到成交账号（只算一次）；
+    没有归属人的 SKU：各账号只保留自己投的那份，避免两张表重复计算。
+    """
+    coll = parts.get(acc) or {}
+    merged: dict[int, dict] = {}
+
+    def _put(sid: int, item: dict) -> None:
+        merged[int(sid)] = item
+
+    for sid, c in coll.items():
+        slot = attributed.get(int(sid)) or {}
+        owner = slot.get("owner") or ""
+        if owner:
+            mine = (owner == acc)
+            cps = float(slot.get("cps") or 0) if mine else 0.0
+            jzt = float(slot.get("jzt") or 0) if mine else 0.0
+        else:
+            own = (slot.get("byAcc") or {}).get(acc) or {}
+            cps = float(own.get("cps") or 0)
+            jzt = float(own.get("jzt") or 0)
+        _put(sid, {"skuId": int(sid), "itemName": c.get("itemName") or "",
+                   "qty": int(c.get("qty") or 0), "szAmt": float(c.get("szAmt") or 0),
+                   "cpsCost": cps, "jztCost": jzt,
+                   "accts": list(c.get("accts") or [acc]),
+                   "spendAccts": list(slot.get("spendAccts") or [acc])})
+
+    # 花费归到本账号、但本账号商智里没有这个 SKU（极少见）：补一行，便于看到这笔钱
+    for sid, slot in attributed.items():
+        if sid in merged:
+            continue
+        owner = slot.get("owner") or ""
+        if owner and owner != acc:
+            continue
+        if not owner:
+            own = (slot.get("byAcc") or {}).get(acc) or {}
+            cps, jzt = float(own.get("cps") or 0), float(own.get("jzt") or 0)
+        else:
+            cps, jzt = float(slot.get("cps") or 0), float(slot.get("jzt") or 0)
+        if not cps and not jzt:
+            continue
+        _put(sid, {"skuId": int(sid), "itemName": "", "qty": 0, "szAmt": 0.0,
+                   "cpsCost": cps, "jztCost": jzt,
+                   "accts": [], "spendAccts": list(slot.get("spendAccts") or [])})
+    return finalize(merged, costs=costs)
+
+
 def totals_of(rows: list[dict]) -> dict:
     def _sum(k, subset=None):
         return round(sum(float(r.get(k) or 0) for r in (subset if subset is not None else rows)), 2)
@@ -413,12 +504,15 @@ class ProfitRunner:
             state["totals"] = data.get("totals") or {}
             state["notes"] = data.get("notes") or []
             state["merges"] = data.get("merges") or []
+            state["byAccount"] = data.get("byAccount") or {}
+            state["accounts"] = data.get("accounts") or []
         return state
 
     def _paths(self, account: str, start: str, end: str) -> Path:
+        """缓存按「区间」一份（里面同时存各账号的表），切换账号不用重新抓。"""
         base = Path(settings.DATA_DIR) / "reports"
         base.mkdir(parents=True, exist_ok=True)
-        return base / f"profit_{account}_{start}_{end}.json"
+        return base / f"profit_{start}_{end}.json"
 
     def load_cached(self, account: str, start: str, end: str) -> dict | None:
         key = account if account == "all" else settings.get_account(account)["key"]
@@ -433,7 +527,12 @@ class ProfitRunner:
             return None
         st = fp.stat()
         data["savedAt"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
-        for r in data["rows"]:
+        by = data.get("byAccount") or {}
+        if key != "all" and key in by:
+            data = dict(data, rows=by[key].get("rows") or [],
+                        totals=by[key].get("totals") or {},
+                        account=key, accountLabel=by[key].get("label") or key)
+        for r in data.get("rows") or []:
             if not r.get("category"):
                 r["category"] = catalog.category_of(r.get("itemName") or "")
         return data
@@ -447,7 +546,7 @@ class ProfitRunner:
             if self._state.get("running"):
                 return {"ok": False, "error": "已有「月度利润分析」任务在运行"}
             if not force:
-                cached = self.load_cached(key, start, end)
+                cached = self.load_cached(account, start, end)
                 if cached:
                     job_id = cached.get("jobId") or f"profit-cache-{key}-{start}_{end}"
                     self._results[job_id] = cached
@@ -513,6 +612,25 @@ class ProfitRunner:
             data = self.load_cached(account, start, end)
         return data
 
+    @staticmethod
+    def acc_rows(data: dict | None, account: str | None) -> list[dict]:
+        """payload 里取某账号的行；没有 byAccount 时退回 rows。"""
+        if not data:
+            return []
+        by = data.get("byAccount") or {}
+        if account and account in by:
+            return by[account].get("rows") or []
+        return data.get("rows") or []
+
+    def _store(self, data: dict, acc: str | None, rows: list[dict]) -> None:
+        by = data.get("byAccount") or {}
+        if acc and acc in by:
+            by[acc]["rows"] = rows
+            by[acc]["totals"] = totals_of(rows)
+        if not acc or acc == data.get("account"):
+            data["rows"] = rows
+            data["totals"] = totals_of(rows)
+
     def _persist(self, data: dict) -> None:
         try:
             self._paths(data["account"], data["start"], data["end"]).write_text(
@@ -527,7 +645,8 @@ class ProfitRunner:
         data = self._payload(job_id, account, start, end)
         if not data:
             return {"ok": False, "error": "没有可操作的结果，请先查询一次"}
-        rows = data.get("rows") or []
+        acc = account or data.get("account")
+        rows = self.acc_rows(data, acc)
         idx = {int(r["skuId"]): r for r in rows}
         s, t = idx.get(int(src)), idx.get(int(dst))
         if not s or not t:
@@ -547,8 +666,7 @@ class ProfitRunner:
         if not s.get("qty") and not s.get("cpsCost") and float(s.get("jztCost") or 0) <= 0:
             rows = [r for r in rows if r is not s]
         rows.sort(key=lambda x: -(x.get("gross") or 0))
-        data["rows"] = rows
-        data["totals"] = totals_of(rows)
+        self._store(data, acc, rows)
         mp = load_map()
         mp[int(src)] = int(dst)
         save_map(mp)
@@ -566,7 +684,8 @@ class ProfitRunner:
         data = self._payload(job_id, account, start, end)
         if not data:
             return {"ok": True, "removed": int(src), "note": "已从映射表删除，重新计算后生效"}
-        rows = data.get("rows") or []
+        acc = account or data.get("account")
+        rows = self.acc_rows(data, acc)
         moved = 0.0
         for m in list(data.get("merges") or []):
             if int(m.get("from", 0)) != int(src):
@@ -585,8 +704,7 @@ class ProfitRunner:
                          "jztCost": round(moved, 2), "net": round(-moved, 2),
                          "netRate": None, "costSource": ""})
         rows.sort(key=lambda x: -(x.get("gross") or 0))
-        data["rows"] = rows
-        data["totals"] = totals_of(rows)
+        self._store(data, acc, rows)
         self._persist(data)
         return {"ok": True, "restored": round(moved, 2), "from": int(src), "to": int(dst)}
 
@@ -605,7 +723,7 @@ class ProfitRunner:
         pw = ctx = None
         try:
             lock = self._profile_lock
-            parts: list[dict] = []
+            parts: dict[str, dict] = {}
             notes: list[str] = []
             per_acc: dict[str, dict] = {}
             for idx, account in enumerate(accounts, 1):
@@ -654,7 +772,7 @@ class ProfitRunner:
                         if sid and r.get("itemName"):
                             names.setdefault(sid, r["itemName"])
                 per_acc[account] = {"rows": len(sz_rows), "spend": round(sum(jzt.values()), 2)}
-                parts.append(collect(sz_rows, cps, jzt, names=names, accounts=[account]))
+                parts[account] = collect(sz_rows, cps, jzt, names=names, accounts=[account])
 
             self._set(message="正在读取 ERP 到手结算价…")
             costs = settings.load_costs(start, end)
@@ -662,21 +780,28 @@ class ProfitRunner:
                 notes.append("ERP 成本接口没有返回任何 SKU（可能 Token 失效或区间无数据），"
                              "到手结算价按 0 处理，请检查成本接口。")
 
-            self._set(message="正在按 SKU 合并各账号成交与花费…")
-            merged = merge_collected(parts)
-            rows = finalize(merged, costs=costs)
-            if not rows:
+            self._set(message="正在按 SKU 把花费归集到对应账号…")
+            attributed = attribute_spend(parts)
+            by_account: dict[str, dict] = {}
+            for acc in accounts:
+                rows = rows_for_account(parts, attributed, acc, costs=costs)
+                by_account[acc] = {"rows": rows, "totals": totals_of(rows),
+                                   "label": settings.get_account(acc).get("label") or acc}
+            main_acc = accounts[0]
+            rows = by_account[main_acc]["rows"]
+            totals = by_account[main_acc]["totals"]
+            if not any(b["rows"] for b in by_account.values()):
                 raise RuntimeError("该区间没有任何成交/花费数据（商智可能还没出数，或区间选到了今天）")
 
-            if len(accounts) > 1:
-                cross = [r for r in rows if len(set(r.get("accts") or []) | set(r.get("spendAccts") or [])) > 1]
-                if cross:
-                    notes.append(
-                        f"已按 SKU 跨账号合并：{len(cross)} 个 SKU 的成交与广告花费来自不同账号"
-                        f"（例如某账号投了另一个店铺的商品），花费统一归到该 SKU 的成交行上，"
-                        f"因此单账号视图里会看到「有花费没成交」，那是别的账号在卖。")
+            moved = [sid for sid, v in attributed.items()
+                     if v.get("owner") and any(a != v["owner"] for a in (v.get("spendAccts") or []))]
+            if moved:
+                notes.append(
+                    f"已按 SKU 归集：{len(moved)} 个 SKU 的广告花费由投放账号归到了一直出单的账号"
+                    f"（例如账号B 投主账号的商品，这笔钱记在主账号那一行），"
+                    f"所以两个账号的利润表都能对上，不会再出现「有花费没成交」的虚行。")
 
-            no_supply = sum(1 for r in rows if not r.get("arrival"))
+            no_supply = sum(1 for b in by_account.values() for r in b["rows"] if not r.get("arrival"))
             if no_supply:
                 notes.append(f"{no_supply} 个 SKU 在 ERP 里查不到到手结算价：到手金额留空、"
                              f"毛利按全店口径估算，净利率只按有到手结算价的 SKU 计算。")
@@ -684,27 +809,24 @@ class ProfitRunner:
             if src and src.get("kind") and src.get("kind") != "供货方接口":
                 notes.append(f"成本口径：{src.get('kind')}（{src.get('detail')}）")
 
-            totals = totals_of(rows)
-            label = " + ".join(settings.get_account(a).get("label") or a for a in accounts)
-            payload = {"jobId": job_id, "account": "all" if len(accounts) > 1 else accounts[0],
-                       "accounts": accounts, "accountLabel": label,
-                       "start": start, "end": end, "rows": rows, "totals": totals,
+            label = " + ".join(b["label"] for b in by_account.values())
+            payload = {"jobId": job_id, "account": main_acc, "accounts": accounts,
+                       "accountLabel": label, "start": start, "end": end,
+                       "rows": rows, "totals": totals, "byAccount": by_account,
+                       "owner": {str(k): v.get("owner") for k, v in attributed.items()
+                                 if v.get("owner")},
                        "notes": notes, "finishedAt": settings.now_iso(),
-                       "costSource": settings.COSTS_SOURCE, "perAccount": per_acc,
-                       "hasCps": any(paycomm.read_cached("cps", a, start, end) is not None
-                                     for a in accounts),
-                       "hasJzt": any(paycomm.read_cached("spend", a, start, end) is not None
-                                     for a in accounts)}
+                       "costSource": settings.COSTS_SOURCE, "perAccount": per_acc}
             self._results[job_id] = payload
             try:
-                self._paths(payload["account"], start, end).write_text(
+                self._paths(main_acc, start, end).write_text(
                     json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             except Exception:  # noqa: BLE001
                 pass
             self._set(running=False, finishedAt=settings.now_iso(), error=None,
                       total=len(rows), done=len(rows),
-                      message=(f"完成：{len(rows)} 个 SKU（{label}），到手金额 {totals['arrival']:,.2f}，"
-                               f"毛利 {totals['gross']:,.2f}，净利 {totals['net']:,.2f} 元"))
+                      message=(f"完成：{label} 各一张表（共 {sum(len(b['rows']) for b in by_account.values())} 行），"
+                               f"{by_account[main_acc]['label']} 净利 {totals['net']:,.2f} 元"))
         except Exception as exc:  # noqa: BLE001
             self._set(running=False, error=f"{type(exc).__name__}: {exc}",
                       finishedAt=settings.now_iso(), message=f"失败：{exc}")

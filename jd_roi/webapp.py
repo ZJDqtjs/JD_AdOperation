@@ -1447,7 +1447,7 @@ var KPIS = INIT.kpis || [];
 var RATIO = INIT.ratioKeys || [];
 var LBL = {}, TYP = {};
 FIELDS.forEach(function(f){ LBL[f[0]] = f[1]; TYP[f[0]] = f[2]; });
-var DIM = 'sku', JOB = null, ROWS = [], TOTALS = {}, MERGES = [], SORT = {k:'gross', d:-1}, TIMER = null;
+var DIM = 'sku', JOB = null, ROWS = [], TOTALS = {}, MERGES = [], DATA = {}, SORT = {k:'gross', d:-1}, TIMER = null;
 var FAILS = 0;
 
 function $(id){ return document.getElementById(id); }
@@ -1636,6 +1636,16 @@ function renderNotes(notes){
     + notes.map(function(n){ return '<li>'+esc(n)+'</li>'; }).join('') + '</ul>';
 }
 function showTable(){ $('pfTableCard').style.display=''; $('pfExport').disabled=false; render(); }
+function applyAcc(){
+  var b = DATA[$('pfAcc').value];
+  if(!b){ return; }
+  ROWS = b.rows || [];
+  TOTALS = b.totals || {};
+  MERGES = b.merges || MERGES;
+  if(ROWS.length){ showTable(); }
+  else { $('pfTableCard').style.display='none'; msg('该账号在这个区间没有数据'); }
+}
+function switchAcc(){ if(Object.keys(DATA).length){ applyAcc(); } else { poll(); } }
 
 function poll(){
   fetch(API + '/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
@@ -1661,9 +1671,16 @@ function poll(){
         msg('本页最近一次结果是 ' + rg[0] + ' ~ ' + rg[1] + '；当前区间点「查询」即可（有缓存秒出）');
         return;
       }
-      JOB = j.jobId; ROWS = j.rows; TOTALS = j.totals || {}; MERGES = j.merges || [];
+      JOB = j.jobId;
+      DATA = j.byAccount || {};
+      MERGES = j.merges || [];
       renderNotes(j.notes || []);
-      showTable();
+      if(Object.keys(DATA).length){
+        if(!DATA[$('pfAcc').value]){ $('pfAcc').value = Object.keys(DATA)[0]; }
+        applyAcc();
+      } else {
+        ROWS = j.rows || []; TOTALS = j.totals || {}; showTable();
+      }
     }
   }).catch(function(e){
     FAILS += 1;
@@ -1715,7 +1732,7 @@ function sort(k){
   render();
 }
 window.PF = {run:run, refetch:refetch, exp:exp, dim:dim, sort:sort, render:render,
-             mapTo:mapTo, unmapFrom:unmapFrom};
+             mapTo:mapTo, unmapFrom:unmapFrom, switchAcc:switchAcc};
 function boot(){
   poll();
   $('pfTable').addEventListener('click', function(e){
@@ -1747,7 +1764,7 @@ def profit_page(request: Request):
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = q.get("account") or settings.MAIN_ACCOUNT
-    if acc != "all" and acc not in keys:
+    if acc not in keys:
         acc = settings.MAIN_ACCOUNT
     start, end = _last_month_range()
     if q.get("start") and q.get("end"):
@@ -1755,10 +1772,8 @@ def profit_page(request: Request):
             start, end = profit.norm_range(q.get("start"), q.get("end"))
         except ValueError:
             pass
-    opts = ('<option value="all"' + (' selected' if acc == "all" else '') + '>'
-            + '全部账号（按 SKU 合并）</option>')
-    opts += "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-                    f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+                   f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
     init = {"api": "/api/profit", "fields": [[k, lab, t] for k, lab, t in profit.FIELDS],
             "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
@@ -1787,7 +1802,7 @@ def profit_page(request: Request):
 
 <div class="card">
   <div class="toolbar">
-    <label class="fld">账号 <select id="pfAcc">{opts}</select></label>
+    <label class="fld">账号 <select id="pfAcc" onchange="PF.switchAcc()">{opts}</select></label>
     <label class="fld">起 <input type="date" id="pfStart" value="{_e(start)}"></label>
     <label class="fld">止 <input type="date" id="pfEnd" value="{_e(end)}"></label>
     <button class="btn" id="pfRun" onclick="PF.run()">查询</button>
@@ -1850,11 +1865,10 @@ def api_profit_run(account: str | None = None, start: str = "", end: str = "", f
     """account=all 或 accounts=a,b 时，按 SKU 跨账号合并（花费跟着成交走）。"""
     try:
         wanted = [x for x in (accounts or "").split(",") if x.strip()]
-        if account == "all" or len(wanted) > 1:
-            keys = wanted or [a["key"] for a in settings.ACCOUNTS]
-            return _profit.run_background(keys[0], start, end, force=bool(force), accounts=keys)
-        return _profit.run_background(account or settings.MAIN_ACCOUNT, start, end,
-                                      force=bool(force))
+        keys = wanted or [a["key"] for a in settings.ACCOUNTS]
+        if not keys:
+            return {"ok": False, "error": "没有可用的账号"}
+        return _profit.run_background(keys[0], start, end, force=bool(force), accounts=keys)
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -1874,7 +1888,7 @@ def api_profit_suggest(job: str | None = None, account: str | None = None,
     data = _profit._payload(job, account, start, end)
     if not data:
         return {"ok": False, "error": "先查询一次"}
-    rows = data.get("rows") or []
+    rows = _profit.acc_rows(data, account)
     out = {}
     for r in rows:
         if float(r.get("jztCost") or 0) > 0:
