@@ -912,7 +912,7 @@ function head(){
 }
 function rowsHtml(list){
   var cat = (DIM === 'cat');
-  var span = cols().length + (cat ? 2 : 3);
+  var span = cols().length + 2;
   if(!list.length) return '<tr><td colspan="'+span+'" class="l">没有匹配的行</td></tr>';
   return list.map(function(r){
     var tds = cols().map(function(k){
@@ -1447,7 +1447,7 @@ var KPIS = INIT.kpis || [];
 var RATIO = INIT.ratioKeys || [];
 var LBL = {}, TYP = {};
 FIELDS.forEach(function(f){ LBL[f[0]] = f[1]; TYP[f[0]] = f[2]; });
-var DIM = 'sku', JOB = null, ROWS = [], TOTALS = {}, MERGES = [], DATA = {}, SORT = {k:'gross', d:-1}, TIMER = null;
+var DIM = 'sku', JOB = null, ROWS = [], TOTALS = {}, DATA = {}, SORT = {k:'gross', d:-1}, TIMER = null;
 var FAILS = 0;
 
 function $(id){ return document.getElementById(id); }
@@ -1495,7 +1495,6 @@ function head(){
     var mark = SORT.k===k ? (SORT.d<0?' ↓':' ↑') : '';
     h += '<th class="n noSort" data-key="'+k+'">'+esc(LBL[k]||k)+mark+'</th>';
   });
-  if(!cat) h += '<th class="l noSort">操作</th>';
   return h+'</tr>';
 }
 function rowsHtml(list){
@@ -1509,20 +1508,8 @@ function rowsHtml(list){
     if(cat){
       return '<tr><td class="l"><b>'+esc(r.category)+'</b></td><td class="n">'+r.__n+'</td>'+tds+'</tr>';
     }
-    var op = '';
-    if((r.mergedFrom||[]).length){
-      op = '<span class="hint">已含归并 '+esc((r.mergedFrom||[]).join(','))+'</span>';
-    } else if((r.allocFrom||[]).length){
-      op = '<span class="hint">含分摊 '+esc((r.allocFrom||[]).join(','))+'</span>';
-    } else if(num(r.jztCost) > 0){
-      op = '<select data-src="'+esc(r.skuId)+'" style="max-width:190px;margin-right:6px"></select>'
-         + '<button class="btn sec mini" data-act="map" data-src="'+esc(r.skuId)+'">归并到</button>';
-    } else if(!num(r.qty)){
-      op = '<span class="hint">纯广告无成交</span>';
-    }
     return '<tr><td class="l"><b>'+esc(r.skuId)+'</b></td>'
-      + '<td class="l nm" title="'+esc(accTip(r))+'">'+esc(r.itemName||'—')+'</td>'+tds
-      + '<td class="l">'+op+'</td></tr>';
+      + '<td class="l nm" title="'+esc(accTip(r))+'">'+esc(r.itemName||'—')+'</td>'+tds+'</tr>';
   }).join('');
 }
 function kpisHtml(){
@@ -1573,59 +1560,6 @@ function render(){
   $('pfCount').textContent = cat
     ? ('共 ' + list.length + ' 个品类 / ' + ROWS.length + ' 个 SKU')
     : ('共 ' + ROWS.length + ' 个 SKU' + (list.length!==ROWS.length ? ('，筛选后 '+list.length+' 行') : ''));
-  fillSuggests();
-  renderMerges();
-}
-function fillSuggests(){
-  var sels = document.querySelectorAll('#pfBody select[data-src]');
-  if(!sels.length) return;
-  var qs = new URLSearchParams({job: JOB || '', account: $('pfAcc').value,
-    start: $('pfStart').value, end: $('pfEnd').value});
-  fetch(API + '/suggest?' + qs.toString()).then(function(r){ return r.json(); }).then(function(j){
-    if(!j.ok) return;
-    var sg = j.suggest || {};
-    Array.prototype.forEach.call(document.querySelectorAll('#pfBody select[data-src]'), function(sel){
-      var list = sg[sel.getAttribute('data-src')] || [];
-      sel.innerHTML = list.length
-        ? list.map(function(c){
-            return '<option value="'+c.skuId+'">'+esc(c.skuId+' · '+(c.itemName||'').slice(0,14)+' · '+c.qty+'件')+'</option>';
-          }).join('')
-        : '<option value="">（同品类没有可归并的成交 SKU）</option>';
-    });
-  }).catch(function(){});
-}
-function renderMerges(){
-  var card = $('pfMergeCard');
-  if(!card) return;
-  if(!MERGES.length){ card.style.display='none'; return; }
-  card.style.display = '';
-  $('pfMergeBody').innerHTML = MERGES.map(function(m){
-    return '<tr><td class="l">'+esc(m.from)+'</td><td class="l">'+esc(m.to)+'</td>'
-      + '<td class="n">'+fmt(m.cost,'money')+'</td>'
-      + '<td class="n"><button class="btn ghost mini" data-act="unmap" data-src="'+esc(m.from)+'">撤销</button></td></tr>';
-  }).join('');
-}
-function mapTo(src){
-  var sel = document.querySelector('#pfBody select[data-src="'+src+'"]');
-  var dst = sel && sel.value;
-  if(!dst){ msg('没有可归并的目标 SKU（同品类暂无成交）','bad'); return; }
-  var qs = new URLSearchParams({from_sku: src, to_sku: dst, job: JOB || '',
-    account: $('pfAcc').value, start: $('pfStart').value, end: $('pfEnd').value});
-  fetch(API + '/map?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
-    .then(function(j){
-      if(!j.ok){ msg('归并失败：'+(j.error||''),'bad'); return; }
-      msg('已把 '+j.from+' 的 '+fmt(j.moved,'money')+' 元花费归并到 '+j.to,'ok');
-      poll();
-    }).catch(function(e){ msg('归并失败 '+e,'bad'); });
-}
-function unmapFrom(src){
-  var qs = new URLSearchParams({from_sku: src, job: JOB || '',
-    account: $('pfAcc').value, start: $('pfStart').value, end: $('pfEnd').value});
-  fetch(API + '/unmap?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
-    .then(function(j){
-      msg(j.ok ? ('已撤销归并 '+src) : ('撤销失败：'+(j.error||'')), j.ok ? 'ok' : 'bad');
-      poll();
-    }).catch(function(e){ msg('撤销失败 '+e,'bad'); });
 }
 function renderNotes(notes){
   var el = $('pfNotes');
@@ -1641,7 +1575,6 @@ function applyAcc(){
   if(!b){ return; }
   ROWS = b.rows || [];
   TOTALS = b.totals || {};
-  MERGES = b.merges || MERGES;
   if(ROWS.length){ showTable(); }
   else { $('pfTableCard').style.display='none'; msg('该账号在这个区间没有数据'); }
 }
@@ -1673,7 +1606,6 @@ function poll(){
       }
       JOB = j.jobId;
       DATA = j.byAccount || {};
-      MERGES = j.merges || [];
       renderNotes(j.notes || []);
       if(Object.keys(DATA).length){
         if(!DATA[$('pfAcc').value]){ $('pfAcc').value = Object.keys(DATA)[0]; }
@@ -1732,26 +1664,14 @@ function sort(k){
   render();
 }
 window.PF = {run:run, refetch:refetch, exp:exp, dim:dim, sort:sort, render:render,
-             mapTo:mapTo, unmapFrom:unmapFrom, switchAcc:switchAcc};
+             switchAcc:switchAcc};
 function boot(){
   poll();
   $('pfTable').addEventListener('click', function(e){
-    var b = e.target.closest('button[data-act]');
-    if(b){
-      var src = b.getAttribute('data-src');
-      if(b.getAttribute('data-act') === 'map') mapTo(src);
-      return;
-    }
     var th = e.target.closest('th');
     if(!th || !th.getAttribute('data-key')) return;
     sort(th.getAttribute('data-key'));
   });
-  if($('pfMergeCard')){
-    $('pfMergeCard').addEventListener('click', function(e){
-      var b = e.target.closest('button[data-act]');
-      if(b && b.getAttribute('data-act') === 'unmap') unmapFrom(b.getAttribute('data-src'));
-    });
-  }
 }
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
@@ -1831,17 +1751,6 @@ def profit_page(request: Request):
   </div>
 </div>
 
-<div class="card" id="pfMergeCard" style="display:none">
-  <h2>已归并的花费 <span class="tagline">广告 SKU 的花费并到了成交 SKU，可随时撤销</span></h2>
-  <p class="hint">广告实体（智能投放的 SKU、全站智能推广的 SPU）与商智记的成交 SKU 常常不是同一个，
-    这里记录你确认过的归并关系（写入 <code>config/sku_map.json</code>），重新计算后依然生效。</p>
-  <div class="tblwrap short">
-    <table><thead><tr><th class="l noSort">广告 SKU</th><th class="l noSort">成交 SKU</th>
-      <th class="n noSort">归并花费(元)</th><th class="n noSort">操作</th></tr></thead>
-      <tbody id="pfMergeBody"></tbody></table>
-  </div>
-</div>
-
 <div class="note" id="pfNotes" style="display:none;margin-top:16px"></div>
 
 <div class="note" style="margin-top:18px">
@@ -1879,44 +1788,6 @@ def api_profit_status(rows: int = 0):
     snap["ok"] = True
     snap["active"] = snap.pop("running", False)
     return snap
-
-
-@app.get("/api/profit/suggest")
-def api_profit_suggest(job: str | None = None, account: str | None = None,
-                       start: str | None = None, end: str | None = None):
-    """给「有广告花费但没有成交」的 SKU 推荐同品类里正在出单的 SKU（按商品名相似度）。"""
-    data = _profit._payload(job, account, start, end)
-    if not data:
-        return {"ok": False, "error": "先查询一次"}
-    rows = _profit.acc_rows(data, account)
-    out = {}
-    for r in rows:
-        if float(r.get("jztCost") or 0) > 0:
-            out[str(r["skuId"])] = profit.suggest_targets(rows, int(r["skuId"]))
-    return {"ok": True, "suggest": out}
-
-
-@app.post("/api/profit/map")
-def api_profit_map(from_sku: int = 0, to_sku: int = 0, job: str | None = None,
-                   account: str | None = None, start: str | None = None,
-                   end: str | None = None):
-    """把「广告 SKU」的京准通花费并到「成交 SKU」（写 config/sku_map.json，可撤销）。"""
-    if not from_sku or not to_sku:
-        return {"ok": False, "error": "缺少 from_sku / to_sku"}
-    return _profit.map_cost(from_sku, to_sku, job, account, start, end)
-
-
-@app.post("/api/profit/unmap")
-def api_profit_unmap(from_sku: int = 0, job: str | None = None, account: str | None = None,
-                     start: str | None = None, end: str | None = None):
-    if not from_sku:
-        return {"ok": False, "error": "缺少 from_sku"}
-    return _profit.unmap_cost(from_sku, job, account, start, end)
-
-
-@app.get("/api/profit/map")
-def api_profit_map_list():
-    return {"ok": True, "map": {str(k): v for k, v in profit.load_map().items()}}
 
 
 @app.get("/api/profit/export")
