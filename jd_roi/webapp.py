@@ -50,7 +50,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                Response, StreamingResponse)
 
 from . import (aijobs, ai_page, analyze2, analyze_ai, config, dailystore as ds,
-               paycomm, report2, scrape_day, settings)
+               paycomm, profit, report2, scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -1420,6 +1420,355 @@ def api_paycomm_spend_cache_delete(account: str | None = None, start: str = "", 
     return _paycomm_spend.delete_cache(account, start, end)
 
 
+# ================================================================ 月度利润分析
+# 商智成交件数 × ERP 到手结算价 / 毛利每件，再扣 CPS 与京准通花费 → 净利。
+# 取数与计算在 jd_roi/profit.py，这里只做页面与接口。
+PROFIT_WEB_KEYS = ["qty", "frontPrice", "supply", "arrival", "grossPerOrder",
+                   "gross", "cpsCost", "jztCost", "net", "netRate"]
+
+PROFIT_KPIS = [
+    {"label": "SKU 数", "key": None, "type": "int"},
+    {"label": "成交件数", "key": "qty", "type": "int"},
+    {"label": "到手金额", "key": "arrival", "type": "money", "sub": "件数 × ERP 到手结算价"},
+    {"label": "毛利", "key": "gross", "type": "money", "sub": "件数 × 毛利/件（未扣广告）"},
+    {"label": "CPS 花费", "key": "cpsCost", "type": "money"},
+    {"label": "京准通花费", "key": "jztCost", "type": "money"},
+    {"label": "净利", "key": "net", "type": "money", "subKind": "netRate"},
+]
+
+PROFIT_JS = r"""
+(function(){
+var INIT = window.PC_INIT || {};
+var API = INIT.api || '/api/profit';
+var FIELDS = INIT.fields || [];
+var WEB = INIT.webKeys || [];
+var KPIS = INIT.kpis || [];
+var RATIO = INIT.ratioKeys || [];
+var LBL = {}, TYP = {};
+FIELDS.forEach(function(f){ LBL[f[0]] = f[1]; TYP[f[0]] = f[2]; });
+var DIM = 'sku', JOB = null, ROWS = [], TOTALS = {}, SORT = {k:'gross', d:-1}, TIMER = null;
+var FAILS = 0;
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function num(v){ if(v===null||v===undefined||v==='') return null; var n=Number(v); return isNaN(n)?null:n; }
+function fmt(v,t){ var n=num(v); if(n===null) return '—';
+  if(t==='int') return n.toLocaleString('zh-CN');
+  return n.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function msg(s,kind){ var el=$('pfMsg'); if(!el) return; el.textContent=s||'';
+  el.style.color = kind==='bad' ? 'var(--red)' : (kind==='ok' ? 'var(--greenink)' : 'var(--muted)'); }
+function kpi(lbl,val,sub){ return '<div class="kpi"><div class="lbl">'+esc(lbl)+'</div><div class="val">'+val+'</div>'
+  + (sub?'<div class="sub">'+esc(sub)+'</div>':'') + '</div>'; }
+function cols(){ return (DIM==='cat') ? WEB.filter(function(k){ return RATIO.indexOf(k)<0; }) : WEB; }
+
+function aggregate(list){
+  var map = {}, order = [];
+  list.forEach(function(r){
+    var k = r.category || '未分类';
+    var b = map[k];
+    if(!b){ b = {category:k, __n:0}; cols().forEach(function(kk){ b[kk]=0; }); map[k]=b; order.push(k); }
+    b.__n += 1;
+    cols().forEach(function(kk){ var v = num(r[kk]); if(v!==null) b[kk]+=v; });
+  });
+  return order.map(function(k){
+    var b = map[k];
+    cols().forEach(function(kk){ b[kk] = Math.round(b[kk]*100)/100; });
+    return b;
+  });
+}
+function head(){
+  var cat = (DIM==='cat');
+  var h = cat
+    ? '<tr><th class="l noSort" data-key="category">品类</th><th class="n noSort" data-key="__n">SKU数</th>'
+    : '<tr><th class="l noSort" data-key="skuId">SKU</th><th class="l noSort" data-key="itemName">商品名称</th>';
+  cols().forEach(function(k){
+    var mark = SORT.k===k ? (SORT.d<0?' ↓':' ↑') : '';
+    h += '<th class="n noSort" data-key="'+k+'">'+esc(LBL[k]||k)+mark+'</th>';
+  });
+  return h+'</tr>';
+}
+function rowsHtml(list){
+  var cat = (DIM==='cat');
+  if(!list.length) return '<tr><td colspan="'+(cols().length+2)+'" class="l">没有匹配的行</td></tr>';
+  return list.map(function(r){
+    var tds = cols().map(function(k){
+      var hot = (k==='net') ? ' hot' : '';
+      return '<td class="n'+hot+'">'+fmt(r[k],TYP[k])+'</td>';
+    }).join('');
+    if(cat){
+      return '<tr><td class="l"><b>'+esc(r.category)+'</b></td><td class="n">'+r.__n+'</td>'+tds+'</tr>';
+    }
+    return '<tr><td class="l"><b>'+esc(r.skuId)+'</b></td>'
+      + '<td class="l nm" title="'+esc(r.itemName)+'">'+esc(r.itemName||'—')+'</td>'+tds+'</tr>';
+  }).join('');
+}
+function kpisHtml(){
+  var out = '';
+  KPIS.forEach(function(k){
+    var val, sub = k.sub || '';
+    if(!k.key){
+      val = ROWS.length.toLocaleString('zh-CN');
+    } else {
+      var s = 0;
+      ROWS.forEach(function(r){ s += num(r[k.key]) || 0; });
+      val = (k.type==='int') ? fmt(s,'int') : ('¥' + fmt(s,'money'));
+    }
+    if(k.subKind === 'netRate'){
+      sub = TOTALS.netRate ? ('净利率 ' + fmt(TOTALS.netRate,'num') + '%') : '净利 = 毛利 − 广告花费';
+    }
+    out += kpi(k.label, val, sub);
+  });
+  return out;
+}
+function render(){
+  var cat = (DIM==='cat');
+  var kw = ($('pfFilter').value||'').trim().toLowerCase();
+  var base = cat ? aggregate(ROWS) : ROWS;
+  var list = base.filter(function(r){
+    if(!kw) return true;
+    if(cat) return String(r.category||'').toLowerCase().indexOf(kw) >= 0;
+    return String(r.skuId).indexOf(kw) >= 0
+      || String(r.itemName||'').toLowerCase().indexOf(kw) >= 0
+      || String(r.category||'').toLowerCase().indexOf(kw) >= 0;
+  });
+  list = list.slice().sort(function(a,b){
+    var k = SORT.k;
+    if(cat && (k==='skuId'||k==='itemName'||k==='category')){
+      return String(a.category||'').localeCompare(String(b.category||''))*SORT.d;
+    }
+    if(k==='itemName') return String(a[k]||'').localeCompare(String(b[k]||''))*SORT.d;
+    if(k==='skuId') return String(a.skuId).localeCompare(String(b.skuId))*SORT.d;
+    var x = num(a[k]), y = num(b[k]);
+    if(x===null) x = -1e18;
+    if(y===null) y = -1e18;
+    return (x-y)*SORT.d;
+  });
+  $('pfHead').innerHTML = head();
+  $('pfBody').innerHTML = rowsHtml(list);
+  $('pfKpis').innerHTML = kpisHtml();
+  $('pfKpis').style.display = '';
+  $('pfCount').textContent = cat
+    ? ('共 ' + list.length + ' 个品类 / ' + ROWS.length + ' 个 SKU')
+    : ('共 ' + ROWS.length + ' 个 SKU' + (list.length!==ROWS.length ? ('，筛选后 '+list.length+' 行') : ''));
+}
+function renderNotes(notes){
+  var el = $('pfNotes');
+  if(!el) return;
+  if(!notes || !notes.length){ el.style.display='none'; el.innerHTML=''; return; }
+  el.style.display = '';
+  el.innerHTML = '<b>数据提示</b><ul style="margin:6px 0 0 18px;padding:0">'
+    + notes.map(function(n){ return '<li>'+esc(n)+'</li>'; }).join('') + '</ul>';
+}
+function showTable(){ $('pfTableCard').style.display=''; $('pfExport').disabled=false; render(); }
+
+function poll(){
+  fetch(API + '/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
+    FAILS = 0;
+    if(!j.ok){ msg(j.error||'状态查询失败','bad'); return; }
+    if(j.active){
+      if(j.jobId) JOB = j.jobId;
+      $('pfRun').disabled = true; $('pfRefetch').disabled = true;
+      var pct = j.total ? Math.round(j.done*100/j.total) : 0;
+      $('pfBar').style.width = pct+'%';
+      msg((j.message||'计算中') + (j.total ? ('　'+j.done+'/'+j.total) : ''));
+      clearTimeout(TIMER); TIMER = setTimeout(poll, 1500);
+      return;
+    }
+    $('pfRun').disabled = false; $('pfRefetch').disabled = false;
+    $('pfBar').style.width = j.error ? '0' : '100%';
+    if(j.error){ msg(j.message || j.error, 'bad'); }
+    else if(j.message){ msg(j.message, 'ok'); }
+    if(j.rows && j.rows.length){
+      JOB = j.jobId; ROWS = j.rows; TOTALS = j.totals || {};
+      renderNotes(j.notes || []);
+      showTable();
+    }
+  }).catch(function(e){
+    FAILS += 1;
+    if(FAILS <= 4){ msg('状态查询失败（'+e+'），2 秒后重试…'); clearTimeout(TIMER); TIMER=setTimeout(poll,2000); return; }
+    $('pfRun').disabled = false; $('pfRefetch').disabled = false;
+    msg('与服务端连接中断（常见于服务重启），刷新页面即可恢复', 'bad');
+  });
+}
+function run(force){
+  var acc = $('pfAcc').value, s = $('pfStart').value, e = $('pfEnd').value;
+  if(!s || !e){ msg('请选择起止日期','bad'); return; }
+  if(s > e){ msg('起始日期不能晚于结束日期','bad'); return; }
+  ROWS = []; JOB = null; TOTALS = {};
+  $('pfTableCard').style.display='none';
+  $('pfExport').disabled = true;
+  $('pfRun').disabled = true; $('pfRefetch').disabled = true;
+  $('pfBar').style.width = '0';
+  msg(force ? '正在重新计算（会覆盖该区间缓存）…' : '查询中（先看本地缓存）…');
+  var qs = new URLSearchParams({account: acc, start: s, end: e});
+  if(force) qs.set('force','1');
+  fetch(API + '/run?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ msg('失败：'+(j.error||''),'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; return; }
+      JOB = j.jobId;
+      if(j.cached){ msg('命中本地缓存（'+(j.savedAt||'')+' 计算，共 '+(j.rows||0)+' 个 SKU），未请求商智'); }
+      poll();
+    }).catch(function(e){ msg('请求失败 '+e,'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; });
+}
+function refetch(){
+  if(!confirm('重新计算 ' + $('pfStart').value + ' ~ ' + $('pfEnd').value + '？\n\n会真实请求商智并覆盖该区间缓存。')) return;
+  run(true);
+}
+function exp(){
+  if(!JOB){ msg('还没有数据，先点「查询」','bad'); return; }
+  var qs = new URLSearchParams({job: JOB, account: $('pfAcc').value,
+    start: $('pfStart').value, end: $('pfEnd').value, dim: DIM});
+  window.location = API + '/export?' + qs.toString();
+}
+function dim(k){
+  DIM = (k === 'cat') ? 'cat' : 'sku';
+  $('pfDimSku').className = 'tab' + (DIM==='sku' ? ' active' : '');
+  $('pfDimCat').className = 'tab' + (DIM==='cat' ? ' active' : '');
+  $('pfTableTitle').textContent = (DIM==='cat') ? '品类汇总' : 'SKU 明细';
+  if(ROWS.length) render();
+}
+function sort(k){
+  if(SORT.k === k) SORT.d = -SORT.d;
+  else SORT = {k:k, d:(k==='itemName'||k==='skuId'||k==='category')?1:-1};
+  render();
+}
+window.PF = {run:run, refetch:refetch, exp:exp, dim:dim, sort:sort, render:render};
+function boot(){
+  poll();
+  $('pfTable').addEventListener('click', function(e){
+    var th = e.target.closest('th');
+    if(!th || !th.getAttribute('data-key')) return;
+    sort(th.getAttribute('data-key'));
+  });
+}
+if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
+})();
+"""
+
+
+@app.get("/profit", response_class=HTMLResponse)
+def profit_page(request: Request):
+    q = request.query_params
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = q.get("account") or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    start, end = _last_month_range()
+    if q.get("start") and q.get("end"):
+        try:
+            start, end = profit.norm_range(q.get("start"), q.get("end"))
+        except ValueError:
+            pass
+    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+                   f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    init = {"api": "/api/profit", "fields": [[k, lab, t] for k, lab, t in profit.FIELDS],
+            "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
+            "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>月度利润分析 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+</head><body>
+{report2.navtop("/profit")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}利润</div>
+  <h1>月度利润分析</h1>
+  <div class="metaline">
+    <span>成交件数：商智商品明细</span><span class="dot"></span>
+    <span>到手结算价：ERP 成本接口</span><span class="dot"></span>
+    <span>毛利/件：报表分析口径（未扣广告）</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/paycomm">CPS 花费 →</a>
+    <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
+    <a class="btn ghost mini" href="/login">登录 / 检查登录态</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="card">
+  <div class="toolbar">
+    <label class="fld">账号 <select id="pfAcc">{opts}</select></label>
+    <label class="fld">起 <input type="date" id="pfStart" value="{_e(start)}"></label>
+    <label class="fld">止 <input type="date" id="pfEnd" value="{_e(end)}"></label>
+    <button class="btn" id="pfRun" onclick="PF.run()">查询</button>
+    <button class="btn ghost" id="pfRefetch" onclick="PF.refetch()" title="忽略缓存，重新请求商智">重新计算</button>
+    <button class="btn sec" id="pfExport" onclick="PF.exp()" disabled>导出 Excel</button>
+  </div>
+  <div class="hint" id="pfMsg" style="min-height:20px">选账号与区间后点「查询」：有缓存直接读本地，没有才去商智取数。</div>
+  <div class="pcbar"><i id="pfBar"></i></div>
+</div>
+
+<div class="grid g4" id="pfKpis" style="display:none;margin-top:18px"></div>
+
+<div class="card" id="pfTableCard" style="display:none">
+  <h2><span id="pfTableTitle">SKU 明细</span> <span class="tagline">点表头可换排序</span></h2>
+  <div class="toolbar">
+    <span class="tabs" style="margin:0 12px 8px 0">
+      <button type="button" class="tab active" id="pfDimSku" onclick="PF.dim('sku')">按 SKU</button>
+      <button type="button" class="tab" id="pfDimCat" onclick="PF.dim('cat')">按品类</button>
+    </span>
+    <input id="pfFilter" placeholder="筛选 SKU / 商品名 / 品类" oninput="PF.render()"
+           style="min-width:240px;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
+    <span class="hint" id="pfCount"></span>
+  </div>
+  <div class="tblwrap long">
+    <table id="pfTable"><thead id="pfHead"></thead><tbody id="pfBody"></tbody></table>
+  </div>
+</div>
+
+<div class="note" id="pfNotes" style="display:none;margin-top:16px"></div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>到手金额</b> = 商智成交件数 × ERP「到手结算价 supply」（京东结算给我们的每件金额，已扣点）。</p>
+  <p><b>毛利</b> = 成交件数 × 「毛利/件」= 到手结算价 − 货款 − 运费 − 包材 − 人工（<b>未扣广告</b>），
+     与「分析报表」里的同一列完全同口径。</p>
+  <p><b>净利</b> = 毛利 − CPS 花费（付款佣金）− 京准通花费（智能投放 + 关键词 + 全站智能推广）。
+     两个花费都只读「花费一览」的本地缓存，本页不会额外抓取；缺失时会在上方提示，去对应页面抓一次即可。</p>
+  <p>只有广告花费、没有成交的 SKU 也会列出（毛利 0，净利为负），那是纯亏的钱。</p>
+</div>
+
+</div>
+<script>window.PC_INIT = {json.dumps(init, ensure_ascii=False)};</script>
+<script>{PROFIT_JS}</script>
+</body></html>""")
+
+
+@app.post("/api/profit/run")
+def api_profit_run(account: str | None = None, start: str = "", end: str = "", force: int = 0):
+    try:
+        return _profit.run_background(account or settings.MAIN_ACCOUNT, start, end,
+                                      force=bool(force))
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/profit/status")
+def api_profit_status(rows: int = 0):
+    snap = _profit.snapshot(with_rows=bool(rows))
+    snap["ok"] = True
+    snap["active"] = snap.pop("running", False)
+    return snap
+
+
+@app.get("/api/profit/export")
+def api_profit_export(job: str | None = None, account: str | None = None,
+                      start: str | None = None, end: str | None = None,
+                      dim: str = "sku"):
+    from urllib.parse import quote
+    got = _profit.export(job, account=account, start=start, end=end, dim=dim)
+    if not got:
+        return JSONResponse({"ok": False, "error": "没有可导出的结果，请先查询一次"}, status_code=404)
+    data, fname = got
+    disp = f"attachment; filename=\"profit.xlsx\"; filename*=UTF-8''{quote(fname)}"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
+
+
 # ================================================================ API
 @app.get("/api/status")
 def api_status():
@@ -2433,6 +2782,8 @@ _login = LoginSession()
 # 花费一览两个独立任务（CPS 付款佣金 / 京准通广告花费）：与登录 / 保活共用同一把 Profile 锁
 _paycomm = paycomm.PayCommRunner("cps", profile_lock=_login._profile_lock)
 _paycomm_spend = paycomm.PayCommRunner("spend", profile_lock=_login._profile_lock)
+# 月度利润分析：商智销量 + ERP 成本 + 上面两套花费缓存
+_profit = profit.ProfitRunner(profile_lock=_login._profile_lock)
 
 
 class AiRunner:

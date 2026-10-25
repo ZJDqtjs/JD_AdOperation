@@ -587,6 +587,24 @@ def build_spend_xlsx(rows: list[dict], spend: dict, start: str, end: str,
     return buf.getvalue()
 
 
+def read_cached(mode: str, account: str, start: str, end: str) -> dict | None:
+    """只读本地缓存（精确命中 → 多段拼接），不启动浏览器、不发请求。
+
+    给「月度利润分析」这类要复用花费数据的页面调用。
+    """
+    runner = PayCommRunner(mode)          # 仅用于读文件，不涉及 Profile 锁
+    try:
+        data = runner.cached_result(account, start, end)
+        if data:
+            return data
+        got = runner.use_stitched(account, start, end)
+        if got and got.get("jobId"):
+            return runner._results.get(got["jobId"])
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 # ================================================================ 任务
 MODES = {
     # mode: (磁盘文件名前缀, 页面标题, 按钮文案)
