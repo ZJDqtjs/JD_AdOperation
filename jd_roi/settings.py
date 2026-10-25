@@ -415,20 +415,31 @@ def _costs_fetch(date_from: str = "", date_to: str = "") -> dict:
     import urllib.parse
     import urllib.request
 
-    url = COSTS_URL
+    headers = {"Accept": "application/json", "User-Agent": "jd-roi/1.0"}
+    if COSTS_TOKEN:
+        headers["X-Api-Token"] = COSTS_TOKEN
+
+    def _get(query: dict) -> dict:
+        url = COSTS_URL
+        if query:
+            url = f"{url}{'&' if '?' in url else '?'}{urllib.parse.urlencode(query)}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=COSTS_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     qs = {}
     if date_from:
         qs["date_from"] = date_from
     if date_to:
         qs["date_to"] = date_to
-    if qs:
-        url = f"{url}{'&' if '?' in url else '?'}{urllib.parse.urlencode(qs)}"
-    headers = {"Accept": "application/json", "User-Agent": "jd-roi/1.0"}
-    if COSTS_TOKEN:
-        headers["X-Api-Token"] = COSTS_TOKEN
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=COSTS_TIMEOUT) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        data = _get(qs)
+    except Exception:  # noqa: BLE001
+        # 供货方接口对「同时带 date_from + date_to」的请求会 500（2026-10-25 实测），
+        # 退一步不带区间再取一次（该接口本来就返回整张成本表）
+        if not qs:
+            raise
+        data = _get({})
     if not isinstance(data, dict) or not isinstance(data.get("skus"), dict):
         raise ValueError(f"成本接口返回结构异常：{str(data)[:160]}")
     data["_fetched_at"] = time.time()
@@ -459,7 +470,7 @@ def costs_unit_map() -> dict:
     return out
 
 
-def load_costs(date_from: str = "", date_to: str = "") -> dict:
+def load_costs(date_from: str = "", date_to: str = "", force: bool = False) -> dict:
     """每个 SKU 的真实成本：远端接口优先 → 本地缓存 → config/costs.json → 空（全店口径）。
 
     返回结构：{"default": {...}, "skus": {"<skuId>": {"supply":…, "_goodsCost":…}},
@@ -470,7 +481,7 @@ def load_costs(date_from: str = "", date_to: str = "") -> dict:
     global COSTS_SOURCE
     if COSTS_URL:
         cached = _costs_cache_read()
-        fresh = (cached.get("skus") and
+        fresh = (not force and cached.get("skus") and
                  time_ago(cached.get("_fetched_at")) < COSTS_TTL and
                  (cached.get("_query") or {}).get("date_from", "") == date_from and
                  (cached.get("_query") or {}).get("date_to", "") == date_to)

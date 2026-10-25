@@ -1027,8 +1027,10 @@ function poll(){
     $('pcRefetch').disabled = false;
     $('pcCancel').style.display = 'none';
     $('pcBar').style.width = j.error ? '0' : '100%';
-    if(j.error){ msg(j.message || j.error, 'bad'); }
-    else if(j.message){ msg(j.message, 'ok'); }
+    if(!silent){
+      if(j.error){ msg(j.message || j.error, 'bad'); }
+      else if(j.message){ msg(j.message, 'ok'); }
+    }
     if(j.rows && j.rows.length){
       var rg = j.range || [];
       var same = rg.length ? (rg[0] === $('pcStart').value && rg[1] === $('pcEnd').value) : true;
@@ -1580,23 +1582,25 @@ function applyAcc(){
 }
 function switchAcc(){ if(Object.keys(DATA).length){ applyAcc(); } else { poll(); } }
 
-function poll(){
+function poll(silent){
   fetch(API + '/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
     FAILS = 0;
-    if(!j.ok){ msg(j.error||'状态查询失败','bad'); return; }
+    if(!j.ok){ if(!silent){ msg(j.error||'状态查询失败','bad'); } return; }
     if(j.active){
       if(j.jobId) JOB = j.jobId;
       $('pfRun').disabled = true; $('pfRefetch').disabled = true;
       var pct = j.total ? Math.round(j.done*100/j.total) : 0;
       $('pfBar').style.width = pct+'%';
-      msg((j.message||'计算中') + (j.total ? ('　'+j.done+'/'+j.total) : ''));
+      if(!silent){ msg((j.message||'计算中') + (j.total ? ('　'+j.done+'/'+j.total) : '')); }
       clearTimeout(TIMER); TIMER = setTimeout(poll, 1500);
       return;
     }
     $('pfRun').disabled = false; $('pfRefetch').disabled = false;
     $('pfBar').style.width = j.error ? '0' : '100%';
-    if(j.error){ msg(j.message || j.error, 'bad'); }
-    else if(j.message){ msg(j.message, 'ok'); }
+    if(!silent){
+      if(j.error){ msg(j.message || j.error, 'bad'); }
+      else if(j.message){ msg(j.message, 'ok'); }
+    }
     if(j.rows && j.rows.length){
       var rg = j.range || [];
       var same = rg.length ? (rg[0] === $('pfStart').value && rg[1] === $('pfEnd').value) : true;
@@ -1641,6 +1645,23 @@ function run(force){
       poll();
     }).catch(function(e){ msg('请求失败 '+e,'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; });
 }
+function reprice(){
+  if(!JOB){ msg('还没有结果，先点「查询」','bad'); return; }
+  if(!confirm('只重新拉取 ERP 成本并重算到手价/毛利/净利？\n\n商智成交与 CPS/京准通花费都沿用本地缓存，不会重新抓。')) return;
+  msg('正在重拉 ERP 成本…');
+  $('pfReprice').disabled = true;
+  var qs = new URLSearchParams({job: JOB, account: $('pfAcc').value,
+    start: $('pfStart').value, end: $('pfEnd').value});
+  fetch(API + '/reprice?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
+    .then(function(j){
+      $('pfReprice').disabled = false;
+      if(!j.ok){ msg('更新失败：'+(j.error||''),'bad'); return; }
+      msg('已按最新 ERP 成本重算：' + j.costSku + ' 个 SKU 有成本，'
+          + (j.files || 1) + ' 个区间的表已更新，' + j.changed + ' 行发生变化（接口更新于 '
+          + (j.costUpdatedAt || '—') + '）', 'ok');
+      poll(true);
+    }).catch(function(e){ $('pfReprice').disabled = false; msg('更新失败 '+e,'bad'); });
+}
 function refetch(){
   if(!confirm('重新计算 ' + $('pfStart').value + ' ~ ' + $('pfEnd').value + '？\n\n会真实请求商智并覆盖该区间缓存。')) return;
   run(true);
@@ -1664,7 +1685,7 @@ function sort(k){
   render();
 }
 window.PF = {run:run, refetch:refetch, exp:exp, dim:dim, sort:sort, render:render,
-             switchAcc:switchAcc};
+             switchAcc:switchAcc, reprice:reprice};
 function boot(){
   poll();
   $('pfTable').addEventListener('click', function(e){
@@ -1727,6 +1748,8 @@ def profit_page(request: Request):
     <label class="fld">止 <input type="date" id="pfEnd" value="{_e(end)}"></label>
     <button class="btn" id="pfRun" onclick="PF.run()">查询</button>
     <button class="btn ghost" id="pfRefetch" onclick="PF.refetch()" title="忽略缓存，重新请求商智">重新计算</button>
+    <button class="btn sec" id="pfReprice" onclick="PF.reprice()"
+            title="只重拉 ERP 成本，商智与花费不动">只更新 ERP 成本</button>
     <button class="btn sec" id="pfExport" onclick="PF.exp()" disabled>导出 Excel</button>
   </div>
   <div class="hint" id="pfMsg" style="min-height:20px">选账号与区间后点「查询」：有缓存直接读本地，没有才去商智取数。</div>
@@ -1788,6 +1811,13 @@ def api_profit_status(rows: int = 0):
     snap["ok"] = True
     snap["active"] = snap.pop("running", False)
     return snap
+
+
+@app.post("/api/profit/reprice")
+def api_profit_reprice(job: str | None = None, account: str | None = None,
+                       start: str | None = None, end: str | None = None):
+    """只重拉 ERP 成本并重算利润；商智成交与 CPS/京准通花费沿用缓存。"""
+    return _profit.reprice(job, account, start, end)
 
 
 @app.get("/api/profit/export")

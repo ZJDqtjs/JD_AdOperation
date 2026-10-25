@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -529,6 +530,113 @@ class ProfitRunner:
         suffix = "_品类" if dim == "cat" else ""
         return xlsx, f"月度利润{suffix}_{data.get('account')}_{data['start']}_{data['end']}.xlsx"
 
+
+    def _payload(self, job_id: str | None = None, account: str | None = None,
+                 start: str | None = None, end: str | None = None) -> dict | None:
+        data = self._results.get(job_id or "") or None
+        if data is None and account and start and end:
+            data = self.load_cached(account, start, end)
+        return data
+
+    @staticmethod
+    def _reprice_payload(data: dict, costs: dict, model: dict, units: dict) -> int:
+        """按给定成本重算一份 payload，返回发生变化的行数。"""
+        by = data.get("byAccount") or {}
+        if not by:
+            by = {data.get("account") or "main": {"rows": data.get("rows") or [],
+                                                  "totals": data.get("totals") or {}}}
+            data["byAccount"] = by
+        changed = 0
+        for acc, block in by.items():
+            rows = block.get("rows") or []
+            for r in rows:
+                qty = int(r.get("qty") or 0)
+                amt = float(r.get("szAmt") or 0)
+                front = r.get("frontPrice") or (round(amt / qty, 2) if qty else 0)
+                cp = analyze2.sku_cost_of(str(r["skuId"]), float(front or 0), model, costs, units)
+                supply = float(cp.get("supply") or 0)
+                gpo = float(cp.get("grossPerOrder") or 0)
+                if r.get("supply") != round(supply, 2) or r.get("grossPerOrder") != round(gpo, 2):
+                    changed += 1
+                r["frontPrice"] = round(float(front or 0), 2)
+                r["supply"] = round(supply, 2)
+                r["grossPerOrder"] = round(gpo, 2)
+                r["costSource"] = cp.get("costSource") or ""
+                r["arrival"] = round(qty * supply, 2) if (qty and supply > 0) else None
+                r["gross"] = round(qty * gpo, 2)
+                _recalc(r)
+            rows.sort(key=lambda x: -(x.get("gross") or 0))
+            block["rows"] = rows
+            block["totals"] = totals_of(rows)
+            if acc == data.get("account"):
+                data["rows"] = rows
+                data["totals"] = block["totals"]
+        data["costSource"] = settings.COSTS_SOURCE
+        data["costUpdatedAt"] = costs.get("updatedAt")
+        data["notes"] = [n for n in (data.get("notes") or [])
+                         if not str(n).startswith("成本口径：")
+                         and "在 ERP 里查不到到手结算价" not in str(n)]
+        no_supply = sum(1 for b in by.values() for r in (b.get("rows") or [])
+                        if not r.get("arrival"))
+        if no_supply:
+            data["notes"].append(f"{no_supply} 个 SKU 在 ERP 里查不到到手结算价："
+                                 f"到手金额留空、毛利按全店口径估算。")
+        src = settings.COSTS_SOURCE or {}
+        if src.get("kind") and src.get("kind") != "供货方接口":
+            data["notes"].append(f"成本口径：{src.get('kind')}（{src.get('detail')}）")
+        return changed
+
+    def reprice(self, job_id: str | None = None, account: str | None = None,
+                start: str | None = None, end: str | None = None,
+                force: bool = True, all_ranges: bool = True) -> dict:
+        """只重拉 ERP 成本，重算利润（商智成交与 CPS/京准通花费都不动）。
+
+        默认把 data/reports 下所有已缓存的月度利润表一起重算，避免另一个月份还是旧成本。
+        """
+        costs = settings.load_costs(start or "", end or "", force=force)
+        if not (costs or {}).get("skus"):
+            return {"ok": False,
+                    "error": "ERP 成本接口没有返回任何 SKU（接口可能仍在报错），已保留旧数据。"
+                             f"来源：{(settings.COSTS_SOURCE or {}).get('detail')}"}
+        model = analyze2.load_cost_model()
+        units = settings.costs_unit_map()
+
+        data = self._payload(job_id, account, start, end)
+        if not data:
+            return {"ok": False, "error": "没有已算好的结果，请先查询一次"}
+        changed = self._reprice_payload(data, costs, model, units)
+        try:
+            self._paths(data.get("account") or "main",
+                        data["start"], data["end"]).write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        files, extra = 1, 0
+        if all_ranges:
+            base = Path(settings.DATA_DIR) / "reports"
+            for fp in sorted(base.glob("profit_2*-*-*_2*-*-*.json")):
+                if not re.fullmatch(r"profit_\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}\.json",
+                                    fp.name):
+                    continue
+                try:
+                    other = json.loads(fp.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    continue
+                if (other.get("start"), other.get("end")) == (data.get("start"), data.get("end")):
+                    continue
+                if not other.get("byAccount") and not other.get("rows"):
+                    continue
+                extra += self._reprice_payload(other, costs, model, units)
+                files += 1
+                try:
+                    fp.write_text(json.dumps(other, ensure_ascii=False), encoding="utf-8")
+                except Exception:  # noqa: BLE001
+                    pass
+        return {"ok": True, "changed": changed + extra, "files": files,
+                "costUpdatedAt": costs.get("updatedAt"),
+                "costSku": len(costs.get("skus") or {}),
+                "source": (settings.COSTS_SOURCE or {}).get("kind"),
+                "totals": data.get("totals")}
 
     # ---------------- 内部
     def _set(self, **kw) -> None:
