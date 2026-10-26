@@ -207,7 +207,7 @@ def finalize(collected: dict[int, dict], costs: dict | None = None) -> list[dict
         if r["qty"] or r["cpsCost"] or r["jztCost"]:
             rows.append(r)
     rows.sort(key=lambda x: -(x.get("gross") or 0))
-    return apply_map(rows)
+    return rows
 
 
 def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
