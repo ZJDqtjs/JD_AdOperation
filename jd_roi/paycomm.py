@@ -1011,11 +1011,77 @@ class PayCommRunner:
         with self._lock:
             self._state.update(kw)
 
+    def _collect(self, page, account: str, start: str, end: str,
+                 on_progress=None) -> tuple[list[dict], dict]:
+        """在已打开的京准通页面上抓一个 mode 的数据，返回 (rows, extra)。
+
+        extra = {"spend": {...}}（spend 模式）或 {"daily": [...]}（cps 模式）。
+        不写盘、不动运行态；「花费一览」的手动任务与「月度利润」自动补抓共用这一份逻辑。
+        """
+        def say(msg: str, **kw) -> None:
+            if on_progress:
+                on_progress(msg)
+            else:
+                self._set(message=msg, **kw)
+
+        rows: list[dict] = []
+        extra: dict = {}
+        if self.mode == "spend":
+            say("正在读取京准通广告花费（智能投放 + 全站智能推广）…")
+            spend = fetch_spend(page, start, end,
+                                settings.get_account(account).get("account_id"))
+            names: dict = {}
+            try:
+                # 只借商品列表补商品名（取不到不影响花费数据）
+                goods = list_goods(page, start, end)
+                names = {int(g["itemId"]): (g.get("itemName") or "") for g in goods}
+            except Exception:  # noqa: BLE001
+                names = {}
+            hints = spend.get("hints") or {}
+            rows = [{"skuId": sku, "itemName": (nm := names.get(sku) or hints.get(sku, "")),
+                     "category": catalog.category_of(nm),
+                     "jztJstCost": v["jst"], "jztShopCost": v["shop"],
+                     "jztKwCost": v["kw"], "jztCost": v["total"]}
+                    for sku, v in (spend.get("bySku") or {}).items()]
+            rows.sort(key=lambda r: (r.get("jztCost") or -1), reverse=True)
+            say(f"京准通花费已取到 {len(rows)} 个 SKU", total=len(rows), done=len(rows))
+            extra["spend"] = spend
+        else:
+            say("正在读取商品列表…")
+            goods = list_goods(page, start, end)
+            if goods:
+                say(f"共 {len(goods)} 个 SKU，正在逐个取数…", total=len(goods))
+
+            for i, g in enumerate(goods, 1):
+                if self._cancel.is_set():
+                    break
+                sku = int(g["itemId"])
+                try:
+                    od = sku_metrics(page, sku, start, end)
+                except Exception as exc:  # noqa: BLE001
+                    od = {}
+                    say(f"{sku} 取数失败（{type(exc).__name__}），已跳过")
+                rec = {"skuId": sku, "itemName": g.get("itemName"),
+                       "category": catalog.category_of(g.get("itemName") or "")}
+                for k, _, _ in FIELDS:
+                    rec[k] = od.get(k)
+                rows.append(rec)
+                say(f"已完成 {i}/{len(goods)}：{sku} 付款佣金 "
+                    f"{float(rec.get('payCommAmount') or 0):,.2f} 元", done=i)
+                _sleep(DELAY_SKU)
+
+            if not self._cancel.is_set():
+                say("正在取账户分日合计…")
+                try:
+                    extra["daily"] = daily_total(page, start, end)
+                except Exception:  # noqa: BLE001
+                    extra["daily"] = []
+        return rows, extra
+
     def _work(self, job_id: str, account: str, start: str, end: str) -> None:
         pw = ctx = None
         rows: list[dict] = []
-        daily: list[dict] = []
-        spend: dict = {}
+        extra: dict = {}
         try:
             lock = self._profile_lock
             self._set(message="等待浏览器 Profile 空闲…")
@@ -1029,56 +1095,7 @@ class PayCommRunner:
                 page.wait_for_timeout(10000)
                 if not session_ok(page):
                     raise RuntimeError("登录态失效：请先到「登录」页扫码，或点控制台的「立即续期」")
-
-                if self.mode == "spend":
-                    self._set(message="正在读取京准通广告花费（智能投放 + 全站智能推广）…")
-                    spend = fetch_spend(page, start, end,
-                                        settings.get_account(account).get("account_id"))
-                    names: dict = {}
-                    try:
-                        # 只借商品列表补商品名（取不到不影响花费数据）
-                        goods = list_goods(page, start, end)
-                        names = {int(g["itemId"]): (g.get("itemName") or "") for g in goods}
-                    except Exception:  # noqa: BLE001
-                        names = {}
-                    hints = spend.get("hints") or {}
-                    rows = [{"skuId": sku, "itemName": (nm := names.get(sku) or hints.get(sku, "")),
-                             "category": catalog.category_of(nm),
-                             "jztJstCost": v["jst"], "jztShopCost": v["shop"],
-                             "jztKwCost": v["kw"], "jztCost": v["total"]}
-                            for sku, v in (spend.get("bySku") or {}).items()]
-                    rows.sort(key=lambda r: (r.get("jztCost") or -1), reverse=True)
-                    self._set(total=len(rows), done=len(rows))
-                else:
-                    self._set(message="正在读取商品列表…")
-                    goods = list_goods(page, start, end)
-                    if goods:
-                        self._set(total=len(goods), message=f"共 {len(goods)} 个 SKU，正在逐个取数…")
-
-                    for i, g in enumerate(goods, 1):
-                        if self._cancel.is_set():
-                            break
-                        sku = int(g["itemId"])
-                        try:
-                            od = sku_metrics(page, sku, start, end)
-                        except Exception as exc:  # noqa: BLE001
-                            od = {}
-                            self._set(message=f"{sku} 取数失败（{type(exc).__name__}），已跳过")
-                        rec = {"skuId": sku, "itemName": g.get("itemName"),
-                               "category": catalog.category_of(g.get("itemName") or "")}
-                        for k, _, _ in FIELDS:
-                            rec[k] = od.get(k)
-                        rows.append(rec)
-                        self._set(done=i, message=f"已完成 {i}/{len(goods)}：{sku} "
-                                                  f"付款佣金 {float(rec.get('payCommAmount') or 0):,.2f} 元")
-                        _sleep(DELAY_SKU)
-
-                    if not self._cancel.is_set():
-                        self._set(message="正在取账户分日合计…")
-                        try:
-                            daily = daily_total(page, start, end)
-                        except Exception:  # noqa: BLE001
-                            daily = []
+                rows, extra = self._collect(page, account, start, end)
             finally:
                 try:
                     ctx and ctx.close()
@@ -1090,6 +1107,8 @@ class PayCommRunner:
                     pass
                 lock.release()
 
+            spend = extra.get("spend") or {}
+            daily = extra.get("daily") or []
             cancelled = self._cancel.is_set()
             if cancelled:
                 # 取消 / 进程被重启打断：**绝不落盘**，否则会污染缓存（留下不完整的区间数据）
@@ -1134,3 +1153,30 @@ class PayCommRunner:
         except Exception as exc:  # noqa: BLE001
             self._set(running=False, error=f"{type(exc).__name__}: {exc}",
                       finishedAt=settings.now_iso(), message=f"失败：{exc}")
+
+
+def fetch_into_cache(page, mode: str, account: str, start: str, end: str,
+                     on_progress=None) -> dict | None:
+    """借一个已打开的京准通页面，同步抓某区间花费并写成与「花费一览」相同的缓存文件。
+
+    「月度利润分析」发现花费缓存缺失时直接调用它补齐，用户不必再去别的页面手动抓一次。
+    返回落盘的 payload；一个 SKU 都没抓到（该区间确实没有花费）则返回 None、不写盘。
+    """
+    start, end = norm_range(start, end)
+    key = settings.get_account(account)["key"]
+    runner = PayCommRunner(mode)
+    rows, extra = runner._collect(page, key, start, end, on_progress)
+    if not rows:
+        return None
+    job_id = time.strftime("%Y%m%d%H%M%S") + "-" + mode + "-" + key
+    payload = {"jobId": job_id, "mode": mode, "account": key,
+               "accountLabel": settings.get_account(key).get("label") or key,
+               "start": start, "end": end, "rows": rows,
+               "finishedAt": settings.now_iso(), "autoFilled": True}
+    payload.update(extra)
+    try:
+        fp, _ = runner._disk_paths(key, start, end)
+        fp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    return payload

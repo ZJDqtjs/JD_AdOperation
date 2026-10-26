@@ -14,8 +14,8 @@
     京准通花费   data/reports/paycomm_spend_<账号>_<区间>.json → rows[].jztCost
     净利         = 毛利 − CPS 花费 − 京准通花费
 
-花费只读 paycomm 的本地缓存（精确命中或多段拼接），不会在这里额外抓取；
-缓存缺失时该列留空并在页面上标注，去对应页面抓一次即可。
+花费优先读 paycomm 的本地缓存（精确命中或多段拼接）；缓存缺失时，在同一个浏览器
+会话里自动补抓该账号该区间并写入缓存，用户不需要再去「花费一览」页手动抓。
 """
 from __future__ import annotations
 
@@ -675,7 +675,26 @@ class ProfitRunner:
 
                     self._set(message=f"正在取商智成交件数（{account}，{start} ~ {end}）…")
                     sz_rows = fetch_sz_rows(page, start, end)
-                    self._set(message=f"{account} 商智返回 {len(sz_rows)} 行，读取花费缓存…")
+                    self._set(message=f"{account} 商智返回 {len(sz_rows)} 行，检查花费缓存…")
+                    # 花费缓存缺失就地补齐：同一个浏览器、同一个账号、同一个区间，
+                    # 抓完写进「花费一览」同一套缓存文件，不用再让用户去别的页面手动补。
+                    for mode, label in (("cps", "CPS 花费"), ("spend", "京准通花费")):
+                        if paycomm.read_cached(mode, account, start, end) is not None:
+                            continue
+                        try:
+                            got = paycomm.fetch_into_cache(
+                                page, mode, account, start, end,
+                                on_progress=lambda m, lb=label: self._set(
+                                    message=f"自动补抓{lb}（{account}）：{m}"))
+                        except Exception as exc:  # noqa: BLE001
+                            notes.append(
+                                f"{account} 的{label}自动补抓失败（{type(exc).__name__}: {exc}），"
+                                f"本次该列按 0 计；可稍后到「{label}」页重试。")
+                            continue
+                        if got:
+                            notes.append(
+                                f"{account} 的{label}本地没有 {start} ~ {end} 的缓存，"
+                                f"已在本次查询中自动抓取（{len(got.get('rows') or [])} 个 SKU）并写入缓存。")
                 finally:
                     for closer in (lambda: ctx and ctx.close(), lambda: pw and pw.stop()):
                         try:
@@ -690,10 +709,10 @@ class ProfitRunner:
                 cps_data = paycomm.read_cached("cps", account, start, end)
                 jzt_data = paycomm.read_cached("spend", account, start, end)
                 if cps_data is None:
-                    notes.append(f"{account} 的 CPS 花费没有本地缓存（{start} ~ {end}）："
-                                 f"到「CPS花费」页查一次该区间即可。")
+                    notes.append(f"{account} 的 CPS 花费在 {start} ~ {end} 既没有缓存、"
+                                 f"自动补抓也没取到数据（该区间可能没有 CPS 成交）。")
                 if cps_data is None and jzt_data is None:
-                    notes.append(f"{account} 没有任何花费缓存，本次只统计成交与毛利。")
+                    notes.append(f"{account} 没有任何花费数据，本次只统计成交与毛利。")
                 cps, jzt = _cost_map(cps_data, jzt_data)
                 names: dict[int, str] = {}
                 for src in (jzt_data, cps_data):
