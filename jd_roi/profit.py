@@ -422,9 +422,31 @@ class ProfitRunner:
                        "startedAt": None, "finishedAt": None, "cached": False}
 
     # ---------------- 对外
-    def snapshot(self, with_rows: bool = False) -> dict:
+    def snapshot(self, with_rows: bool = False, job: str | None = None) -> dict:
         with self._lock:
             state = dict(self._state)
+        if job and job != state.get("jobId"):
+            # 查看另一份结果（多为本地缓存）：只回它的数据，不掺当前任务进度，
+            # 这样后台任务还在跑的时候也能看已经算好的区间。
+            data = self._results.get(job)
+            if data is not None:
+                when = data.get("savedAt") or data.get("finishedAt") or ""
+                busy = "，后台还有一个任务在跑，互不影响" if state.get("running") else ""
+                out = {"running": False, "cached": True, "jobId": job, "error": None,
+                       "account": data.get("account"),
+                       "accounts": data.get("accounts") or [],
+                       "range": [data.get("start"), data.get("end")],
+                       "total": len(data.get("rows") or []),
+                       "done": len(data.get("rows") or []),
+                       "savedAt": data.get("savedAt"),
+                       "finishedAt": data.get("finishedAt"),
+                       "message": f"本次结果（{when}）{busy}"}
+                if with_rows:
+                    out.update(rows=data.get("rows") or [], totals=data.get("totals") or {},
+                               notes=data.get("notes") or [], merges=data.get("merges") or [],
+                               byAccount=data.get("byAccount") or {},
+                               accounts=data.get("accounts") or [])
+                return out
         data = self._results.get(state.get("jobId") or "")
         if with_rows and data:
             state["rows"] = data.get("rows") or []
@@ -473,21 +495,34 @@ class ProfitRunner:
         keys = [settings.get_account(a)["key"] for a in (accounts or [account])]
         key = keys[0] if len(keys) == 1 else "all"
         with self._lock:
-            if self._state.get("running"):
-                return {"ok": False, "error": "已有「月度利润分析」任务在运行"}
+            running = bool(self._state.get("running"))
+            # 先查缓存：命中缓存不需要抓取，跟正在跑的任务互不冲突，
+            # 除非用户明确要求「重新计算」（force），才排队等当前任务结束。
             if not force:
                 cached = self.load_cached(account, start, end)
                 if cached:
                     job_id = cached.get("jobId") or f"profit-cache-{key}-{start}_{end}"
+                    cached["jobId"] = job_id
                     self._results[job_id] = cached
-                    self._state.update({"running": False, "cached": True, "jobId": job_id,
-                                        "account": key, "accounts": keys, "range": [start, end],
-                                        "total": len(cached["rows"]), "done": len(cached["rows"]),
-                                        "error": None, "finishedAt": settings.now_iso(),
-                                        "message": f"命中本地缓存（{cached.get('savedAt')} 计算），"
-                                                   f"需要最新数据请点「重新计算」"})
+                    if not running:
+                        self._state.update({"running": False, "cached": True, "jobId": job_id,
+                                            "account": key, "accounts": keys,
+                                            "range": [start, end],
+                                            "total": len(cached["rows"]),
+                                            "done": len(cached["rows"]),
+                                            "error": None, "finishedAt": settings.now_iso(),
+                                            "message": f"命中本地缓存（{cached.get('savedAt')} 计算），"
+                                                       f"需要最新数据请点「重新计算」"})
                     return {"ok": True, "cached": True, "jobId": job_id,
-                            "savedAt": cached.get("savedAt"), "rows": len(cached["rows"])}
+                            "savedAt": cached.get("savedAt"), "rows": len(cached["rows"]),
+                            "busy": running}
+            if running:
+                cur = self._state.get("range") or []
+                more = f"（正在算 {' ~ '.join(cur)}）" if cur else ""
+                tail = ("重新计算要抓商智，请等它结束再点"
+                        if force else f"{start} ~ {end} 没有本地缓存，请等它结束再查")
+                return {"ok": False,
+                        "error": f"已有「月度利润分析」任务在运行{more}，{tail}"}
             job_id = time.strftime("%Y%m%d%H%M%S") + "-profit-" + key
             self._state.update({"running": True, "cached": False, "jobId": job_id,
                                 "account": key, "accounts": keys,

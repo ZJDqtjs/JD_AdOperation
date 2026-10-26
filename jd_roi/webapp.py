@@ -1583,7 +1583,9 @@ function applyAcc(){
 function switchAcc(){ if(Object.keys(DATA).length){ applyAcc(); } else { poll(); } }
 
 function poll(silent){
-  fetch(API + '/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
+  var qs = new URLSearchParams({rows: '1'});
+  if(JOB) qs.set('job', JOB);
+  fetch(API + '/status?' + qs.toString()).then(function(r){ return r.json(); }).then(function(j){
     FAILS = 0;
     if(!j.ok){ if(!silent){ msg(j.error||'状态查询失败','bad'); } return; }
     if(j.active){
@@ -1641,7 +1643,10 @@ function run(force){
     .then(function(j){
       if(!j.ok){ msg('失败：'+(j.error||''),'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; return; }
       JOB = j.jobId;
-      if(j.cached){ msg('命中本地缓存（'+(j.savedAt||'')+' 计算，共 '+(j.rows||0)+' 个 SKU），未请求商智'); }
+      if(j.cached){
+        msg('命中本地缓存（'+(j.savedAt||'')+' 计算，共 '+(j.rows||0)+' 个 SKU），未请求商智'
+            + (j.busy ? '；后台还有任务在跑，本次只读缓存' : ''));
+      }
       poll();
     }).catch(function(e){ msg('请求失败 '+e,'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; });
 }
@@ -1806,8 +1811,8 @@ def api_profit_run(account: str | None = None, start: str = "", end: str = "", f
 
 
 @app.get("/api/profit/status")
-def api_profit_status(rows: int = 0):
-    snap = _profit.snapshot(with_rows=bool(rows))
+def api_profit_status(rows: int = 0, job: str | None = None):
+    snap = _profit.snapshot(with_rows=bool(rows), job=job)
     snap["ok"] = True
     snap["active"] = snap.pop("running", False)
     return snap
