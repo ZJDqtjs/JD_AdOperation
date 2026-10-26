@@ -456,9 +456,12 @@ class ProfitRunner:
         data["savedAt"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
         by = data.get("byAccount") or {}
         if key != "all" and key in by:
-            data = dict(data, rows=by[key].get("rows") or [],
-                        totals=by[key].get("totals") or {},
-                        account=key, accountLabel=by[key].get("label") or key)
+            # 原地改，别用 dict(...) 复制：调用方（reprice）持有的可能是同一份对象的浅拷贝，
+            # 复制会导致内存里的 totals 不更新，只有磁盘是新的
+            data["rows"] = by[key].get("rows") or []
+            data["totals"] = by[key].get("totals") or {}
+            data["account"] = key
+            data["accountLabel"] = by[key].get("label") or key
         for r in data.get("rows") or []:
             if not r.get("category"):
                 r["category"] = catalog.category_of(r.get("itemName") or "")
