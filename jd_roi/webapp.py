@@ -1644,8 +1644,10 @@ function run(force){
       if(!j.ok){ msg('失败：'+(j.error||''),'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; return; }
       JOB = j.jobId;
       if(j.cached){
-        msg('命中本地缓存（'+(j.savedAt||'')+' 计算，共 '+(j.rows||0)+' 个 SKU），未请求商智'
-            + (j.busy ? '；后台还有任务在跑，本次只读缓存' : ''));
+        var head = j.stitched
+          ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求商智')
+          : ('命中本地缓存（'+(j.savedAt||'')+' 计算，共 '+(j.rows||0)+' 个 SKU），未请求商智');
+        msg(head + (j.busy ? '；后台还有任务在跑，本次只读缓存' : ''));
       }
       poll();
     }).catch(function(e){ msg('请求失败 '+e,'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; });

@@ -334,6 +334,29 @@ def _recalc(r: dict) -> None:
     r["netRate"] = round(r["net"] / base * 100, 2) if base else None
 
 
+def _merge_row(a: dict, b: dict) -> dict:
+    """把同一 SKU 在两段缓存里的行合并：量求和，单价/毛利率按合并后的量重算。"""
+    r = dict(a)
+    qty = int(a.get("qty") or 0) + int(b.get("qty") or 0)
+    sz_amt = round(float(a.get("szAmt") or 0) + float(b.get("szAmt") or 0), 2)
+    arr = round(float(a.get("arrival") or 0) + float(b.get("arrival") or 0), 2)
+    r["qty"] = qty
+    r["szAmt"] = sz_amt
+    r["arrival"] = arr if arr else None
+    r["gross"] = round(float(a.get("gross") or 0) + float(b.get("gross") or 0), 2)
+    r["cpsCost"] = round(float(a.get("cpsCost") or 0) + float(b.get("cpsCost") or 0), 2)
+    r["jztCost"] = round(float(a.get("jztCost") or 0) + float(b.get("jztCost") or 0), 2)
+    r["frontPrice"] = round(sz_amt / qty, 2) if qty else 0.0
+    r["supply"] = round(arr / qty, 2) if (qty and arr) else (
+        a.get("supply") or b.get("supply") or 0.0)
+    r["grossPerOrder"] = round(r["gross"] / qty, 2) if qty else 0.0
+    r["accts"] = sorted(set(a.get("accts") or []) | set(b.get("accts") or []))
+    r["spendAccts"] = sorted(set(a.get("spendAccts") or []) | set(b.get("spendAccts") or []))
+    r["costSource"] = a.get("costSource") or b.get("costSource")
+    _recalc(r)
+    return r
+
+
 # ================================================================ Excel
 def build_xlsx(rows: list[dict], start: str, end: str, account_label: str = "",
                totals: dict | None = None, notes: list | None = None) -> bytes:
@@ -489,6 +512,83 @@ class ProfitRunner:
                 r["category"] = catalog.category_of(r.get("itemName") or "")
         return data
 
+    def _spans(self) -> list[tuple[str, str]]:
+        """本地已有的利润表区间（文件名即区间，一份文件里含各账号的表）。"""
+        base = Path(settings.DATA_DIR) / "reports"
+        out = set()
+        for fp in base.glob("profit_2*-*-*_2*-*-*.json"):
+            m = re.fullmatch(r"profit_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.json", fp.name)
+            if m:
+                out.add((m.group(1), m.group(2)))
+        return sorted(out)
+
+    def use_stitched(self, start: str, end: str) -> dict | None:
+        """用多段相邻缓存拼出完整区间（如 8 月 + 9 月 + 10/1~10/25），完全不抓取。
+
+        只接受首尾正好相接、完整覆盖且不外溢的组合，避免把区间外的数据算进来。
+        """
+        spans = self._spans()
+        cur, picked = start, []
+        while cur <= end:
+            cands = [(s, e) for s, e in spans if s == cur and e <= end]
+            if not cands:
+                return None
+            hit = max(cands, key=lambda x: x[1])
+            picked.append(hit)
+            cur = (dt.date.fromisoformat(hit[1]) + dt.timedelta(days=1)).isoformat()
+        if len(picked) < 2:
+            return None                       # 单段就是精确命中，交给 load_cached
+
+        parts: list[tuple[dict, str]] = []
+        for s, e in picked:
+            fp = self._paths("all", s, e)
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                return None
+            if not data.get("byAccount"):
+                return None
+            parts.append((data, time.strftime("%Y-%m-%d %H:%M",
+                                              time.localtime(fp.stat().st_mtime))))
+
+        accs: list[str] = []
+        for data, _ in parts:
+            for acc in (data.get("byAccount") or {}):
+                if acc not in accs:
+                    accs.append(acc)
+        if not accs:
+            return None
+
+        by_account: dict[str, dict] = {}
+        for acc in accs:
+            merged: dict[int, dict] = {}
+            for data, _ in parts:
+                block = (data.get("byAccount") or {}).get(acc) or {}
+                for r in block.get("rows") or []:
+                    sid = int(r["skuId"])
+                    merged[sid] = _merge_row(merged[sid], r) if sid in merged else dict(r)
+            rows = sorted(merged.values(), key=lambda r: -(r.get("gross") or 0))
+            by_account[acc] = {"rows": rows, "totals": totals_of(rows),
+                               "label": settings.get_account(acc).get("label") or acc}
+        if not any(b["rows"] for b in by_account.values()):
+            return None
+
+        main_acc = accs[0]
+        label = " + ".join(b["label"] for b in by_account.values())
+        piece_txt = " + ".join(f"{s}~{e}" for s, e in picked)
+        oldest = min(saved for _, saved in parts)
+        notes = [f"本次结果由 {len(picked)} 段本地缓存拼接（{piece_txt}），未请求商智；"
+                 f"最早一段算于 {oldest}。要看最新数据请点「重新计算」。"]
+        payload = {"jobId": "profit-stitch-" + "-".join(f"{s}_{e}" for s, e in picked),
+                   "account": main_acc, "accounts": accs, "accountLabel": label,
+                   "start": start, "end": end, "rows": by_account[main_acc]["rows"],
+                   "totals": by_account[main_acc]["totals"], "byAccount": by_account,
+                   "notes": notes, "finishedAt": settings.now_iso(),
+                   "costSource": (parts[-1][0].get("costSource") or {}),
+                   "stitched": True, "pieces": [f"{s} ~ {e}" for s, e in picked],
+                   "savedAt": parts[-1][1]}
+        return payload
+
     def run_background(self, account: str, start: str, end: str, force: bool = False,
                        accounts: list[str] | None = None) -> dict:
         start, end = norm_range(start, end)
@@ -500,6 +600,26 @@ class ProfitRunner:
             # 除非用户明确要求「重新计算」（force），才排队等当前任务结束。
             if not force:
                 cached = self.load_cached(account, start, end)
+                if not cached:
+                    # 没有整段缓存时，用多段相邻的月表拼起来（8月 + 9月 + 10/1~10/25）
+                    stitched = self.use_stitched(start, end)
+                    if stitched:
+                        job_id = stitched["jobId"]
+                        self._results[job_id] = stitched
+                        if not running:
+                            self._state.update(
+                                {"running": False, "cached": True, "jobId": job_id,
+                                 "account": stitched["account"],
+                                 "accounts": stitched["accounts"],
+                                 "range": [start, end],
+                                 "total": len(stitched["rows"]),
+                                 "done": len(stitched["rows"]),
+                                 "error": None, "finishedAt": settings.now_iso(),
+                                 "message": "命中本地缓存拼接：" + " + ".join(stitched["pieces"])
+                                            + "（未请求商智）"})
+                        return {"ok": True, "cached": True, "stitched": True, "jobId": job_id,
+                                "pieces": stitched["pieces"], "savedAt": stitched.get("savedAt"),
+                                "rows": len(stitched["rows"]), "busy": running}
                 if cached:
                     job_id = cached.get("jobId") or f"profit-cache-{key}-{start}_{end}"
                     cached["jobId"] = job_id
