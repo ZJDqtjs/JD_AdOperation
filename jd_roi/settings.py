@@ -470,6 +470,35 @@ def costs_unit_map() -> dict:
     return out
 
 
+def cost_override_map() -> dict:
+    """手工成本覆盖表 config/sku_cost_override.json：{"<skuId>": {"shipping": 4.7, ...}}。
+
+    用途：供货方接口漏传某个 SKU 的运费/包材时（返回 0），按 ERP 页面上的真实值手填，
+    优先级高于接口与全店默认。删掉文件即恢复接口口径。
+    """
+    fp = CONFIG_DIR / "sku_cost_override.json"
+    if not fp.exists():
+        return {}
+    try:
+        raw = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {}
+    for k, v in (raw or {}).items():
+        if not isinstance(v, dict):
+            continue
+        item = {}
+        for f in ("supply", "_goodsCost", "shipping", "package", "labor", "returnRate"):
+            if v.get(f) not in (None, ""):
+                try:
+                    item[f] = float(v[f])
+                except (TypeError, ValueError):
+                    pass
+        if item:
+            out[str(k)] = item
+    return out
+
+
 def load_costs(date_from: str = "", date_to: str = "", force: bool = False) -> dict:
     """每个 SKU 的真实成本：远端接口优先 → 本地缓存 → config/costs.json → 空（全店口径）。
 
