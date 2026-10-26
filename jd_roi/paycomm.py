@@ -932,8 +932,9 @@ class PayCommRunner:
             out[(acc, start, end)] = {
                 "mode": self.mode,
                 "account": acc,
-                "accountLabel": (data.get("accountLabel")
-                                 or settings.get_account(acc).get("label") or acc),
+                # 以当前配置的名称为准：账号改名后缓存清单也显示新名字（key 不变，缓存照旧命中）
+                "accountLabel": (settings.get_account(acc).get("label")
+                                 or data.get("accountLabel") or acc),
                 "start": start, "end": end,
                 "rows": len(rows), "total": round(total, 2),
                 "jobId": data.get("jobId"),

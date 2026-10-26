@@ -1008,7 +1008,7 @@ function dim(k){
 function showTable(){ $('pcTableCard').style.display=''; $('pcExport').disabled=false; render(); }
 
 var POLL_FAILS = 0;
-function poll(){
+function poll(silent){
   fetch(API + '/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
     POLL_FAILS = 0;
     if(!j.ok){ msg(j.error||'状态查询失败','bad'); return; }
