@@ -191,19 +191,6 @@ def sku_cost_of(sid: str, unit_price: float, m: dict, costs: dict, units: dict |
     units = units if units is not None else settings.costs_unit_map()
     d = (costs or {}).get("default") or {}
     row = ((costs or {}).get("skus") or {}).get(str(sid)) or {}
-    ov = settings.cost_override_map().get(str(sid)) or {}
-
-    def _pick(field: str, *fallbacks):
-        """手填覆盖 > 接口值（0/空视为没给）> 后面的兜底。"""
-        for src in (ov, row):
-            v = src.get(field)
-            if v not in (None, "") and float(v) > 0:
-                return float(v), ("manual" if src is ov else "erp")
-        for src in fallbacks:
-            v = src.get(field) if isinstance(src, dict) else None
-            if v not in (None, "") and float(v) > 0:
-                return float(v), "default"
-        return 0.0, "none"
     price = _f(unit_price)
     if price <= 0:
         price = _f(row.get("price")) or _f(m.get("refPrice")) or 1.0
@@ -222,17 +209,9 @@ def sku_cost_of(sid: str, unit_price: float, m: dict, costs: dict, units: dict |
         kf = "manual" if str(sid) in units else "assumed"
     if k <= 0:
         k = 1.0
-    # 运费/包材/人工：接口给 0 的（实测有 6 个 SKU 漏传）按「未提供」处理，
-    # 回退到 ERP default（全店默认，shipping=5.00）→ 再回退到 Excel 全店模型。
-    shipping, ship_src = _pick("shipping", m, d)
-    shipping = shipping * k
-    package, pkg_src = _pick("package", m, d)
-    package = package * k
-    labor, _ = _pick("labor", m, d)
-    labor = labor * k
-    goods, goods_src = _pick("_goodsCost", d)
-    goods = goods if goods > 0 else _f(row.get("_goodsCost"), _f(row.get("goodsCost"),
-                                                                _f(d.get("goodsCost"))))
+    shipping = _f(row.get("shipping"), _f(m.get("shipping"), _f(d.get("shipping")))) * k
+    package = _f(row.get("package"), _f(m.get("package"), _f(d.get("package")))) * k
+    labor = _f(row.get("labor"), _f(d.get("labor"))) * k
     supply, goods = supply * k, goods * k
     ret_rate = _f(row.get("returnRate"), _f(d.get("returnRate"), _f(m.get("returnRate"))))
     contrib = supply - goods - shipping - package - labor
@@ -256,7 +235,6 @@ def sku_cost_of(sid: str, unit_price: float, m: dict, costs: dict, units: dict |
         "platformRate": _f(row.get("platformRate"), _f(d.get("platformRate"))),
         "returnCost": round(ret_rate * (shipping + package), 2),      # 单独一行，不进毛利率
         "grossPerOrder": round(contrib, 2),
-        "shippingSource": ship_src, "packageSource": pkg_src, "goodsSource": goods_src,
         "margin": margin,
         "breakeven": be,
         "frontPrice": round(price, 2),                 # = aov，前台件单价（消费者实付）

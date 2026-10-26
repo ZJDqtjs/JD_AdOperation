@@ -579,14 +579,6 @@ class ProfitRunner:
         data["notes"] = [n for n in (data.get("notes") or [])
                          if not str(n).startswith("成本口径：")
                          and "在 ERP 里查不到到手结算价" not in str(n)]
-        ship_def = sum(1 for b in by.values() for r in (b.get("rows") or [])
-                       if r.get("costSource") == "erp"
-                       and (r.get("shippingSource") or "") == "default")
-        if ship_def:
-            data["notes"].append(
-                f"{ship_def} 个 SKU 接口没传运费（shipping=0），已按 ERP 全店默认运费 "
-                f"{(costs.get('default') or {}).get('shipping')} 元/件估算；"
-                f"要精确值可在 config/sku_cost_override.json 里按 SKU 手填。")
         no_supply = sum(1 for b in by.values() for r in (b.get("rows") or [])
                         if not r.get("arrival"))
         if no_supply:
