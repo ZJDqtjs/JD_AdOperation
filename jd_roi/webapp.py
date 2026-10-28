@@ -144,15 +144,14 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
     pre_html = "".join(
         f'<button type="button" class="pre" onclick="setRange({d})">{_e(lab)}</button>'
         for lab, d in presets)
-    # 日历口径的快捷区间（与花费/利润页一致）：今天 / 本月 / 上月 / 上上月
+    # 日历口径的快捷区间（与花费/利润页一致）：本月 / 上月 / 上上月
     today = _today()
     first = today.replace(day=1)
     lm_end = first - dt.timedelta(days=1)
     lm_start = lm_end.replace(day=1)
     pm_end = lm_start - dt.timedelta(days=1)
     pm_start = pm_end.replace(day=1)
-    cal = [("今天", today, today), ("本月", first, today),
-           ("上月", lm_start, lm_end), ("上上月", pm_start, pm_end)]
+    cal = [("本月", first, today), ("上月", lm_start, lm_end), ("上上月", pm_start, pm_end)]
     cal_html = "".join(
         f'<button type="button" class="pre" onclick="setSpan(\'{s.isoformat()}\',\'{e.isoformat()}\')">'
         f'{_e(lab)}</button>'
@@ -882,18 +881,16 @@ td.hot{font-weight:700;color:var(--ink)}
 """
 
 # ---------------------------------------------------------------- 快捷区间
-# 花费一览（CPS / 京准通）与月度利润共用的时间快捷按钮：今天 / 昨天 / 本月 / 上月 / 上上月。
-# 基准日期由服务端注入（window.QRANGE_TODAY），避免浏览器时区或页面开着过夜把「今天」算错。
-QUICK_PRESETS = [("today", "今天"), ("yesterday", "昨天"), ("month", "本月"),
+# 花费一览（CPS / 京准通）与月度利润共用的时间快捷按钮：昨天 / 本月 / 上月 / 上上月。
+# 不放「今天」：花费当天不结算、商智成交只到昨天，这个区间查不出东西。
+# 基准日期由服务端注入（window.QRANGE_TODAY），避免浏览器时区或页面开着过夜把日期算错。
+QUICK_PRESETS = [("yesterday", "昨天"), ("month", "本月"),
                  ("lastmonth", "上月"), ("prevmonth", "上上月")]
 
 QUICK_RANGE_CSS = """
 .qrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:-4px 0 12px}
 .qrow .qlbl{font-size:12px;color:var(--muted);margin-right:2px}
-.qrow .chip[disabled]{opacity:.45;cursor:not-allowed;border-style:dashed}
-.qrow .chip[disabled]:hover{border-color:var(--hair);color:var(--muted)}
 .qrow .chip.on{background:var(--surface-card);color:var(--ink);border-color:var(--cream);font-weight:600}
-.qrow .qtip{font-size:12px;color:var(--muted)}
 """
 
 QUICK_RANGE_JS = r"""
@@ -916,7 +913,6 @@ window.QRANGE = (function(){
   }
   function span(k){
     var t = today(), y = t.getFullYear(), m = t.getMonth(), d = t.getDate();
-    if(k === 'today') return [iso(new Date(y,m,d)), iso(new Date(y,m,d))];
     if(k === 'yesterday') return [iso(new Date(y,m,d-1)), iso(new Date(y,m,d-1))];
     if(k === 'month') return [iso(new Date(y,m,1)), iso(new Date(y,m,d))];
     if(k === 'lastmonth') return [iso(new Date(y,m-1,1)), iso(new Date(y,m,0))];
@@ -935,23 +931,13 @@ window.QRANGE = (function(){
 """
 
 
-def _quick_html(prefix: str, tip: str = "", disabled: dict | None = None) -> str:
-    """快捷区间按钮组。prefix 是页面 JS 命名空间（PC / PF）。
-
-    disabled 里的键渲染成不可点（带 title 说明），用于月度利润这种数据只到昨天的页面。
-    """
-    disabled = disabled or {}
+def _quick_html(prefix: str) -> str:
+    """快捷区间按钮组。prefix 是页面 JS 命名空间（PC / PF）。"""
     out = ['<span class="qlbl">快捷区间</span>']
     for k, lab in QUICK_PRESETS:
-        if k in disabled:
-            out.append(f'<button type="button" class="chip" data-k="{k}" disabled '
-                       f'title="{_e(disabled[k])}">{lab}</button>')
-        else:
-            out.append(f'<button type="button" class="chip" data-k="{k}" '
-                       f'title="{lab}：点一下直接查询（有缓存秒出）" '
-                       f'onclick="{prefix}.quick(\'{k}\')">{lab}</button>')
-    if tip:
-        out.append(f'<span class="qtip">{_e(tip)}</span>')
+        out.append(f'<button type="button" class="chip" data-k="{k}" '
+                   f'title="{lab}：点一下直接查询（有缓存秒出）" '
+                   f'onclick="{prefix}.quick(\'{k}\')">{lab}</button>')
     return f'<div class="qrow" id="{prefix.lower()}Quick">{"".join(out)}</div>'
 
 
@@ -1895,9 +1881,7 @@ def profit_page(request: Request):
             "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
             "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
-    # 商智成交只到昨天：本页的「今天」置灰，免得点了必然报「区间内没有可查询的日期」
-    quick_html = _quick_html("PF", tip="商智成交只到昨天，今天的利润明天才出",
-                             disabled={"today": "商智成交数据只到昨天，今天的利润查不到"})
+    quick_html = _quick_html("PF")
     today_iso = _today().isoformat()
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
