@@ -144,6 +144,19 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
     pre_html = "".join(
         f'<button type="button" class="pre" onclick="setRange({d})">{_e(lab)}</button>'
         for lab, d in presets)
+    # 日历口径的快捷区间（与花费/利润页一致）：今天 / 本月 / 上月 / 上上月
+    today = _today()
+    first = today.replace(day=1)
+    lm_end = first - dt.timedelta(days=1)
+    lm_start = lm_end.replace(day=1)
+    pm_end = lm_start - dt.timedelta(days=1)
+    pm_start = pm_end.replace(day=1)
+    cal = [("今天", today, today), ("本月", first, today),
+           ("上月", lm_start, lm_end), ("上上月", pm_start, pm_end)]
+    cal_html = "".join(
+        f'<button type="button" class="pre" onclick="setSpan(\'{s.isoformat()}\',\'{e.isoformat()}\')">'
+        f'{_e(lab)}</button>'
+        for lab, s, e in cal)
     acc_html = ""
     if show_accounts:
         boxes = "".join(
@@ -156,11 +169,12 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
   <label>起 <input type="date" name="start" id="rbStart" value="{_e(start)}"></label>
   <label>止 <input type="date" name="end" id="rbEnd" value="{_e(end)}"></label>
   <span class="mini" id="rbDays" style="color:var(--muted)">共 {n} 天</span>
-  {pre_html}{acc_html}
+  {cal_html}<span class="sep"></span>{pre_html}{acc_html}
   <button type="submit">生成分析</button>
   {extra}
 </form>
 <script>
+function setSpan(a,b){{ rbStart.value=a; rbEnd.value=b; upd(); }}
 function setRange(n){{
   var e=new Date(rbEnd.value||"{_e(end)}");
   if(!rbEnd.value) e=new Date("{_e(end)}");
@@ -717,6 +731,7 @@ def report(request: Request):
     q = request.query_params
     start, end = ui_range(q.get("start"), q.get("end"), q.get("days"), 7)
     accounts = account_list(q.getlist("accounts"))
+    t0 = time.time()
     try:
         data = analyze2.build(start=start, end=end, accounts=accounts)
     except FileNotFoundError as exc:
@@ -739,7 +754,12 @@ def report(request: Request):
     title = f"广告运营分析 {start} ~ {end}（{(dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days + 1}天）"
     cached = analyze_ai.load_latest()
     ai = cached if analyze_ai.matches(cached, start, end, keys) else None
-    return HTMLResponse(report2.render(data, ui=ui, title=title, ai=ai))
+    t1 = time.time()
+    html_out = report2.render(data, ui=ui, title=title, ai=ai)
+    print(f"[report] {start}~{end} 账号={','.join(keys)} build {t1 - t0:.2f}s "
+          f"render {time.time() - t1:.2f}s 成本={(settings.COSTS_SOURCE or {}).get('kind')}",
+          flush=True)
+    return HTMLResponse(html_out)
 
 
 # ================================================================ AI 分析台
@@ -801,19 +821,20 @@ PAYCOMM_KINDS = {
         "api": "/api/paycomm/spend",
         "title": "京准通花费",
         "eyebrow": "花费一览 · 京准通",
-        "metaline": ["智能投放：商品报表按 skuId",
-                     "关键词：创意报表按落地页 SKU（含已删计划）",
-                     "全站智能推广：计划上的 spuId",
-                     "约 20 秒完成，结果写本地缓存"],
-        "grid": "g5",
+        "metaline": ["快车：智能投放 / 关键词 / 全站智能推广（含已删计划）",
+                     "全站营销：单品推广按 sxuId",
+                     "对不上商品的花费单列「未归因」，不摊到商品",
+                     "约 30 秒完成，结果写本地缓存"],
+        "grid": "g6",
         "switch": ("/paycomm", "看 CPS 花费 →"),
-        "webKeys": ["jztCost", "jztJstCost", "jztKwCost", "jztShopCost"],
+        "webKeys": ["jztCost", "jztJstCost", "jztKwCost", "jztShopCost", "jztSwaCost"],
         "kpis": [
             {"label": "SKU 数", "key": None, "type": "int"},
             {"label": "京准通花费合计", "key": "jztCost", "type": "money", "subKind": "spend"},
             {"label": "智能投放", "key": "jztJstCost", "type": "money"},
             {"label": "关键词计划", "key": "jztKwCost", "type": "money"},
             {"label": "全站智能推广", "key": "jztShopCost", "type": "money"},
+            {"label": "全站营销", "key": "jztSwaCost", "type": "money"},
         ],
         "sort": "jztCost",
         "ratioKeys": [],
@@ -829,12 +850,20 @@ PAYCOMM_NOTES = {
 100 个 SKU 约 2~3 分钟，全程占用浏览器登录态，期间不要同时扫码登录。</p>""",
     "spend": """
 <p><b>智能投放</b>：智能投放「商品报表」按 SKU 的花费（<code>/reweb/jst/account/sku/list</code>），含已下线计划。</p>
-<p><b>关键词计划</b>：取报表中心「创意」报表（<code>/reweb/msa/base/ad/list</code>），
-每条创意绑定一个商品、落地页就是 <code>item.jd.com/&lt;SKU&gt;.html</code>，因此可以按 SKU 拆分；
-这个报表<b>包含已删除的计划</b>，比快车计划列表更全（例如 8 月有一个已删关键词计划 6,012 元仍在花费）。</p>
-<p><b>全站智能推广</b>：快车计划列表里计划上带 <code>spuId</code> 的花费（campaignType=153）。</p>
-<p>三者相加为「京准通花费合计」。商品名优先用数据看板的商品名；该区间没有 CPS 成交时，
-用广告计划名里的商品名兜底显示。真正归不到 SKU 的（例如创意没有落地页）才会出现在下方「未归因」表格里。</p>""",
+<p><b>关键词计划</b>：先取快车推广管理的创意接口（<code>/dspad/msa/promolist/item/keyword/ad</code>），
+它直接返回每条创意推的 <code>skuId</code>（要进「计划 → 单元 → 创意」才看得到，这里一次拿全）；
+拿不到时退回报表中心创意报表（<code>/reweb/msa/base/ad/list</code>）的落地页 SKU，
+那个报表<b>包含已删除的计划</b>（例如 8 月有一个已删关键词计划 6,012 元仍在花费）。</p>
+<p><b>全站智能推广</b>：以报表中心计划报表（<code>/reweb/msa/base/campaign/list</code>）的计划级金额为准，
+<b>含已删除计划</b>；再用计划上的 <code>spuId</code> 归到商品，已删计划拿不到 spuId 时按同名计划回找。</p>
+<p><b>全站营销</b>：报表（<code>/reweb/swa/account/campaign/list</code>）的单品推广只给到 SPU，
+真正投放的是该 SPU 下没被拉黑的 SKU——再查推广管理（<code>/swa/ad/list</code> +
+<code>/swa/forbidden/list</code>）拿 <code>deliverySkuIds</code>，一个计划投几个 SKU 就<b>平分</b>（尾差给最后一个）。
+全店/新品推广没有 SKU，进「未归因」。</p>
+<p>快车三路 + 全站营销 = 「京准通花费合计」，应等于京准通首页的「效果广告花费」
+（快车 + 全站营销 + 站外广告）。商品名优先用数据看板的商品名；该区间没有 CPS 成交时，
+用广告计划名里的商品名兜底显示。定位不到 SKU 的花费一律单列在下方「未归因」表格里，<b>绝不按比例摊到商品上</b>。</p>""",
+
 }
 
 PAYCOMM_CSS = """
@@ -847,8 +876,84 @@ td.nm{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 td.hot{font-weight:700;color:var(--ink)}
 .toolbar .fld{display:inline-flex;align-items:center;gap:6px;margin:0 10px 8px 0}
 .grid.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
-@media(max-width:1100px){.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.grid.g6{grid-template-columns:repeat(6,minmax(0,1fr))}
+@media(max-width:1100px){.grid.g5,.grid.g6{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:760px){.grid.g5,.grid.g6{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
+
+# ---------------------------------------------------------------- 快捷区间
+# 花费一览（CPS / 京准通）与月度利润共用的时间快捷按钮：今天 / 昨天 / 本月 / 上月 / 上上月。
+# 基准日期由服务端注入（window.QRANGE_TODAY），避免浏览器时区或页面开着过夜把「今天」算错。
+QUICK_PRESETS = [("today", "今天"), ("yesterday", "昨天"), ("month", "本月"),
+                 ("lastmonth", "上月"), ("prevmonth", "上上月")]
+
+QUICK_RANGE_CSS = """
+.qrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:-4px 0 12px}
+.qrow .qlbl{font-size:12px;color:var(--muted);margin-right:2px}
+.qrow .chip[disabled]{opacity:.45;cursor:not-allowed;border-style:dashed}
+.qrow .chip[disabled]:hover{border-color:var(--hair);color:var(--muted)}
+.qrow .chip.on{background:var(--surface-card);color:var(--ink);border-color:var(--cream);font-weight:600}
+.qrow .qtip{font-size:12px;color:var(--muted)}
+"""
+
+QUICK_RANGE_JS = r"""
+window.QRANGE = (function(){
+  var BASE = window.QRANGE_TODAY || '';
+  function pad(n){ return (n<10?'0':'')+n; }
+  function iso(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+  function srvToday(){
+    var p = String(BASE).split('-');
+    if(p.length !== 3) return null;
+    var d = new Date(+p[0], +p[1]-1, +p[2]);
+    return isNaN(d) ? null : d;
+  }
+  function today(){
+    var n = new Date();
+    var local = new Date(n.getFullYear(), n.getMonth(), n.getDate());
+    var srv = srvToday();
+    // 页面开着过夜时跟着浏览器当天走；只在浏览器更晚时前进，不倒退
+    return (srv && local > srv) ? local : (srv || local);
+  }
+  function span(k){
+    var t = today(), y = t.getFullYear(), m = t.getMonth(), d = t.getDate();
+    if(k === 'today') return [iso(new Date(y,m,d)), iso(new Date(y,m,d))];
+    if(k === 'yesterday') return [iso(new Date(y,m,d-1)), iso(new Date(y,m,d-1))];
+    if(k === 'month') return [iso(new Date(y,m,1)), iso(new Date(y,m,d))];
+    if(k === 'lastmonth') return [iso(new Date(y,m-1,1)), iso(new Date(y,m,0))];
+    if(k === 'prevmonth') return [iso(new Date(y,m-2,1)), iso(new Date(y,m-1,0))];
+    return null;
+  }
+  function mark(box, s, e){
+    var nodes = document.querySelectorAll(box + ' .chip[data-k]');
+    for(var i=0;i<nodes.length;i++){
+      var r = span(nodes[i].getAttribute('data-k'));
+      nodes[i].className = 'chip' + ((r && s && e && r[0] === s && r[1] === e) ? ' on' : '');
+    }
+  }
+  return {span: span, mark: mark};
+})();
+"""
+
+
+def _quick_html(prefix: str, tip: str = "", disabled: dict | None = None) -> str:
+    """快捷区间按钮组。prefix 是页面 JS 命名空间（PC / PF）。
+
+    disabled 里的键渲染成不可点（带 title 说明），用于月度利润这种数据只到昨天的页面。
+    """
+    disabled = disabled or {}
+    out = ['<span class="qlbl">快捷区间</span>']
+    for k, lab in QUICK_PRESETS:
+        if k in disabled:
+            out.append(f'<button type="button" class="chip" data-k="{k}" disabled '
+                       f'title="{_e(disabled[k])}">{lab}</button>')
+        else:
+            out.append(f'<button type="button" class="chip" data-k="{k}" '
+                       f'title="{lab}：点一下直接查询（有缓存秒出）" '
+                       f'onclick="{prefix}.quick(\'{k}\')">{lab}</button>')
+    if tip:
+        out.append(f'<span class="qtip">{_e(tip)}</span>')
+    return f'<div class="qrow" id="{prefix.lower()}Quick">{"".join(out)}</div>'
+
 
 PAYCOMM_JS = """
 (function(){
@@ -940,7 +1045,8 @@ function kpisHtml(){
     }
     if(k.subKind === 'spend'){
       var st = SPEND.totals || {};
-      var un = (num(st.keyword) || 0) + (num(st.other) || 0);
+      var un = num(st.unattr);
+      if(un === null) un = (num(st.keyword) || 0) + (num(st.other) || 0);
       sub = un ? ('未归因 ' + fmt(un,'money') + ' 元（无 SKU）')
                : '全部已按 SKU 归因';
     }
@@ -982,20 +1088,38 @@ function render(){
   renderUnattr();
 }
 function renderUnattr(){
+  var us = SPEND.unattrRows || [];
   var kws = SPEND.keywordRows || [];
-  if(INIT.showUnattr && kws.length){
-    var kh = kws.map(function(c){
-      return '<tr><td class="l">'+esc(c.campaignId)+'</td><td class="l nm">'+esc(c.campaignName)
-        + '</td><td class="n">'+fmt(c.cost,'money')+'</td></tr>';
-    }).join('');
-    var kt = 0; kws.forEach(function(c){ kt += num(c.cost)||0; });
-    kh += '<tr><td class="l"><b>合计</b></td><td class="l">'+kws.length+' 个计划</td>'
-        + '<td class="n"><b>'+fmt(kt,'money')+'</b></td></tr>';
-    $('pcUnattrBody').innerHTML = kh;
-    $('pcUnattrCard').style.display = '';
-  } else if($('pcUnattrCard')){
-    $('pcUnattrCard').style.display = 'none';
+  if(!INIT.showUnattr || (!us.length && !kws.length)){
+    if($('pcUnattrCard')) $('pcUnattrCard').style.display = 'none';
+    return;
   }
+  var uh = '', ut = 0;
+  us.forEach(function(u){
+    ut += num(u.cost) || 0;
+    uh += '<tr><td class="l nm">'+esc(u.name)+'</td><td class="n">'+fmt(u.cost,'money')+'</td></tr>';
+  });
+  if(us.length){
+    uh += '<tr><td class="l"><b>合计</b></td><td class="n"><b>'+fmt(ut,'money')+'</b></td></tr>';
+  }
+  $('pcUnattrBody').innerHTML = uh;
+  var kwBox = $('pcUnattrKw');
+  if(kwBox){
+    if(kws.length){
+      var kh = kws.map(function(c){
+        return '<tr><td class="l">'+esc(c.campaignId)+'</td><td class="l nm">'+esc(c.campaignName)
+          + '</td><td class="n">'+fmt(c.cost,'money')+'</td></tr>';
+      }).join('');
+      var kt = 0; kws.forEach(function(c){ kt += num(c.cost)||0; });
+      kh += '<tr><td class="l"><b>合计</b></td><td class="l">'+kws.length+' 个创意</td>'
+          + '<td class="n"><b>'+fmt(kt,'money')+'</b></td></tr>';
+      $('pcUnattrKwBody').innerHTML = kh;
+      kwBox.style.display = '';
+    } else {
+      kwBox.style.display = 'none';
+    }
+  }
+  $('pcUnattrCard').style.display = '';
 }
 function dim(k){
   DIM = (k === 'cat') ? 'cat' : 'sku';
@@ -1054,6 +1178,18 @@ function poll(silent){
     $('pcBar').style.width = '0';
     msg('与服务端的连接中断了（常见于服务重启）。刷新页面即可恢复；后台任务不受影响。', 'bad');
   });
+}
+function markQuick(){
+  if(!window.QRANGE) return;
+  window.QRANGE.mark('#pcQuick', $('pcStart').value, $('pcEnd').value);
+}
+function quick(k){
+  var r = window.QRANGE && window.QRANGE.span(k);
+  if(!r) return;
+  $('pcStart').value = r[0];
+  $('pcEnd').value = r[1];
+  markQuick();
+  run();
 }
 function run(force){
   var acc = $('pcAcc').value, s = $('pcStart').value, e = $('pcEnd').value;
@@ -1152,7 +1288,7 @@ function sort(k){
 }
 window.PC = {sort: sort, run: run, refetch: refetch, exp: exp, cancel: cancel,
              render: render, loadCache: loadCache, delCache: delCache, dim: dim,
-             expView: expView};
+             expView: expView, quick: quick};
 function boot(){
   poll(); loadCache();
   $('pcTable').addEventListener('click', function(e){
@@ -1160,6 +1296,9 @@ function boot(){
     if(!th || !th.getAttribute('data-key')) return;
     sort(th.getAttribute('data-key'));
   });
+  $('pcStart').addEventListener('change', markQuick);
+  $('pcEnd').addEventListener('change', markQuick);
+  markQuick();
 }
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
@@ -1189,21 +1328,32 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
             "ratioKeys": cfg.get("ratioKeys", [])}
     unattr_html = """
 <div class="card" id="pcUnattrCard" style="display:none">
-  <h2>未归因的关键词计划 <span class="tagline">快车关键词计划的商品挂在「单元」上，接口不返回 SKU</span></h2>
-  <p class="hint">这些花费无法落到具体 SKU，因此不计入上方任何一行，仅列出计划名供人工对应商品。</p>
+  <h2>未归因花费 <span class="tagline">定位不到 SKU 的钱单列在这里，绝不按比例摊到商品</span></h2>
+  <p class="hint">这些花费已经在合计里（所以能对上京准通），但没有落到具体商品上；
+     要缩小这块，只能让计划带上 spuId / 创意带落地页 / 全站营销走单品推广。</p>
   <div class="tblwrap short">
-    <table><thead><tr><th class="l noSort">计划ID</th><th class="l noSort">计划名称</th>
+    <table><thead><tr><th class="l noSort">项目</th>
       <th class="n noSort">花费(元)</th></tr></thead><tbody id="pcUnattrBody"></tbody></table>
+  </div>
+  <div id="pcUnattrKw" style="display:none;margin-top:16px">
+    <h2>未归因的关键词创意明细</h2>
+    <div class="tblwrap short">
+      <table><thead><tr><th class="l noSort">计划ID</th><th class="l noSort">创意/计划名称</th>
+        <th class="n noSort">花费(元)</th></tr></thead><tbody id="pcUnattrKwBody"></tbody></table>
+    </div>
   </div>
 </div>""" if cfg["showUnattr"] else ""
     metaline = "".join(
         f'<span>{_e(t)}</span>'
         + ('<span class="dot"></span>' if i < len(cfg["metaline"]) - 1 else "")
         for i, t in enumerate(cfg["metaline"]))
+    quick_html = _quick_html("PC")
+    today_iso = _today().isoformat()
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_e(cfg["title"])} · 京东广告运营</title>
 <style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+<style>{QUICK_RANGE_CSS}</style>
 </head><body>
 {report2.navtop(cfg["nav"])}
 <header class="top"><div class="wrap pagehead">
@@ -1227,6 +1377,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     <button class="btn sec" id="pcExport" onclick="PC.exp()" disabled>导出完整 Excel</button>
     <button class="btn ghost" id="pcCancel" onclick="PC.cancel()" style="display:none">取消</button>
   </div>
+{quick_html}
   <div class="hint" id="pcMsg" style="min-height:20px">选账号与区间后点「查询」：有缓存直接读本地（不请求京准通），没有才去抓。</div>
   <div class="pcbar" id="pcBarWrap"><i id="pcBar"></i></div>
 </div>
@@ -1272,6 +1423,8 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
 </div>
 
 </div>
+<script>window.QRANGE_TODAY = "{today_iso}";</script>
+<script>{QUICK_RANGE_JS}</script>
 <script>window.PC_INIT = {json.dumps(init, ensure_ascii=False)};</script>
 <script>{PAYCOMM_JS}</script>
 </body></html>""")
@@ -1571,7 +1724,7 @@ function renderNotes(notes){
   el.innerHTML = '<b>数据提示</b><ul style="margin:6px 0 0 18px;padding:0">'
     + notes.map(function(n){ return '<li>'+esc(n)+'</li>'; }).join('') + '</ul>';
 }
-function showTable(){ $('pfTableCard').style.display=''; $('pfExport').disabled=false; render(); }
+function showTable(){ $('pfTableCard').style.display=''; $('pcExportView').disabled=false; render(); }
 function applyAcc(){
   var b = DATA[$('pfAcc').value];
   if(!b){ return; }
@@ -1627,13 +1780,25 @@ function poll(silent){
     msg('与服务端连接中断（常见于服务重启），刷新页面即可恢复', 'bad');
   });
 }
+function markQuick(){
+  if(!window.QRANGE) return;
+  window.QRANGE.mark('#pfQuick', $('pfStart').value, $('pfEnd').value);
+}
+function quick(k){
+  var r = window.QRANGE && window.QRANGE.span(k);
+  if(!r) return;
+  $('pfStart').value = r[0];
+  $('pfEnd').value = r[1];
+  markQuick();
+  run();
+}
 function run(force){
   var acc = $('pfAcc').value, s = $('pfStart').value, e = $('pfEnd').value;
   if(!s || !e){ msg('请选择起止日期','bad'); return; }
   if(s > e){ msg('起始日期不能晚于结束日期','bad'); return; }
   ROWS = []; JOB = null; TOTALS = {};
   $('pfTableCard').style.display='none';
-  $('pfExport').disabled = true;
+  $('pcExportView').disabled = true;
   $('pfRun').disabled = true; $('pfRefetch').disabled = true;
   $('pfBar').style.width = '0';
   msg(force ? '正在重新计算（会覆盖该区间缓存）…' : '查询中（先看本地缓存）…');
@@ -1679,6 +1844,7 @@ function exp(){
     start: $('pfStart').value, end: $('pfEnd').value, dim: DIM});
   window.location = API + '/export?' + qs.toString();
 }
+function expView(){ exp(); }
 function dim(k){
   DIM = (k === 'cat') ? 'cat' : 'sku';
   $('pfDimSku').className = 'tab' + (DIM==='sku' ? ' active' : '');
@@ -1691,8 +1857,8 @@ function sort(k){
   else SORT = {k:k, d:(k==='itemName'||k==='skuId'||k==='category')?1:-1};
   render();
 }
-window.PF = {run:run, refetch:refetch, exp:exp, dim:dim, sort:sort, render:render,
-             switchAcc:switchAcc, reprice:reprice};
+window.PF = {run:run, refetch:refetch, exp:exp, expView:expView, dim:dim, sort:sort,
+             render:render, switchAcc:switchAcc, reprice:reprice, quick:quick};
 function boot(){
   poll();
   $('pfTable').addEventListener('click', function(e){
@@ -1700,6 +1866,9 @@ function boot(){
     if(!th || !th.getAttribute('data-key')) return;
     sort(th.getAttribute('data-key'));
   });
+  $('pfStart').addEventListener('change', markQuick);
+  $('pfEnd').addEventListener('change', markQuick);
+  markQuick();
 }
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
@@ -1726,10 +1895,15 @@ def profit_page(request: Request):
             "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
             "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
+    # 商智成交只到昨天：本页的「今天」置灰，免得点了必然报「区间内没有可查询的日期」
+    quick_html = _quick_html("PF", tip="商智成交只到昨天，今天的利润明天才出",
+                             disabled={"today": "商智成交数据只到昨天，今天的利润查不到"})
+    today_iso = _today().isoformat()
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>月度利润分析 · 京东广告运营</title>
 <style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+<style>{QUICK_RANGE_CSS}</style>
 </head><body>
 {report2.navtop("/profit")}
 <header class="top"><div class="wrap pagehead">
@@ -1757,8 +1931,10 @@ def profit_page(request: Request):
     <button class="btn ghost" id="pfRefetch" onclick="PF.refetch()" title="忽略缓存，重新请求商智">重新计算</button>
     <button class="btn sec" id="pfReprice" onclick="PF.reprice()"
             title="只重拉 ERP 成本，商智与花费不动">只更新 ERP 成本</button>
-    <button class="btn sec" id="pfExport" onclick="PF.exp()" disabled>导出 Excel</button>
+    <button class="btn sec mini" id="pcExportView" onclick="PF.expView()" style="margin-left:auto"
+            title="按当前维度导出（SKU 或 品类）" disabled>导出当前视图 Excel</button>
   </div>
+{quick_html}
   <div class="hint" id="pfMsg" style="min-height:20px">选账号与区间后点「查询」：有缓存直接读本地，没有才去商智取数。</div>
   <div class="pcbar"><i id="pfBar"></i></div>
 </div>
@@ -1787,12 +1963,20 @@ def profit_page(request: Request):
   <p><b>到手金额</b> = 商智成交件数 × ERP「到手结算价 supply」（京东结算给我们的每件金额，已扣点）。</p>
   <p><b>毛利</b> = 成交件数 × 「毛利/件」= 到手结算价 − 货款 − 运费 − 包材 − 人工（<b>未扣广告</b>），
      与「分析报表」里的同一列完全同口径。</p>
-  <p><b>净利</b> = 毛利 − CPS 花费（付款佣金）− 京准通花费（智能投放 + 关键词 + 全站智能推广）。
+  <p><b>净利</b> = 毛利 − CPS 花费（付款佣金）− 京准通花费（快车：智能投放 / 关键词 / 全站智能推广 + 全站营销）。
      两个花费都只读「花费一览」的本地缓存，本页不会额外抓取；缺失时会在上方提示，去对应页面抓一次即可。</p>
-  <p>只有广告花费、没有成交的 SKU 也会列出（毛利 0，净利为负），那是纯亏的钱。</p>
+  <p><b>只列本账号京准通有投放的商品</b>：行集由京准通决定，商智里有成交但本账号没投的商品不会出现在这张表里
+     （它属于投放它的那个账号）。本表「京准通花费」合计 = 该账号「京准通花费」页的合计。</p>
+  <p><b>成交按 SKU 取</b>：成交件数、前台价、成交额是「这个 SKU 卖了多少」，不属于某个账号，
+     所以会把两个账号的商智合成一张 SKU 表——本账号投的商品即使卖在另一个账号的店铺里，
+     这里也能看到件数与毛利（悬停可看「成交账号」）。两个账号的商智都没有它时，才是 0 件数、毛利 0 的纯花费行。</p>
+  <p>注意：同一个 SKU 若两个账号都在投，会同时出现在两张表里且各自带全额成交，跨账号相加会重复计成交与毛利，
+     按账号单独看才准。</p>
 </div>
 
 </div>
+<script>window.QRANGE_TODAY = "{today_iso}";</script>
+<script>{QUICK_RANGE_JS}</script>
 <script>window.PC_INIT = {json.dumps(init, ensure_ascii=False)};</script>
 <script>{PROFIT_JS}</script>
 </body></html>""")
@@ -1801,10 +1985,19 @@ def profit_page(request: Request):
 @app.post("/api/profit/run")
 def api_profit_run(account: str | None = None, start: str = "", end: str = "", force: int = 0,
                    accounts: str = ""):
-    """account=all 或 accounts=a,b 时，按 SKU 跨账号合并（花费跟着成交走）。"""
+    """按 SKU 跨账号合并（花费跟着投放账号走）。
+
+    页面下拉选中的账号排第一：结果默认展示它，其余账号只为跨账号归集成交/花费。
+    """
     try:
         wanted = [x for x in (accounts or "").split(",") if x.strip()]
-        keys = wanted or [a["key"] for a in settings.ACCOUNTS]
+        all_keys = [a["key"] for a in settings.ACCOUNTS]
+        if wanted:
+            keys = [k for k in all_keys if k in wanted] or wanted
+        elif account and account in all_keys:
+            keys = [account] + [k for k in all_keys if k != account]
+        else:
+            keys = all_keys
         if not keys:
             return {"ok": False, "error": "没有可用的账号"}
         return _profit.run_background(keys[0], start, end, force=bool(force), accounts=keys)

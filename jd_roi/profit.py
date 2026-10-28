@@ -14,6 +14,15 @@
     京准通花费   data/reports/paycomm_spend_<账号>_<区间>.json → rows[].jztCost
     净利         = 毛利 − CPS 花费 − 京准通花费
 
+账号归属以**京准通花费**为准（LOGIC_VERSION=5）：
+  - **行集**由京准通决定：本账号有投放的商品才出现在这张表里，商智里没投放的商品不列；
+  - **花费**记在投放账号，不按商智成交件数跨账号搬运；
+  - **商智按 SKU 归集**：成交件数/成交额是「这个 SKU 卖了多少」，不属于某个账号，
+    先把各账号的商智合成一张 SKU 表，再按 SKU 补到每张利润表里（可以从另一个账号取）。
+同一个 SKU 若两个账号都在投，会同时出现在两张表里且各自带全额成交，
+跨账号相加会重复计成交与毛利，按账号单独看才准。
+旧口径算出的 profit_*.json 会被当成缓存未命中，需要重算一次。
+
 花费优先读 paycomm 的本地缓存（精确命中或多段拼接）；缓存缺失时，在同一个浏览器
 会话里自动补抓该账号该区间并写入缓存，用户不需要再去「花费一览」页手动抓。
 """
@@ -31,6 +40,14 @@ from . import analyze2, catalog, indicators as ind, paycomm, scrape_sz, settings
 from .browser import launch_persistent, session_ok
 
 BOARD_PAGE = "https://jzt.jd.com/jtk/#/data-board"
+
+# 计算口径版本：改了口径就 +1，旧的 profit_*.json 缓存自动失效（不删文件，只是不再命中）
+#   1 = 花费按商智成交件数归给「出单账号」（已废弃）
+#   2 = 花费按京准通投放账号归集，商智只给成交件数与前台价
+#   3 = 商智按 SKU 跨账号归集（成交属于 SKU，不跟着账号走），花费仍只记投放账号
+#   4 = 行集以京准通为准：本账号没有投放的商品不列（商智只用来补成交数据）
+#   5 = 花费口径升级（关键词精确 SKU、全站营销按实际投放 SKU 平分），需要重算
+LOGIC_VERSION = 5
 
 # (字段, 列名, 类型)；ratio 类在按品类汇总时不求和
 FIELDS = [
@@ -154,6 +171,41 @@ def collect(sz_rows: list[dict], cps: dict, jzt: dict,
     return out
 
 
+def sz_sku(raw: dict) -> int:
+    """商智商品明细行的 skuId（忽略合计行/空行，解析不了返回 0）。"""
+    sid_raw = raw.get("sku_id")
+    if sid_raw in (None, "", "合计") or raw.get("$summary"):
+        return 0
+    try:
+        return int(sid_raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def merge_sz_by_sku(sz_parts: dict[str, list[dict]]) -> dict[int, dict]:
+    """把各账号的商智商品明细按 skuId 合成**一张**表（商智属于 SKU，不属于账号）。
+
+    同一个 SKU 正常只会出现在卖它的那个店铺的商智里；万一两边都有（历史数据/同店多账号），
+    取件数大的那份，绝不相加，避免同一笔成交被算两遍。
+    返回 {skuId: {"qty", "amt", "name", "acc"}}，acc = 这份成交记在哪个账号的商智里。
+    """
+    out: dict[int, dict] = {}
+    for acc, rows in (sz_parts or {}).items():
+        for raw in rows or []:
+            sid = sz_sku(raw)
+            if not sid:
+                continue
+            qty = int(float(raw.get(ind.SZ_QTY) or 0))
+            amt = float(raw.get(ind.SZ_AMT) or 0)
+            if qty <= 0 and amt <= 0:
+                continue
+            cur = out.get(sid)
+            if cur is None or (qty, amt) > (cur["qty"], cur["amt"]):
+                out[sid] = {"qty": qty, "amt": amt, "acc": acc,
+                            "name": str(raw.get("name") or "")}
+    return out
+
+
 def merge_collected(parts: list[dict]) -> dict[int, dict]:
     """把多个账号的 collect 结果按 SKU 合并（成交与花费都累加）。"""
     out: dict[int, dict] = {}
@@ -220,40 +272,29 @@ def build_rows(sz_rows: list[dict], cps: dict, jzt: dict,
 
 
 def attribute_spend(parts: dict[str, dict[int, dict]]) -> dict[int, dict]:
-    """把各账号的花费按 SKU 归给「真正卖出这个 SKU 的账号」。
+    """按**京准通花费**决定每个 SKU 归哪个账号（不再看商智成交）。
 
-    规则（按优先级）：
-      1) SKU 在哪个账号有商智成交（件数最多者；件数相同看成交额）→ 该 SKU 的
-         CPS / 京准通花费整体归到那个账号；
-      2) 所有账号都没有成交（例如全站智能推广的 spu）→ 各自保留自己投的那份，不合并。
-    返回 {skuId: {"owner", "cps", "jzt", "byAcc": {acc: {"cps", "jzt"}}}}。
+    规则：谁在这个 SKU 上花了钱（京准通 / CPS 佣金），这笔花费就永远记在谁名下；
+    同一个 SKU 两个账号都在投，就各记各的那份，绝不把 B 的花费搬到 A 的表里。
+    商智只提供成交件数与前台价，不参与账号归属。
+
+    返回 {skuId: {"owners": [...], "cps": 合计, "jzt": 合计,
+                  "byAcc": {acc: {"cps", "jzt"}}}}。
     """
-    owners: dict[int, str] = {}
-    weights: dict[int, tuple] = {}
-    for acc, coll in parts.items():
-        for sid, c in coll.items():
-            qty = int(c.get("qty") or 0)
-            if qty <= 0:
-                continue
-            w = (qty, float(c.get("szAmt") or 0))
-            if sid not in weights or w > weights[sid]:
-                weights[sid] = w
-                owners[sid] = acc
-
     out: dict[int, dict] = {}
     for acc, coll in parts.items():
         for sid, c in coll.items():
-            slot = out.setdefault(int(sid), {"cps": 0.0, "jzt": 0.0,
-                                             "byAcc": {}, "spendAccts": []})
+            sid = int(sid)
+            slot = out.setdefault(sid, {"owners": [], "cps": 0.0, "jzt": 0.0, "byAcc": {}})
             cps = float(c.get("cpsCost") or 0)
             jzt = float(c.get("jztCost") or 0)
             slot["cps"] += cps
             slot["jzt"] += jzt
-            slot["byAcc"][acc] = {"cps": round(cps, 2), "jzt": round(jzt, 2)}
             if cps or jzt:
-                slot["spendAccts"].append(acc)
-    for sid, slot in out.items():
-        slot["owner"] = owners.get(sid) or ""
+                slot["byAcc"][acc] = {"cps": round(cps, 2), "jzt": round(jzt, 2)}
+                if acc not in slot["owners"]:
+                    slot["owners"].append(acc)
+    for slot in out.values():
         slot["cps"] = round(slot["cps"], 2)
         slot["jzt"] = round(slot["jzt"], 2)
     return out
@@ -261,52 +302,16 @@ def attribute_spend(parts: dict[str, dict[int, dict]]) -> dict[int, dict]:
 
 def rows_for_account(parts: dict[str, dict[int, dict]], attributed: dict[int, dict],
                      acc: str, costs: dict | None = None) -> list[dict]:
-    """生成某个账号的利润行：成交取自己的，花费取「归集到自己」的那份。
+    """生成某个账号的利润表：成交取本账号商智，花费只记本账号京准通花的那份。
 
-    有归属人的 SKU：花费整体归到成交账号（只算一次）；
-    没有归属人的 SKU：各账号只保留自己投的那份，避免两张表重复计算。
+    花费跟着「投放账号」走：本账号投的商品即使成交记在另一个账号的商智里，
+    这笔钱也只留在本账号；另一张表不会重复出现，也不会有钱被搬走。
     """
-    coll = parts.get(acc) or {}
-    merged: dict[int, dict] = {}
-
-    def _put(sid: int, item: dict) -> None:
-        merged[int(sid)] = item
-
-    for sid, c in coll.items():
-        slot = attributed.get(int(sid)) or {}
-        owner = slot.get("owner") or ""
-        if owner:
-            mine = (owner == acc)
-            cps = float(slot.get("cps") or 0) if mine else 0.0
-            jzt = float(slot.get("jzt") or 0) if mine else 0.0
-        else:
-            own = (slot.get("byAcc") or {}).get(acc) or {}
-            cps = float(own.get("cps") or 0)
-            jzt = float(own.get("jzt") or 0)
-        _put(sid, {"skuId": int(sid), "itemName": c.get("itemName") or "",
-                   "qty": int(c.get("qty") or 0), "szAmt": float(c.get("szAmt") or 0),
-                   "cpsCost": cps, "jztCost": jzt,
-                   "accts": list(c.get("accts") or [acc]),
-                   "spendAccts": list(slot.get("spendAccts") or [acc])})
-
-    # 花费归到本账号、但本账号商智里没有这个 SKU（极少见）：补一行，便于看到这笔钱
-    for sid, slot in attributed.items():
-        if sid in merged:
-            continue
-        owner = slot.get("owner") or ""
-        if owner and owner != acc:
-            continue
-        if not owner:
-            own = (slot.get("byAcc") or {}).get(acc) or {}
-            cps, jzt = float(own.get("cps") or 0), float(own.get("jzt") or 0)
-        else:
-            cps, jzt = float(slot.get("cps") or 0), float(slot.get("jzt") or 0)
-        if not cps and not jzt:
-            continue
-        _put(sid, {"skuId": int(sid), "itemName": "", "qty": 0, "szAmt": 0.0,
-                   "cpsCost": cps, "jztCost": jzt,
-                   "accts": [], "spendAccts": list(slot.get("spendAccts") or [])})
-    return finalize(merged, costs=costs)
+    rows = finalize(parts.get(acc) or {}, costs=costs)
+    for r in rows:
+        # 「花费账号」只列真正掏钱的账号，本表恒为本账号（没有花费则留空）
+        r["spendAccts"] = [acc] if (r.get("cpsCost") or r.get("jztCost")) else []
+    return rows
 
 
 def totals_of(rows: list[dict]) -> dict:
@@ -359,7 +364,8 @@ def _merge_row(a: dict, b: dict) -> dict:
 
 # ================================================================ Excel
 def build_xlsx(rows: list[dict], start: str, end: str, account_label: str = "",
-               totals: dict | None = None, notes: list | None = None) -> bytes:
+               totals: dict | None = None, notes: list | None = None,
+               dim: str = "sku") -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -425,6 +431,14 @@ def build_xlsx(rows: list[dict], start: str, end: str, account_label: str = "",
         ws3.append(["备注", n])
     ws3.column_dimensions["A"].width = 18
     ws3.column_dimensions["B"].width = 100
+
+    if dim == "cat":
+        # 「按品类导出」：删掉 SKU 明细页，品类汇总成为首屏（与「花费一览」的导出一致）
+        try:
+            wb.remove(wb["SKU利润"])
+        except KeyError:
+            pass
+        wb.active = 0
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -497,6 +511,8 @@ class ProfitRunner:
             return None
         if not data.get("rows"):
             return None
+        if int(data.get("logicVersion") or 0) != LOGIC_VERSION:
+            return None          # 旧口径算的缓存：当没命中，重算一次（文件保留不删）
         st = fp.stat()
         data["savedAt"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
         by = data.get("byAccount") or {}
@@ -548,6 +564,8 @@ class ProfitRunner:
                 return None
             if not data.get("byAccount"):
                 return None
+            if int(data.get("logicVersion") or 0) != LOGIC_VERSION:
+                return None      # 有一段是旧口径，拼出来的数也不可信
             parts.append((data, time.strftime("%Y-%m-%d %H:%M",
                                               time.localtime(fp.stat().st_mtime))))
 
@@ -680,7 +698,7 @@ class ProfitRunner:
                         for c in keep]
             xlsx = build_xlsx(rows_cat, data["start"], data["end"],
                               data.get("accountLabel") or data.get("account"),
-                              totals=data.get("totals"), notes=data.get("notes"))
+                              totals=data.get("totals"), notes=data.get("notes"), dim="cat")
         else:
             xlsx = build_xlsx(rows, data["start"], data["end"],
                               data.get("accountLabel") or data.get("account"),
@@ -742,6 +760,13 @@ class ProfitRunner:
         src = settings.COSTS_SOURCE or {}
         if src.get("kind") and src.get("kind") != "供货方接口":
             data["notes"].append(f"成本口径：{src.get('kind')}（{src.get('detail')}）")
+        guard = (costs or {}).get("_guard") or []
+        if guard:
+            info = "、".join(f"{g['skuId']}（{g['used']} 元，接口给 {g['rejected']}）"
+                             for g in guard[:6])
+            data["notes"].append(
+                f"{len(guard)} 个 SKU 的 ERP 单件货款成本比上一版暴涨 3 倍以上且高于到手结算价，"
+                f"已沿用上一版数值：{info}。请让供货方核对最近几天的成本记录。")
         return changed
 
     def reprice(self, job_id: str | None = None, account: str | None = None,
@@ -814,23 +839,40 @@ class ProfitRunner:
             parts: dict[str, dict] = {}
             notes: list[str] = []
             per_acc: dict[str, dict] = {}
+            sz_parts: dict[str, list[dict]] = {}
+            cps_parts: dict[str, dict] = {}
+            jzt_parts: dict[str, dict] = {}
+            names_parts: dict[str, dict] = {}
+            # accounts[0] 是用户在下拉框里选中的账号：它必须能抓到，其余账号只是为了
+            # 跨账号归集成交/花费。新加的账号还没扫码时登录态是失效的，不能因为
+            # 它一个没登录就把整次查询打挂——跳过它并在提示里说明。
+            first = accounts[0] if accounts else ""
+            done_accounts: list[str] = []
             for idx, account in enumerate(accounts, 1):
-                self._set(message=f"等待浏览器登录态（{account}，{idx}/{len(accounts)}）…")
+                acc_label = settings.get_account(account).get("label") or account
+                self._set(message=f"等待浏览器登录态（{acc_label}，{idx}/{len(accounts)}）…")
                 if not lock.acquire(timeout=900):
                     raise RuntimeError("浏览器登录态被占用（登录/抓取/其他任务），请稍后重试")
                 pw = ctx = None
                 try:
-                    self._set(message=f"正在启动浏览器（{account}）…")
+                    self._set(message=f"正在启动浏览器（{acc_label}）…")
                     pw, ctx = launch_persistent(headless=True, account=account)
                     page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
                     page.goto(BOARD_PAGE, wait_until="domcontentloaded", timeout=90000)
                     page.wait_for_timeout(8000)
                     if not session_ok(page):
-                        raise RuntimeError(f"{account} 登录态失效：请先到「登录」页扫码，或点控制台的「立即续期」")
+                        if account == first:
+                            raise RuntimeError(
+                                f"{acc_label}（{account}）登录态失效：请先到「登录」页扫码，"
+                                f"或点控制台的「立即续期」")
+                        notes.append(
+                            f"{acc_label}（{account}）登录态失效，本次已跳过该账号"
+                            f"（它的成交与花费都不计入）；到「登录」页扫码后重新查询即可补上。")
+                        continue
 
-                    self._set(message=f"正在取商智成交件数（{account}，{start} ~ {end}）…")
+                    self._set(message=f"正在取商智成交件数（{acc_label}，{start} ~ {end}）…")
                     sz_rows = fetch_sz_rows(page, start, end)
-                    self._set(message=f"{account} 商智返回 {len(sz_rows)} 行，检查花费缓存…")
+                    self._set(message=f"{acc_label} 商智返回 {len(sz_rows)} 行，检查花费缓存…")
                     # 花费缓存缺失就地补齐：同一个浏览器、同一个账号、同一个区间，
                     # 抓完写进「花费一览」同一套缓存文件，不用再让用户去别的页面手动补。
                     for mode, label in (("cps", "CPS 花费"), ("spend", "京准通花费")):
@@ -879,34 +921,103 @@ class ProfitRunner:
                         if sid and r.get("itemName"):
                             names.setdefault(sid, r["itemName"])
                 per_acc[account] = {"rows": len(sz_rows), "spend": round(sum(jzt.values()), 2)}
-                parts[account] = collect(sz_rows, cps, jzt, names=names, accounts=[account])
+                sz_parts[account] = sz_rows
+                cps_parts[account] = cps
+                jzt_parts[account] = jzt
+                names_parts[account] = names
+                done_accounts.append(account)
+
+            if not done_accounts:
+                raise RuntimeError("所配账号登录态全部失效，本次没有可用账号：请先到「登录」页扫码")
+
+            # 商智是「SKU 的数据」，不是某个账号的数据：先按 SKU 把所有账号的商智合成一张表。
+            # 同一 SKU 只有卖它的那个店铺有成交，所以按 skuId 天然唯一。
+            sz_by_sku = merge_sz_by_sku(sz_parts)
+
+            # 行集只看京准通：本账号**有投放**的商品才出现在这张表里（商智没投放的商品不列）。
+            # 成交件数/前台价再从全局商智按 SKU 补——SKU 在别家店铺卖，就取那家的数据。
+            parts = {}
+            for account in done_accounts:
+                keys = set((jzt_parts.get(account) or {}).keys())
+                cps_used = {k: v for k, v in (cps_parts.get(account) or {}).items()
+                            if k in keys}
+                sz_used = [r for r in (sz_parts.get(account) or []) if sz_sku(r) in keys]
+                parts[account] = collect(sz_used, cps_used, jzt_parts.get(account) or {},
+                                         names=names_parts.get(account) or {}, accounts=[account])
+
+            filled = 0
+            for account in done_accounts:
+                for sid, c in (parts.get(account) or {}).items():
+                    if int(c.get("qty") or 0) > 0 or float(c.get("szAmt") or 0) > 0:
+                        continue
+                    src = sz_by_sku.get(int(sid))
+                    if not src:
+                        continue          # 两个账号的商智都没有它，才是真的没成交
+                    c["qty"] = int(src["qty"])
+                    c["szAmt"] = float(src["amt"])
+                    if not c.get("itemName"):
+                        c["itemName"] = src.get("name") or ""
+                    if src["acc"] and src["acc"] not in (c.get("accts") or []):
+                        c.setdefault("accts", []).append(src["acc"])
+                    filled += 1
+            if filled:
+                notes.append(f"{filled} 个 SKU 的商智成交取自另一个账号（商智按 SKU 归集，"
+                             f"不跟着账号走）：件数/前台价/毛利都按卖出它的那个店铺补全，"
+                             f"花费仍只记在投放账号。")
 
             self._set(message="正在读取 ERP 到手结算价…")
             costs = settings.load_costs(start, end)
+            guard = (costs or {}).get("_guard") or []
+            if guard:
+                info = "、".join(f"{g['skuId']}（{g['used']} 元，接口给 {g['rejected']}）"
+                                 for g in guard[:6])
+                notes.append(f"{len(guard)} 个 SKU 的 ERP 单件货款成本比上一版暴涨 3 倍以上"
+                             f"且高于到手结算价，已沿用上一版数值，避免算出假亏损：{info}。"
+                             f"请让供货方核对最近几天的成本记录。")
             if not (costs or {}).get("skus"):
                 notes.append("ERP 成本接口没有返回任何 SKU（可能 Token 失效或区间无数据），"
                              "到手结算价按 0 处理，请检查成本接口。")
 
-            self._set(message="正在按 SKU 把花费归集到对应账号…")
+            self._set(message="正在按京准通花费把商品归到投放账号…")
             attributed = attribute_spend(parts)
             by_account: dict[str, dict] = {}
-            for acc in accounts:
+            for acc in done_accounts:
                 rows = rows_for_account(parts, attributed, acc, costs=costs)
                 by_account[acc] = {"rows": rows, "totals": totals_of(rows),
                                    "label": settings.get_account(acc).get("label") or acc}
-            main_acc = accounts[0]
+            main_acc = done_accounts[0]
             rows = by_account[main_acc]["rows"]
             totals = by_account[main_acc]["totals"]
             if not any(b["rows"] for b in by_account.values()):
                 raise RuntimeError("该区间没有任何成交/花费数据（商智可能还没出数，或区间选到了今天）")
 
-            moved = [sid for sid, v in attributed.items()
-                     if v.get("owner") and any(a != v["owner"] for a in (v.get("spendAccts") or []))]
-            if moved:
-                notes.append(
-                    f"已按 SKU 归集：{len(moved)} 个 SKU 的广告花费由投放账号归到了一直出单的账号"
-                    f"（例如账号B 投主账号的商品，这笔钱记在主账号那一行），"
-                    f"所以两个账号的利润表都能对上，不会再出现「有花费没成交」的虚行。")
+            spend_txt = "、".join(f"{by_account[a]['label']} {by_account[a]['totals']['jztCost']:,.2f}"
+                                 for a in done_accounts)
+            notes.append(f"京准通花费按投放账号归集（谁投的算谁的，不跨账号搬运）："
+                         f"{spend_txt} 元。该数应等于各账号「京准通花费」页的合计。")
+            notes.append("表里只列本账号京准通有投放的商品；CPS 佣金也只算这些商品的，"
+                         "账号全部佣金看「CPS 花费」页。")
+            for acc in done_accounts:
+                total_cps = round(sum((cps_parts.get(acc) or {}).values()), 2)
+                used_cps = round(sum(float(r.get("cpsCost") or 0)
+                                     for r in by_account[acc]["rows"]), 2)
+                rest = round(total_cps - used_cps, 2)
+                if abs(rest) >= 0.01:
+                    notes.append(f"{by_account[acc]['label']}：CPS 佣金合计 {total_cps:,.2f} 元，"
+                                 f"其中 {used_cps:,.2f} 元落在本表商品上，"
+                                 f"另外 {rest:,.2f} 元在所投商品之外的 SKU 上（不在这张表里）。")
+            for acc in done_accounts:
+                only = [r for r in by_account[acc]["rows"]
+                        if not r.get("qty") and (r.get("jztCost") or r.get("cpsCost"))]
+                if only:
+                    amt = sum(float(r.get("jztCost") or 0) + float(r.get("cpsCost") or 0)
+                              for r in only)
+                    notes.append(f"{by_account[acc]['label']}：{len(only)} 个 SKU 有广告花费，"
+                                 f"但两个账号的商智都没有成交（{amt:,.2f} 元）——"
+                                 f"要么没出单，要么卖出去的 SKU 跟投的不是同一个，需要人工核对。")
+            shared = [sid for sid, v in attributed.items() if len(v.get("owners") or []) > 1]
+            if shared:
+                notes.append(f"{len(shared)} 个 SKU 两个账号都在投，各自只记自己花的那份。")
 
             no_supply = sum(1 for b in by_account.values() for r in b["rows"] if not r.get("arrival"))
             if no_supply:
@@ -917,11 +1028,12 @@ class ProfitRunner:
                 notes.append(f"成本口径：{src.get('kind')}（{src.get('detail')}）")
 
             label = " + ".join(b["label"] for b in by_account.values())
-            payload = {"jobId": job_id, "account": main_acc, "accounts": accounts,
+            payload = {"jobId": job_id, "account": main_acc, "accounts": done_accounts,
+                       "logicVersion": LOGIC_VERSION,
                        "accountLabel": label, "start": start, "end": end,
                        "rows": rows, "totals": totals, "byAccount": by_account,
-                       "owner": {str(k): v.get("owner") for k, v in attributed.items()
-                                 if v.get("owner")},
+                       "owner": {str(k): ",".join(v.get("owners") or [])
+                                 for k, v in attributed.items() if v.get("owners")},
                        "notes": notes, "finishedAt": settings.now_iso(),
                        "costSource": settings.COSTS_SOURCE, "perAccount": per_acc}
             self._results[job_id] = payload
