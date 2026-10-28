@@ -53,6 +53,9 @@ services:
       LLM_MAX_TOKENS: "${LLM_MAX_TOKENS:-8000}"
       JD_AI_ENABLED: "${JD_AI_ENABLED:-1}"
       JD_AI_RANGE_DAYS: "${JD_AI_RANGE_DAYS:-7}"
+      # 子路径挂载：被 nginx 反代到 /jdfenxi/ 这类前缀时设为 /jdfenxi，
+      # 页面里的根路径链接与 302 跳转会自动补前缀；留空则按根路径运行（原行为）
+      JD_URL_PREFIX: "${JD_URL_PREFIX:-}"
       # 也可以在环境变量里直接给账号（JSON），优先级高于 config/accounts.json
       # JD_ACCOUNTS: '[{"key":"main","label":"主账号","account_id":10000000001}]'
     volumes:

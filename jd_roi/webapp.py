@@ -41,6 +41,7 @@ import html
 import io
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -54,6 +55,39 @@ from . import (aijobs, ai_page, analyze2, analyze_ai, config, dailystore as ds,
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
+
+# ================================================================ 子路径挂载
+# 公网 nginx 把本服务反代到子路径（如 http://<ip>/jdfenxi/）时，页面里的根路径
+# 链接（href="/login"、fetch('/api/...')）和 302 的 Location 都要补上前缀，
+# 否则浏览器会把这些地址解析到主站根路径，跑到别的应用上。
+# 由环境变量 JD_URL_PREFIX 开启；不设置时行为与原来完全一致。
+URL_PREFIX = (os.getenv("JD_URL_PREFIX", "") or "").rstrip("/")
+
+if URL_PREFIX:
+    _ATTR_RE = re.compile(r'\b(href|src|action)=(["\'])/(?!/)')
+    # 只给已知的首段路径补前缀，避免误伤 JS 里的 split('/') 之类的普通字符串
+    _URL_STR_RE = re.compile(
+        r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico)\b)')
+
+    @app.middleware("http")
+    async def _prefix_urls(request: Request, call_next):
+        resp = await call_next(request)
+        loc = resp.headers.get("location")
+        if loc and loc.startswith("/") and not loc.startswith("//"):
+            resp.headers["location"] = URL_PREFIX + loc
+        # SSE（/api/ai/stream）等非 HTML 响应原样放行，不能缓冲
+        if "text/html" not in resp.headers.get("content-type", ""):
+            return resp
+        buf = bytearray()
+        async for chunk in resp.body_iterator:
+            buf += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+        text = buf.decode("utf-8", "replace")
+        text = _ATTR_RE.sub(lambda m: f"{m.group(1)}={m.group(2)}{URL_PREFIX}/", text)
+        text = _URL_STR_RE.sub(lambda m: f"{m.group(1)}{URL_PREFIX}/", text)
+        headers = {k: v for k, v in resp.headers.items()
+                   if k.lower() not in ("content-length", "content-type")}
+        return Response(content=text.encode("utf-8"), status_code=resp.status_code,
+                        headers=headers, media_type="text/html; charset=utf-8")
 
 KINDS_UI = [("jzt_campaign", "概览计划"), ("jst_campaign", "投放计划"),
             ("jst_sku", "投放商品"), ("jst_searchword", "搜索词"),
