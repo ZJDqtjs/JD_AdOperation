@@ -854,7 +854,9 @@ PAYCOMM_NOTES = {
 拿不到时退回报表中心创意报表（<code>/reweb/msa/base/ad/list</code>）的落地页 SKU，
 那个报表<b>包含已删除的计划</b>（例如 8 月有一个已删关键词计划 6,012 元仍在花费）。</p>
 <p><b>全站智能推广</b>：以报表中心计划报表（<code>/reweb/msa/base/campaign/list</code>）的计划级金额为准，
-<b>含已删除计划</b>；再用计划上的 <code>spuId</code> 归到商品，已删计划拿不到 spuId 时按同名计划回找。</p>
+<b>含已删除计划</b>。计划按 SPU 投放、SPU 下的 SKU 可拉黑，所以再查推广管理
+（<code>/dspad/smartmax/forbidden/list</code>）拿「生效 SKU」（SPU 全部 SKU − 黑名单），花费在生效 SKU 间<b>平分</b>。
+拿不到名单的退回整笔记 spuId；已删计划拿不到 spuId 时按同名计划回找。</p>
 <p><b>全站营销</b>：报表（<code>/reweb/swa/account/campaign/list</code>）的单品推广只给到 SPU，
 真正投放的是该 SPU 下没被拉黑的 SKU——再查推广管理（<code>/swa/ad/list</code> +
 <code>/swa/forbidden/list</code>）拿 <code>deliverySkuIds</code>，一个计划投几个 SKU 就<b>平分</b>（尾差给最后一个）。

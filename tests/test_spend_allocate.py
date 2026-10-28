@@ -54,15 +54,26 @@ def main() -> int:
         {"sxuId": 0, "cost": "20.00", "adName": "全店推广", "_swaType": 118},
     ]
 
-    got = paycomm.allocate(jst_rows, creative_rows, msa_plans, promolist_rows, swa_rows)
+    # 全站智能推广的 SPU 生效 SKU：200000001 这个 SPU 下 3 个 SKU 都在投（黑名单 0 个）
+    shop_delivery = {
+        200000001: {"skus": [200000001, 200000003, 200000004], "names": {200000003: "佛手柑2个装"},
+                    "black": 0},
+        200000002: {"skus": [200000002], "names": {}, "black": 1},
+    }
+    got = paycomm.allocate(jst_rows, creative_rows, msa_plans, promolist_rows, swa_rows,
+                           shop_delivery=shop_delivery)
     by, tot = got["bySku"], got["totals"]
 
     assert by[100000001]["jst"] == 100.0 and by[100000001]["kw"] == 30.0, by[100000001]
     assert by[100000002]["jst"] == 50.0, by[100000002]
     assert by[100000003]["swa"] == 80.0, by[100000003]
-    # 全站智能推广：在投按 campaignId→spuId，已删按同名计划回找 spuId
-    assert by[200000001]["shop"] == 200.0, by[200000001]
+    # 全站智能推广：SPU 下「生效 SKU」平分（200/3 → 66.67/66.67/66.66），尾差给最后一个
+    assert by[200000001]["shop"] == 66.67, by[200000001]
+    assert by[200000003]["shop"] == 66.67, by[200000003]
+    assert by[200000004]["shop"] == 66.66, by[200000004]
+    # 已删计划同名回找到 spu 200000002，其生效名单里只有它自己 → 整笔 70
     assert by[200000002]["shop"] == 70.0, by[200000002]
+    assert tot["shopSplit"] == 1, tot
 
     # 未归因：关键词 20 + 全站智能推广 30 + 全站营销 20
     unattr = {u["key"]: u["cost"] for u in got["unattrRows"]}

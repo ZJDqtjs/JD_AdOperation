@@ -72,7 +72,8 @@ SPEND_FIELDS = [
 #   1 = 智能投放 + 关键词 + 全站智能推广（漏已删计划、没有全站营销）
 #   2 = 快车金额以报表中心计划级为准（含已删），新增全站营销(swa)，分不到的单独列「未归因」
 #   3 = 关键词改为推广管理创意的 skuId；全站营销按「实际投放 SKU」(deliverySkuIds) 平分
-SPEND_SCHEMA = 3
+#   4 = 全站智能推广也按 SPU 下「生效 SKU」（全部 SKU − 黑名单）平分，不再整笔记 spuId
+SPEND_SCHEMA = 4
 
 # 「未归因」行的固定 SKU 编号（负数是给跨区间拼接用的稳定 key，不是真实商品）
 UNATTR_IDS = {"shop": -9101, "kw": -9102, "swa": -9103, "other": -9104}
@@ -160,6 +161,11 @@ SWA_FORBID_API = "https://jzt-api.jd.com/swa/forbidden/list"
 # 快车推广管理：创意列表直接带 skuId（关键词计划推的是哪个商品）
 MSA_AD_API = "https://atoms-api.jd.com/dspad/msa/promolist/item/keyword/ad"
 MSA_PAGE = "https://jzt.jd.com/msa/index.html#/list/tab/plan?objective=overview"
+MSA_SMART_PAGE = ("https://jzt.jd.com/msa/#/list/shopSmart?objective=item"
+                  "&scenario=normal&targetingType=shopSmart")
+# 全站智能推广：SPU 下「生效 SKU」列表（拉黑的 SKU 不参与投放）
+MSA_FORBID_API = "https://atoms-api.jd.com/dspad/smartmax/forbidden/list"
+MSA_MAX_BUSINESS = 600000013
 
 _JS_REPORT = """
 async ({url, payload}) => {
@@ -435,6 +441,55 @@ def fetch_swa_delivery(page, start: str, end: str) -> dict:
     return out
 
 
+def fetch_msa_spu_skus(page, spu_ids: list[int]) -> dict:
+    """全站智能推广（campaignType=153）：SPU → 该 SPU 下**真正在投**的 SKU。
+
+    计划按 SPU 投放，SPU 下的 SKU 可以拉黑（推广管理 → 更多 → 设置SKU黑名单），
+    接口一次就能给全部 SPU 的生效 SKU（`spuEffectiveSkuMap`）+ 拉黑数量（`spuSkuNumMap`）。
+    返回 {spuId: {"skus": [...], "names": {...}, "black": n}}。
+    """
+    spus = sorted({int(x) for x in (spu_ids or []) if int(x or 0) > 0})
+    if not spus:
+        return {}
+    out: dict[int, dict] = {}
+    for i in range(0, len(spus), 40):          # 一次别塞太多，分批
+        batch = spus[i:i + 40]
+        payload = {
+            "spuIds": batch, "businessType": MSA_MAX_BUSINESS, "campaignType": 153,
+            "searchType": 2,
+            "campaignInfoList": [{"campaignId": 0, "adGroupId": 0, "spuId": spu,
+                                  "jointActivityId": None, "activityType": None}
+                                 for spu in batch],
+            "requestFrom": 0,
+        }
+        try:
+            data = _post_atoms(page, MSA_FORBID_API, payload).get("data") or {}
+        except Exception:  # noqa: BLE001
+            continue
+        eff = data.get("spuEffectiveSkuMap") or {}
+        nums = data.get("spuSkuNumMap") or {}
+        details = data.get("skuDetailMap") or {}
+        for spu in batch:
+            skus = []
+            for x in eff.get(str(spu)) or eff.get(spu) or []:
+                try:
+                    skus.append(int(x))
+                except (TypeError, ValueError):
+                    pass
+            if not skus:
+                continue
+            names: dict[int, str] = {}
+            for sid in skus:
+                v = details.get(str(sid)) or details.get(sid) or {}
+                nm = str(v.get("skuName") or v.get("name") or "")
+                if nm:
+                    names[sid] = nm
+            black = int((nums.get(str(spu)) or {}).get("blackSkuNum") or 0)
+            out[int(spu)] = {"skus": skus, "names": names, "black": black}
+        _sleep(DELAY_PAGE)
+    return out
+
+
 def fetch_kw_creative_skus(page, page_size: int = 200) -> dict:
     """快车关键词创意 → 它推的是哪个 SKU（管理页接口直接返回 skuId）。
 
@@ -515,12 +570,14 @@ def _match_spu(name, by_name: dict) -> int:
 
 def allocate(jst_rows: list[dict], creative_rows: list[dict], msa_plans: list[dict],
              promolist_rows: list[dict], swa_rows: list[dict],
-             kw_skus: dict | None = None, swa_delivery: dict | None = None) -> dict:
+             kw_skus: dict | None = None, swa_delivery: dict | None = None,
+             shop_delivery: dict | None = None) -> dict:
     """把四路口径按 SKU 归集；归不到的单独列出，**绝不按比例分摊**。
 
     1) 智能投放  jst 商品报表按 skuId（含已下线计划）
     2) 关键词    推广管理创意接口的 skuId（最准）；取不到退回创意落地页 URL（含已删计划）
-    3) 全站智能推广  报表中心计划级金额（含已删计划）+ 计划上的 spuId（已删按同名计划回找）
+    3) 全站智能推广  报表中心计划级金额（含已删计划）+ 计划 spuId → SPU 下**生效 SKU 平分**
+       （生效 SKU = SPU 的全部 SKU − SKU 黑名单；拿不到名单时退回整笔记 spuId）
     4) 全站营销  单品推广按「实际投放 SKU」(deliverySkuIds) 平分；全店/新品推广没有 SKU → 未归因
     总额校验：快车已归集 + 未归因 必须等于计划级合计（= 京准通「快车花费」）。
     """
@@ -569,6 +626,7 @@ def allocate(jst_rows: list[dict], creative_rows: list[dict], msa_plans: list[di
 
     by_id, by_name = _spu_maps(promolist_rows)
     msa_total = 0.0
+    shop_split = 0
     for p in msa_plans or []:
         cost = float(p.get("cost") or 0)
         if not cost:
@@ -582,11 +640,23 @@ def allocate(jst_rows: list[dict], creative_rows: list[dict], msa_plans: list[di
         except (TypeError, ValueError):
             cid = 0
         spu = by_id.get(cid) or _match_spu(p.get("campaignName"), by_name)
-        if spu:
-            bucket(spu)["shop"] += cost
-            hints.setdefault(spu, _clean_name(p.get("campaignName")))
-        else:
+        if not spu:
             unattr["shop"] += cost
+            continue
+        # 计划是按 SPU 投的：SPU 下没被拉黑的 SKU 才真正在投，花费在它们之间平分
+        info = (shop_delivery or {}).get(spu) or {}
+        skus = list(info.get("skus") or [spu])
+        share = round(cost / len(skus), 2)
+        last = round(cost - share * (len(skus) - 1), 2)
+        if len(skus) > 1:
+            shop_split += 1
+        for i, sku in enumerate(skus):
+            bucket(sku)["shop"] += last if i == len(skus) - 1 else share
+            nm = (info.get("names") or {}).get(sku)
+            if not nm:
+                nm = _clean_name(p.get("campaignName")) if sku == spu else ""
+            if nm:
+                hints.setdefault(sku, nm)
 
     swa_total = 0.0
     swa_split = 0
@@ -659,6 +729,7 @@ def allocate(jst_rows: list[dict], creative_rows: list[dict], msa_plans: list[di
         "msaPlanTotal": round(msa_total, 2),
         "swaPlanTotal": round(swa_total, 2),
         "swaSplit": swa_split,
+        "shopSplit": shop_split,
         "unattr": round(sum(r["cost"] for r in unattr_rows), 2),
         "skuCount": len(out),
     }
@@ -690,6 +761,16 @@ def fetch_spend(page, start: str, end: str, account_id: int | None = None) -> di
 
     # 快车计划列表：当前页面就在 msa 快车，直接取（spuId 映射）
     camps = fetch_campaigns(page, start, end)
+    # 全站智能推广计划涉及的 SPU：要去查「SPU 下生效 SKU」（黑名单除外）
+    shop_spus: list[int] = []
+    for r in camps.get("rows") or []:
+        try:
+            if int(r.get("campaignType") or 0) == 153:
+                spu = int(r.get("spuId") or 0)
+                if spu and spu not in shop_spus:
+                    shop_spus.append(spu)
+        except (TypeError, ValueError):
+            continue
     _sleep(DELAY_PAGE)
     # 智能投放商品报表：先切到 jst 报表页，保证接口上下文与现网一致
     try:
@@ -738,9 +819,16 @@ def fetch_spend(page, start: str, end: str, account_id: int | None = None) -> di
         swa_delivery = fetch_swa_delivery(page, start, end)
     except Exception:  # noqa: BLE001
         swa_delivery = {}
+    _sleep(DELAY_PAGE)
+    # 全站智能推广：SPU 下「生效 SKU」（SPU 全部 SKU − 黑名单），花费要平分
+    shop_delivery: dict = {}
+    try:
+        shop_delivery = fetch_msa_spu_skus(page, shop_spus)
+    except Exception:  # noqa: BLE001
+        shop_delivery = {}
 
     out = allocate(jst.get("rows") or [], creatives, plans, camps.get("rows") or [], swa,
-                   kw_skus=kw_skus, swa_delivery=swa_delivery)
+                   kw_skus=kw_skus, swa_delivery=swa_delivery, shop_delivery=shop_delivery)
     ext = camps.get("ext") or {}
     try:
         out["totals"]["campaignTotal"] = round(float(ext.get("cost") or 0), 2)
