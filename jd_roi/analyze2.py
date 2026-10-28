@@ -562,6 +562,10 @@ def sku_rows(accts, model, costs=None):
                 unit_price = round(_f(e["amt"]) / _f(e["qty"]), 2)
                 break
         cost = sku_cost_of(sid, unit_price or aovRef, model, costs, units)
+        if not unit_price:
+            # 商智该 SKU 在区间内没有成交件数：退到「广告客单价」，样本小时会很飘
+            # （例：3 单 230 元 → 76.5，而商智真实前台件单价 56）。页面要标出来。
+            cost["priceFallback"] = "ad" if aovRef else ""
         # 两条自动体检：
         #   ① 到手结算价 ≥ 前台件单价：不可能成立（到手结算价是消费者实付里的一部分），多半是促销价/期间口径不一致
         #   ② ERP 件数 ÷ 商智件数 偏离 1：仅作参考。实测换算系数取 1 才成立

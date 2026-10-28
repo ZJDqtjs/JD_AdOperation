@@ -386,6 +386,16 @@ def _money(v, dec=0) -> str:
     return f"{_n(v):,.{dec}f}"
 
 
+def _price_fb(s: dict) -> bool:
+    """前台件单价是不是「商智没数据 → 退用广告客单价」算出来的（样本小会很飘）。"""
+    return bool(((s or {}).get("costParams") or {}).get("priceFallback"))
+
+
+def _price_fb_tip(s: dict) -> str:
+    return ("；⚠ 本期商智该 SKU 没有成交件数，这里退用了广告客单价（成交额÷订单数），"
+            "样本小时会明显偏离真实前台价，仅供参照" if _price_fb(s) else "")
+
+
 def _num(v, dec=2) -> str:
     return f"{_n(v):,.{dec}f}"
 
@@ -414,14 +424,18 @@ def _badge(tier) -> str:
 
 
 def _roi_cls(roi, be) -> str:
-    roi, be = _n(roi), _n(be, 99)
+    """ROI 的字色只跟本行自己的保本线比：达到=绿，低于=红。
+
+    以前这里写死了 `roi >= 4 就绿`（全店口径时代保本线恒为 4.00 的遗留），
+    接入逐 SKU 成本后保本线在 3~7 之间浮动，写死 4 会把 ROI 4.50、保本 6.41
+    的品涂成绿色盈利，与同行的档位徽标（止损/严重亏损）自相矛盾。
+    """
+    roi, be = _n(roi), _n(be)
     if roi <= 0:
         return "flat"
-    if roi >= 4:
-        return "up"
-    if roi >= be:
-        return ""
-    return "down"
+    if be <= 0:
+        return "down"          # 保本线不存在 = 卖一件亏一件，投广告只会放大亏损
+    return "up" if roi >= be else "down"
 
 
 def _latest(s) -> dict:
@@ -434,12 +448,15 @@ def _latest_key(s) -> str:
 
 
 def _spark(vals, be) -> str:
+    """近 3 周 ROI 小柱：同样按该行自己的保本线分色（绿=达到、红=低于、灰=无花费）。"""
     mx = max([_n(v) for v in vals] + [1e-9])
+    b = _n(be)
     out = []
     for v in vals:
-        h = max(int(_n(v) / mx * 24), 2)
-        cls = "hi" if _n(v) >= 4 else ("lo" if _n(v) < _n(be, 99) else "")
-        out.append(f'<i class="{cls}" style="height:{h}px" title="ROI {_n(v):.2f}"></i>')
+        r = _n(v)
+        h = max(int(r / mx * 24), 2)
+        cls = "" if r <= 0 or b <= 0 else ("hi" if r >= b else "lo")
+        out.append(f'<i class="{cls}" style="height:{h}px" title="ROI {r:.2f}（保本 {b:.2f}）"></i>')
     return '<div class="bars">' + "".join(out) + "</div>"
 
 
@@ -465,8 +482,9 @@ def _plan_advice(p) -> str:
     cur = w2 if _n(w2["cost"]) > 0 else w1
     roi, cost = _n(cur["roi"]), _n(cur["cost"])
     t = p["tier"]
+    grow = _n(p.get("growLine")) or round(be * 1.25, 2)
     if t == "放大":
-        return f"ROI {roi:.2f} ≥ 4：加预算 20~30%，可复制到同款 SKU"
+        return f"ROI {roi:.2f} ≥ 放量线 {grow:.2f}（保本 {be:.2f}）：加预算 20~30%，可复制到同款 SKU"
     if t == "优化":
         return f"ROI {roi:.2f} 在保本 {be:.2f} 之上：抠废词、压 CPC，目标提到 {max(roi + 0.4, be + 0.3):.1f}"
     if t == "止损":
@@ -837,8 +855,9 @@ def _sku_row(i, s, labels) -> str:
         f'<td class="mono" data-v="{_n(cur["ord"])}">{int(_n(cur["ord"]))}</td>'
         f'<td class="mono" data-v="{_n(cur["cpa"])}">{_num(cur["cpa"], 2)}</td>'
         f'<td class="mono" data-v="{_n(s.get("unitPrice"))}" '
-        f'title="前台件单价＝商智成交额÷件数（消费者实付；扣点与京东差价已从里面扣掉才到我们手里）">'
-        f'{_money(s.get("unitPrice"), 1)}</td>'
+        f'title="前台件单价＝商智成交额÷件数（消费者实付；扣点与京东差价已从里面扣掉才到我们手里）'
+        f'{_price_fb_tip(s)}">'
+        f'{_money(s.get("unitPrice"), 1)}{"*" if _price_fb(s) else ""}</td>'
         f'{_supply_cell(s)}'
         f'<td class="mono" data-v="{_n(s["grossPerOrder"])}" title="{_e(_cost_tip(s))}">{_num(s["grossPerOrder"], 1)}</td>'
         f'<td class="mono" data-v="{_n(cur.get("adShare"))}">{_pct(cur.get("adShare"))}</td>'
@@ -1166,7 +1185,7 @@ def page_word(d) -> str:
   <h2>{_e(a["label"])} · 搜索词诊断 <span class="tagline">{_e(wk)} 窗口，按花费排序前 14 个计划</span></h2>
   <p class="hint">
     高效 {len(agg["good"])} 个 · 0单废词 {len(agg["waste"])} 个（浪费 ¥{_money(wa_cost)}）· 低效 {len(agg["low"])} 个。
-    判定标准：高效=订单≥2 且 ROI&gt;4.00；废词=花费≥3 且 0 单；低效=花费≥10 且 ROI&lt;4.00。
+    判定标准：高效=订单≥2 且 ROI&gt;该计划保本线；废词=花费≥3 且 0 单；低效=花费≥10 且 ROI&lt;该计划保本线。
     关键词推广计划看「关键词」，智能化 / 全站智能推广计划看「搜索词」。
   </p>
   <div class="toolbar" style="margin:2px 0 6px">{chips}</div>
