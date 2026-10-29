@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from pathlib import Path
 
 
@@ -409,28 +411,72 @@ def _costs_cache_write(data: dict) -> None:
         pass
 
 
+def _guard_costs(data: dict, prev: dict) -> dict:
+    """拦掉「单件货款成本突然暴涨」的 SKU：沿用上一版，避免上游一天脏数据毁掉整月利润。
+
+    判据（三条同时满足才拦）：新值 > 旧值 × 3、新值 > 到手结算价 × 1.5、旧值本身有效。
+    实测 2026-10-26 供货方接口把两个西兰苔 SKU 的 _goodsCost 从 ~16 元改成 829 元
+    （整月均值被拉到 116.8），利润表因此算出 -101 元/件的假亏损。
+    命中的 SKU 会留在 data["_guard"] 里，报表备注会列出来。
+    """
+    new_skus = data.get("skus") or {}
+    prev_skus = (prev or {}).get("skus") or {}
+    if not new_skus or not prev_skus:
+        return data
+    warn: list = []
+    for sid, rec in list(new_skus.items()):
+        old = prev_skus.get(sid) or {}
+        try:
+            n = float(rec.get("_goodsCost") or 0)
+            o = float(old.get("_goodsCost") or 0)
+            sup = float(rec.get("supply") or 0)
+        except (TypeError, ValueError):
+            continue
+        if n <= 0 or o <= 0 or sup <= 0:
+            continue
+        if n > o * 3 and n > sup * 1.5:
+            new_skus[sid] = dict(rec, _goodsCost=o, _guardedGoodsCost=n)
+            warn.append({"skuId": sid, "name": rec.get("_name") or "",
+                         "used": round(o, 2), "rejected": round(n, 2)})
+    if warn:
+        data["_guard"] = warn
+    return data
+
+
 def _costs_fetch(date_from: str = "", date_to: str = "") -> dict:
     """拉供货方 ERP 的 SKU 成本接口；任何异常都抛给调用方处理。"""
     import time
     import urllib.parse
     import urllib.request
 
-    url = COSTS_URL
+    headers = {"Accept": "application/json", "User-Agent": "jd-roi/1.0"}
+    if COSTS_TOKEN:
+        headers["X-Api-Token"] = COSTS_TOKEN
+
+    def _get(query: dict) -> dict:
+        url = COSTS_URL
+        if query:
+            url = f"{url}{'&' if '?' in url else '?'}{urllib.parse.urlencode(query)}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=COSTS_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     qs = {}
     if date_from:
         qs["date_from"] = date_from
     if date_to:
         qs["date_to"] = date_to
-    if qs:
-        url = f"{url}{'&' if '?' in url else '?'}{urllib.parse.urlencode(qs)}"
-    headers = {"Accept": "application/json", "User-Agent": "jd-roi/1.0"}
-    if COSTS_TOKEN:
-        headers["X-Api-Token"] = COSTS_TOKEN
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=COSTS_TIMEOUT) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        data = _get(qs)
+    except Exception:  # noqa: BLE001
+        # 供货方接口对「同时带 date_from + date_to」的请求会 500（2026-10-25 实测），
+        # 退一步不带区间再取一次（该接口本来就返回整张成本表）
+        if not qs:
+            raise
+        data = _get({})
     if not isinstance(data, dict) or not isinstance(data.get("skus"), dict):
         raise ValueError(f"成本接口返回结构异常：{str(data)[:160]}")
+    data = _guard_costs(data, _costs_cache_read())
     data["_fetched_at"] = time.time()
     data["_query"] = {"date_from": date_from, "date_to": date_to}
     return data
@@ -459,35 +505,81 @@ def costs_unit_map() -> dict:
     return out
 
 
-def load_costs(date_from: str = "", date_to: str = "") -> dict:
+_costs_lock = threading.Lock()
+_costs_pending: set = set()
+
+
+def _costs_refresh_async(date_from: str, date_to: str) -> None:
+    """后台按新区间重拉成本表，不阻塞当前这一次请求。同一个区间只排一次。"""
+    key = (date_from, date_to)
+    with _costs_lock:
+        if key in _costs_pending:
+            return
+        _costs_pending.add(key)
+
+    def run() -> None:
+        t0 = time.time()
+        try:
+            data = _costs_fetch(date_from, date_to)
+            _costs_cache_write(data)
+            print(f"[成本表] 后台刷新完成 {date_from} ~ {date_to}："
+                  f"{len(data.get('skus') or {})} 个 SKU，耗时 {time.time() - t0:.1f}s", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[成本表] 后台刷新失败 {date_from} ~ {date_to}（保留旧表）："
+                  f"{type(e).__name__}: {e}", flush=True)
+        finally:
+            with _costs_lock:
+                _costs_pending.discard(key)
+
+    threading.Thread(target=run, daemon=True, name="costs-refresh").start()
+
+
+def load_costs(date_from: str = "", date_to: str = "", force: bool = False) -> dict:
     """每个 SKU 的真实成本：远端接口优先 → 本地缓存 → config/costs.json → 空（全店口径）。
 
     返回结构：{"default": {...}, "skus": {"<skuId>": {"supply":…, "_goodsCost":…}},
     外加 "_source"/"updatedAt" 等说明字段，供报表标注成本口径来源。
     接口口径：**到手结算价 supply = 京东结算给我们的每件金额（收入，已扣点）**，
     _goodsCost 才是我方货款成本 —— 见《SKU成本接口对接说明.md》第 2 节。
+
+    性能约定：接口按区间算均值，实测 1 天 ~0.1s、10 天 ~1s、整月 ~4-7s。
+    报表页开一次就同步等接口会白屏好几秒，所以除了「本地无表」和 force（用户点
+    「只更新 ERP 成本」）之外，一律**先用本地已有的表秒出**，新区间丢给后台线程刷新，
+    下一次请求自然就用上新数据了。
     """
     global COSTS_SOURCE
     if COSTS_URL:
         cached = _costs_cache_read()
-        fresh = (cached.get("skus") and
-                 time_ago(cached.get("_fetched_at")) < COSTS_TTL and
-                 (cached.get("_query") or {}).get("date_from", "") == date_from and
-                 (cached.get("_query") or {}).get("date_to", "") == date_to)
-        if not fresh:
+        has = bool(cached.get("skus"))
+        prev = cached.get("_query") or {}
+        same = prev.get("date_from", "") == date_from and prev.get("date_to", "") == date_to
+        age = time_ago(cached.get("_fetched_at"))
+        if force or not has:
+            # 用户显式要求刷新，或本地一份都没有：只能同步等接口
             try:
+                t0 = time.time()
                 cached = _costs_fetch(date_from, date_to)
                 _costs_cache_write(cached)
                 COSTS_SOURCE = {"kind": "供货方接口",
-                                "detail": f"{COSTS_URL}｜updatedAt {cached.get('updatedAt', '—')}"}
+                                "detail": f"{COSTS_URL}｜updatedAt {cached.get('updatedAt', '—')}"
+                                          f"｜耗时 {time.time() - t0:.1f}s"}
                 return cached
             except Exception as e:  # noqa: BLE001  断网/Token 失效/5xx 都走缓存，不阻断报表
                 print(f"[成本表] 接口拉取失败，改用本地缓存/costs.json：{type(e).__name__}: {e}")
-                COSTS_SOURCE = {"kind": "本地缓存" if cached.get("skus") else "本地成本文件",
+                COSTS_SOURCE = {"kind": "本地缓存" if has else "本地成本文件",
                                 "detail": f"接口失败：{type(e).__name__}: {e}"}
-        else:
+        elif same and age < COSTS_TTL:
             COSTS_SOURCE = {"kind": "本地缓存",
-                            "detail": f"接口结果缓存 {int(time_ago(cached.get('_fetched_at')) / 60)} 分钟前"}
+                            "detail": f"接口结果缓存 {int(age / 60)} 分钟前"}
+        else:
+            # 区间变了 / 超过 TTL：先用旧表立即出报表，后台按新区间刷新
+            COSTS_SOURCE = {"kind": "本地缓存",
+                            "detail": (f"先用 {int(age / 60)} 分钟前的成本表立即出报表"
+                                       f"（旧表区间 {prev.get('date_from') or '—'} ~ "
+                                       f"{prev.get('date_to') or '—'}），"
+                                       f"已在后台按 {date_from} ~ {date_to} 刷新，"
+                                       f"刷新后重新打开本页即是新数据")}
+            _costs_refresh_async(date_from, date_to)
         if cached.get("skus"):
             return cached
     if COSTS_FILE.exists():

@@ -137,6 +137,20 @@ def has_day(account: str, day: str, kind: str) -> bool:
     return day_path(account, day, kind).exists()
 
 
+def payload_rows(payload) -> int:
+    """落盘 payload 里真正有几条数据。
+
+    商智 流量报表（sz_flow）存的是 core/source 两个列表，不是 rows ——
+    只数 rows 会把它们全判成「0 行」。
+    """
+    if not isinstance(payload, dict):
+        return 0
+    n = len(payload.get("rows") or [])
+    if not n:
+        n = len(payload.get("core") or []) + len(payload.get("source") or [])
+    return n
+
+
 def days_for(account: str, kind: str) -> list:
     """列出某账号某数据源已入库的日期。
 
@@ -180,10 +194,16 @@ def coverage(accounts=None) -> dict:
         per = {}
         for kind in KINDS:
             days = days_for(k, kind)
-            per[kind] = {"count": len(days),
-                         "first": days[0] if days else None,
-                         "last": days[-1] if days else None,
-                         "days": days}
+            item = {"count": len(days),
+                    "first": days[0] if days else None,
+                    "last": days[-1] if days else None,
+                    "days": days}
+            if kind in ("sz_product", "sz_flow"):
+                # 「有文件但 0 行」= 抓早了（商智还没出数），会挡住后续重抓，必须能看见
+                empty = [d for d in days[-30:] if payload_rows(load_day(k, d, kind)) == 0]
+                item["empty"] = len(empty)
+                item["emptyDays"] = empty
+            per[kind] = item
         all_days = sorted({d for kind in KINDS for d in per[kind]["days"]})
         out[k] = {"label": a.get("label") or k, "kinds": per,
                   "days": {"count": len(all_days),

@@ -33,6 +33,12 @@ from .scrape_target import fetch_area_days, fetch_crowd_days
 from .scrape_trend import fetch_hourly_day
 
 _JST_KEY = {"jst_campaign": "campaign", "jst_sku": "sku", "jst_searchword": "searchword"}
+
+# 商智数据比京准通晚 1~2 天才出全：抓早了会「成功但 0 行」，文件存在不等于有数据。
+# 这类天在最近 EMPTY_RETRY_DAYS 天内要重新抓（再老就当真的没数据，不反复请求）。
+SZ_KINDS = {"sz_product", "sz_flow"}
+# 与夜间补数窗口一致（JD_REFRESH_DAYS，默认 15）：窗口内的 0 行天会被反复重试，直到拿到数据
+EMPTY_RETRY_DAYS = max(int(getattr(settings, "REFRESH_DAYS", 15) or 15), 7)
 # 允许直接传接口短名（campaign/sku/searchword），避免调用方传错 key 时静默失败
 _JST_KEY.update({v: v for v in ("campaign", "sku", "searchword")})
 
@@ -759,7 +765,7 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                                      ("kw", lambda: fetch_kw_day(p_kw, day, acct.get("account_id") or 0))):
                         if kind not in kinds:
                             continue
-                        if not force and ds.has_day(key, day, kind):
+                        if not force and _has_good_day(key, day, kind):
                             continue
                         try:
                             ds.save_day(key, day, kind, fn())
@@ -784,7 +790,7 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                     for kind in ("sz_product", "sz_flow"):
                         if kind not in kinds:
                             continue
-                        if not force and ds.has_day(key, day, kind):
+                        if not force and _has_good_day(key, day, kind):
                             continue
                         if kind not in sz:
                             sz[kind] = SzFetcher(context, "flow" if kind == "sz_flow" else "product")
@@ -904,11 +910,38 @@ def _need_hourly(key: str, day: str, force: bool) -> bool:
         return True
 
 
+def _has_good_day(key: str, day: str, kind: str) -> bool:
+    """该天该数据源是否「真的拿到了」：商智最近几天 0 行要当没抓过，否则永远补不上。"""
+    if not ds.has_day(key, day, kind):
+        return False
+    if kind not in SZ_KINDS:
+        return True
+    try:
+        recent = (dt.date.today() - dt.date.fromisoformat(day)).days <= EMPTY_RETRY_DAYS
+    except Exception:  # noqa: BLE001
+        recent = False
+    if not recent:
+        return True
+    return ds.payload_rows(ds.load_day(key, day, kind)) > 0
+
+
 def _day_complete(key: str, day: str, kinds) -> bool:
     # OPTIONAL_KINDS（如分时 hourly）不算在内：它们不是每天都抓，
     # 算进去会让所有历史天永远判定为「不完整」，每晚重跑整段区间。
     want = [k for k in kinds if k in ds.KINDS and k not in ds.OPTIONAL_KINDS]
-    return all(ds.has_day(key, day, k) for k in want)
+    if not all(ds.has_day(key, day, k) for k in want):
+        return False
+    # 商智两天才出全：抓早了会「成功但 0 行」，文件存在不等于有数。
+    # 只看最近几天（老日子要真是没数据，不必每晚重复请求）。
+    try:
+        recent = (dt.date.today() - dt.date.fromisoformat(day)).days <= EMPTY_RETRY_DAYS
+    except Exception:  # noqa: BLE001
+        recent = False
+    if recent:
+        for k in want:
+            if k in SZ_KINDS and ds.payload_rows(ds.load_day(key, day, k)) == 0:
+                return False
+    return True
 
 
 def default_range(days: int | None = None):

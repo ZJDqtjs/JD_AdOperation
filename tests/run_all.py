@@ -16,6 +16,9 @@ PY = sys.executable
 SUITES = [
     ("区间聚合（按天入库 → 任意区间加总）", "tests/test_range_agg.py"),
     ("按 SKU 真实成本（收入口径/单位换算/回落/加权保本线）", "tests/test_sku_costs.py"),
+    ("利润页花费归属（按京准通投放账号，不按商智成交搬运）", "tests/test_profit_attribution.py"),
+    ("京准通花费按 SKU 归集（四路口径 + 未归因 + 计划级对账）", "tests/test_spend_allocate.py"),
+    ("商智按 SKU 跨账号归集（成交跟着 SKU 走，不相加）", "tests/test_merge_sz.py"),
     ("按天索引缓存（跨进程可见性）", "tests/test_day_cache.py"),
     ("抓取锁（成功/异常都释放、可取消、stale 可解锁）", "tests/test_scrape_lock.py"),
     ("任务中心（登记/失败/取消/重跑/落盘）", "tests/test_tasks.py"),

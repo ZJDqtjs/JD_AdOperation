@@ -41,6 +41,7 @@ import html
 import io
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -50,10 +51,47 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                Response, StreamingResponse)
 
 from . import (aijobs, ai_page, analyze2, analyze_ai, config, dailystore as ds,
-               paycomm, report2, scrape_day, settings)
+               paycomm, profit, report2, scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
+
+# ================================================================ 子路径挂载
+# 公网 nginx 把本服务反代到子路径（如 http://<ip>/jdfenxi/）时，页面里的根路径
+# 链接（href="/login"、fetch('/api/...')）和 302 的 Location 都要补上前缀，
+# 否则浏览器会把这些地址解析到主站根路径，跑到别的应用上。
+# 前缀按请求决定：nginx 反代时带 X-Forwarded-Prefix（如 /jdfenxi），直连
+# （局域网 http://<ip>:8011/）没有该头，回退到环境变量 JD_URL_PREFIX；都为空时
+# 行为与原来完全一致。
+URL_PREFIX = (os.getenv("JD_URL_PREFIX", "") or "").rstrip("/")
+
+_ATTR_RE = re.compile(r'\b(href|src|action)=(["\'])/(?!/)')
+# 只给已知的首段路径补前缀，避免误伤 JS 里的 split('/') 之类的普通字符串
+_URL_STR_RE = re.compile(r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico)\b)')
+
+
+@app.middleware("http")
+async def _prefix_urls(request: Request, call_next):
+    prefix = (request.headers.get("x-forwarded-prefix") or URL_PREFIX or "").rstrip("/")
+    resp = await call_next(request)
+    if not prefix:
+        return resp
+    loc = resp.headers.get("location")
+    if loc and loc.startswith("/") and not loc.startswith("//"):
+        resp.headers["location"] = prefix + loc
+    # SSE（/api/ai/stream）等非 HTML 响应原样放行，不能缓冲
+    if "text/html" not in resp.headers.get("content-type", ""):
+        return resp
+    buf = bytearray()
+    async for chunk in resp.body_iterator:
+        buf += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+    text = buf.decode("utf-8", "replace")
+    text = _ATTR_RE.sub(lambda m: f"{m.group(1)}={m.group(2)}{prefix}/", text)
+    text = _URL_STR_RE.sub(lambda m: f"{m.group(1)}{prefix}/", text)
+    headers = {k: v for k, v in resp.headers.items()
+               if k.lower() not in ("content-length", "content-type")}
+    return Response(content=text.encode("utf-8"), status_code=resp.status_code,
+                    headers=headers, media_type="text/html; charset=utf-8")
 
 KINDS_UI = [("jzt_campaign", "概览计划"), ("jst_campaign", "投放计划"),
             ("jst_sku", "投放商品"), ("jst_searchword", "搜索词"),
@@ -144,6 +182,18 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
     pre_html = "".join(
         f'<button type="button" class="pre" onclick="setRange({d})">{_e(lab)}</button>'
         for lab, d in presets)
+    # 日历口径的快捷区间（与花费/利润页一致）：本月 / 上月 / 上上月
+    today = _today()
+    first = today.replace(day=1)
+    lm_end = first - dt.timedelta(days=1)
+    lm_start = lm_end.replace(day=1)
+    pm_end = lm_start - dt.timedelta(days=1)
+    pm_start = pm_end.replace(day=1)
+    cal = [("本月", first, today), ("上月", lm_start, lm_end), ("上上月", pm_start, pm_end)]
+    cal_html = "".join(
+        f'<button type="button" class="pre" onclick="setSpan(\'{s.isoformat()}\',\'{e.isoformat()}\')">'
+        f'{_e(lab)}</button>'
+        for lab, s, e in cal)
     acc_html = ""
     if show_accounts:
         boxes = "".join(
@@ -156,11 +206,12 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
   <label>起 <input type="date" name="start" id="rbStart" value="{_e(start)}"></label>
   <label>止 <input type="date" name="end" id="rbEnd" value="{_e(end)}"></label>
   <span class="mini" id="rbDays" style="color:var(--muted)">共 {n} 天</span>
-  {pre_html}{acc_html}
+  {cal_html}<span class="sep"></span>{pre_html}{acc_html}
   <button type="submit">生成分析</button>
   {extra}
 </form>
 <script>
+function setSpan(a,b){{ rbStart.value=a; rbEnd.value=b; upd(); }}
 function setRange(n){{
   var e=new Date(rbEnd.value||"{_e(end)}");
   if(!rbEnd.value) e=new Date("{_e(end)}");
@@ -717,6 +768,7 @@ def report(request: Request):
     q = request.query_params
     start, end = ui_range(q.get("start"), q.get("end"), q.get("days"), 7)
     accounts = account_list(q.getlist("accounts"))
+    t0 = time.time()
     try:
         data = analyze2.build(start=start, end=end, accounts=accounts)
     except FileNotFoundError as exc:
@@ -739,7 +791,12 @@ def report(request: Request):
     title = f"广告运营分析 {start} ~ {end}（{(dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days + 1}天）"
     cached = analyze_ai.load_latest()
     ai = cached if analyze_ai.matches(cached, start, end, keys) else None
-    return HTMLResponse(report2.render(data, ui=ui, title=title, ai=ai))
+    t1 = time.time()
+    html_out = report2.render(data, ui=ui, title=title, ai=ai)
+    print(f"[report] {start}~{end} 账号={','.join(keys)} build {t1 - t0:.2f}s "
+          f"render {time.time() - t1:.2f}s 成本={(settings.COSTS_SOURCE or {}).get('kind')}",
+          flush=True)
+    return HTMLResponse(html_out)
 
 
 # ================================================================ AI 分析台
@@ -801,19 +858,20 @@ PAYCOMM_KINDS = {
         "api": "/api/paycomm/spend",
         "title": "京准通花费",
         "eyebrow": "花费一览 · 京准通",
-        "metaline": ["智能投放：商品报表按 skuId",
-                     "关键词：创意报表按落地页 SKU（含已删计划）",
-                     "全站智能推广：计划上的 spuId",
-                     "约 20 秒完成，结果写本地缓存"],
-        "grid": "g5",
+        "metaline": ["快车：智能投放 / 关键词 / 全站智能推广（含已删计划）",
+                     "全站营销：单品推广按 sxuId",
+                     "对不上商品的花费单列「未归因」，不摊到商品",
+                     "约 30 秒完成，结果写本地缓存"],
+        "grid": "g6",
         "switch": ("/paycomm", "看 CPS 花费 →"),
-        "webKeys": ["jztCost", "jztJstCost", "jztKwCost", "jztShopCost"],
+        "webKeys": ["jztCost", "jztJstCost", "jztKwCost", "jztShopCost", "jztSwaCost"],
         "kpis": [
             {"label": "SKU 数", "key": None, "type": "int"},
             {"label": "京准通花费合计", "key": "jztCost", "type": "money", "subKind": "spend"},
             {"label": "智能投放", "key": "jztJstCost", "type": "money"},
             {"label": "关键词计划", "key": "jztKwCost", "type": "money"},
             {"label": "全站智能推广", "key": "jztShopCost", "type": "money"},
+            {"label": "全站营销", "key": "jztSwaCost", "type": "money"},
         ],
         "sort": "jztCost",
         "ratioKeys": [],
@@ -829,12 +887,22 @@ PAYCOMM_NOTES = {
 100 个 SKU 约 2~3 分钟，全程占用浏览器登录态，期间不要同时扫码登录。</p>""",
     "spend": """
 <p><b>智能投放</b>：智能投放「商品报表」按 SKU 的花费（<code>/reweb/jst/account/sku/list</code>），含已下线计划。</p>
-<p><b>关键词计划</b>：取报表中心「创意」报表（<code>/reweb/msa/base/ad/list</code>），
-每条创意绑定一个商品、落地页就是 <code>item.jd.com/&lt;SKU&gt;.html</code>，因此可以按 SKU 拆分；
-这个报表<b>包含已删除的计划</b>，比快车计划列表更全（例如 8 月有一个已删关键词计划 6,012 元仍在花费）。</p>
-<p><b>全站智能推广</b>：快车计划列表里计划上带 <code>spuId</code> 的花费（campaignType=153）。</p>
-<p>三者相加为「京准通花费合计」。商品名优先用数据看板的商品名；该区间没有 CPS 成交时，
-用广告计划名里的商品名兜底显示。真正归不到 SKU 的（例如创意没有落地页）才会出现在下方「未归因」表格里。</p>""",
+<p><b>关键词计划</b>：先取快车推广管理的创意接口（<code>/dspad/msa/promolist/item/keyword/ad</code>），
+它直接返回每条创意推的 <code>skuId</code>（要进「计划 → 单元 → 创意」才看得到，这里一次拿全）；
+拿不到时退回报表中心创意报表（<code>/reweb/msa/base/ad/list</code>）的落地页 SKU，
+那个报表<b>包含已删除的计划</b>（例如 8 月有一个已删关键词计划 6,012 元仍在花费）。</p>
+<p><b>全站智能推广</b>：以报表中心计划报表（<code>/reweb/msa/base/campaign/list</code>）的计划级金额为准，
+<b>含已删除计划</b>。计划按 SPU 投放、SPU 下的 SKU 可拉黑，所以再查推广管理
+（<code>/dspad/smartmax/forbidden/list</code>）拿「生效 SKU」（SPU 全部 SKU − 黑名单），花费在生效 SKU 间<b>平分</b>。
+拿不到名单的退回整笔记 spuId；已删计划拿不到 spuId 时按同名计划回找。</p>
+<p><b>全站营销</b>：报表（<code>/reweb/swa/account/campaign/list</code>）的单品推广只给到 SPU，
+真正投放的是该 SPU 下没被拉黑的 SKU——再查推广管理（<code>/swa/ad/list</code> +
+<code>/swa/forbidden/list</code>）拿 <code>deliverySkuIds</code>，一个计划投几个 SKU 就<b>平分</b>（尾差给最后一个）。
+全店/新品推广没有 SKU，进「未归因」。</p>
+<p>快车三路 + 全站营销 = 「京准通花费合计」，应等于京准通首页的「效果广告花费」
+（快车 + 全站营销 + 站外广告）。商品名优先用数据看板的商品名；该区间没有 CPS 成交时，
+用广告计划名里的商品名兜底显示。定位不到 SKU 的花费一律单列在下方「未归因」表格里，<b>绝不按比例摊到商品上</b>。</p>""",
+
 }
 
 PAYCOMM_CSS = """
@@ -847,8 +915,71 @@ td.nm{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 td.hot{font-weight:700;color:var(--ink)}
 .toolbar .fld{display:inline-flex;align-items:center;gap:6px;margin:0 10px 8px 0}
 .grid.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
-@media(max-width:1100px){.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.grid.g6{grid-template-columns:repeat(6,minmax(0,1fr))}
+@media(max-width:1100px){.grid.g5,.grid.g6{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:760px){.grid.g5,.grid.g6{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
+
+# ---------------------------------------------------------------- 快捷区间
+# 花费一览（CPS / 京准通）与月度利润共用的时间快捷按钮：昨天 / 本月 / 上月 / 上上月。
+# 不放「今天」：花费当天不结算、商智成交只到昨天，这个区间查不出东西。
+# 基准日期由服务端注入（window.QRANGE_TODAY），避免浏览器时区或页面开着过夜把日期算错。
+QUICK_PRESETS = [("yesterday", "昨天"), ("month", "本月"),
+                 ("lastmonth", "上月"), ("prevmonth", "上上月")]
+
+QUICK_RANGE_CSS = """
+.qrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:-4px 0 12px}
+.qrow .qlbl{font-size:12px;color:var(--muted);margin-right:2px}
+.qrow .chip.on{background:var(--surface-card);color:var(--ink);border-color:var(--cream);font-weight:600}
+"""
+
+QUICK_RANGE_JS = r"""
+window.QRANGE = (function(){
+  var BASE = window.QRANGE_TODAY || '';
+  function pad(n){ return (n<10?'0':'')+n; }
+  function iso(d){ return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
+  function srvToday(){
+    var p = String(BASE).split('-');
+    if(p.length !== 3) return null;
+    var d = new Date(+p[0], +p[1]-1, +p[2]);
+    return isNaN(d) ? null : d;
+  }
+  function today(){
+    var n = new Date();
+    var local = new Date(n.getFullYear(), n.getMonth(), n.getDate());
+    var srv = srvToday();
+    // 页面开着过夜时跟着浏览器当天走；只在浏览器更晚时前进，不倒退
+    return (srv && local > srv) ? local : (srv || local);
+  }
+  function span(k){
+    var t = today(), y = t.getFullYear(), m = t.getMonth(), d = t.getDate();
+    if(k === 'yesterday') return [iso(new Date(y,m,d-1)), iso(new Date(y,m,d-1))];
+    if(k === 'month') return [iso(new Date(y,m,1)), iso(new Date(y,m,d))];
+    if(k === 'lastmonth') return [iso(new Date(y,m-1,1)), iso(new Date(y,m,0))];
+    if(k === 'prevmonth') return [iso(new Date(y,m-2,1)), iso(new Date(y,m-1,0))];
+    return null;
+  }
+  function mark(box, s, e){
+    var nodes = document.querySelectorAll(box + ' .chip[data-k]');
+    for(var i=0;i<nodes.length;i++){
+      var r = span(nodes[i].getAttribute('data-k'));
+      nodes[i].className = 'chip' + ((r && s && e && r[0] === s && r[1] === e) ? ' on' : '');
+    }
+  }
+  return {span: span, mark: mark};
+})();
+"""
+
+
+def _quick_html(prefix: str) -> str:
+    """快捷区间按钮组。prefix 是页面 JS 命名空间（PC / PF）。"""
+    out = ['<span class="qlbl">快捷区间</span>']
+    for k, lab in QUICK_PRESETS:
+        out.append(f'<button type="button" class="chip" data-k="{k}" '
+                   f'title="{lab}：点一下直接查询（有缓存秒出）" '
+                   f'onclick="{prefix}.quick(\'{k}\')">{lab}</button>')
+    return f'<div class="qrow" id="{prefix.lower()}Quick">{"".join(out)}</div>'
+
 
 PAYCOMM_JS = """
 (function(){
@@ -912,7 +1043,8 @@ function head(){
 }
 function rowsHtml(list){
   var cat = (DIM === 'cat');
-  if(!list.length) return '<tr><td colspan="'+(cols().length+2)+'" class="l">没有匹配的行</td></tr>';
+  var span = cols().length + 2;
+  if(!list.length) return '<tr><td colspan="'+span+'" class="l">没有匹配的行</td></tr>';
   return list.map(function(r){
     var tds = cols().map(function(k){
       var hot = (k==='payCommAmount'||k==='jztCost') ? ' hot' : '';
@@ -939,7 +1071,8 @@ function kpisHtml(){
     }
     if(k.subKind === 'spend'){
       var st = SPEND.totals || {};
-      var un = (num(st.keyword) || 0) + (num(st.other) || 0);
+      var un = num(st.unattr);
+      if(un === null) un = (num(st.keyword) || 0) + (num(st.other) || 0);
       sub = un ? ('未归因 ' + fmt(un,'money') + ' 元（无 SKU）')
                : '全部已按 SKU 归因';
     }
@@ -981,20 +1114,38 @@ function render(){
   renderUnattr();
 }
 function renderUnattr(){
+  var us = SPEND.unattrRows || [];
   var kws = SPEND.keywordRows || [];
-  if(INIT.showUnattr && kws.length){
-    var kh = kws.map(function(c){
-      return '<tr><td class="l">'+esc(c.campaignId)+'</td><td class="l nm">'+esc(c.campaignName)
-        + '</td><td class="n">'+fmt(c.cost,'money')+'</td></tr>';
-    }).join('');
-    var kt = 0; kws.forEach(function(c){ kt += num(c.cost)||0; });
-    kh += '<tr><td class="l"><b>合计</b></td><td class="l">'+kws.length+' 个计划</td>'
-        + '<td class="n"><b>'+fmt(kt,'money')+'</b></td></tr>';
-    $('pcUnattrBody').innerHTML = kh;
-    $('pcUnattrCard').style.display = '';
-  } else if($('pcUnattrCard')){
-    $('pcUnattrCard').style.display = 'none';
+  if(!INIT.showUnattr || (!us.length && !kws.length)){
+    if($('pcUnattrCard')) $('pcUnattrCard').style.display = 'none';
+    return;
   }
+  var uh = '', ut = 0;
+  us.forEach(function(u){
+    ut += num(u.cost) || 0;
+    uh += '<tr><td class="l nm">'+esc(u.name)+'</td><td class="n">'+fmt(u.cost,'money')+'</td></tr>';
+  });
+  if(us.length){
+    uh += '<tr><td class="l"><b>合计</b></td><td class="n"><b>'+fmt(ut,'money')+'</b></td></tr>';
+  }
+  $('pcUnattrBody').innerHTML = uh;
+  var kwBox = $('pcUnattrKw');
+  if(kwBox){
+    if(kws.length){
+      var kh = kws.map(function(c){
+        return '<tr><td class="l">'+esc(c.campaignId)+'</td><td class="l nm">'+esc(c.campaignName)
+          + '</td><td class="n">'+fmt(c.cost,'money')+'</td></tr>';
+      }).join('');
+      var kt = 0; kws.forEach(function(c){ kt += num(c.cost)||0; });
+      kh += '<tr><td class="l"><b>合计</b></td><td class="l">'+kws.length+' 个创意</td>'
+          + '<td class="n"><b>'+fmt(kt,'money')+'</b></td></tr>';
+      $('pcUnattrKwBody').innerHTML = kh;
+      kwBox.style.display = '';
+    } else {
+      kwBox.style.display = 'none';
+    }
+  }
+  $('pcUnattrCard').style.display = '';
 }
 function dim(k){
   DIM = (k === 'cat') ? 'cat' : 'sku';
@@ -1007,7 +1158,7 @@ function dim(k){
 function showTable(){ $('pcTableCard').style.display=''; $('pcExport').disabled=false; render(); }
 
 var POLL_FAILS = 0;
-function poll(){
+function poll(silent){
   fetch(API + '/status?rows=1').then(function(r){ return r.json(); }).then(function(j){
     POLL_FAILS = 0;
     if(!j.ok){ msg(j.error||'状态查询失败','bad'); return; }
@@ -1026,8 +1177,10 @@ function poll(){
     $('pcRefetch').disabled = false;
     $('pcCancel').style.display = 'none';
     $('pcBar').style.width = j.error ? '0' : '100%';
-    if(j.error){ msg(j.message || j.error, 'bad'); }
-    else if(j.message){ msg(j.message, 'ok'); }
+    if(!silent){
+      if(j.error){ msg(j.message || j.error, 'bad'); }
+      else if(j.message){ msg(j.message, 'ok'); }
+    }
     if(j.rows && j.rows.length){
       var rg = j.range || [];
       var same = rg.length ? (rg[0] === $('pcStart').value && rg[1] === $('pcEnd').value) : true;
@@ -1051,6 +1204,18 @@ function poll(){
     $('pcBar').style.width = '0';
     msg('与服务端的连接中断了（常见于服务重启）。刷新页面即可恢复；后台任务不受影响。', 'bad');
   });
+}
+function markQuick(){
+  if(!window.QRANGE) return;
+  window.QRANGE.mark('#pcQuick', $('pcStart').value, $('pcEnd').value);
+}
+function quick(k){
+  var r = window.QRANGE && window.QRANGE.span(k);
+  if(!r) return;
+  $('pcStart').value = r[0];
+  $('pcEnd').value = r[1];
+  markQuick();
+  run();
 }
 function run(force){
   var acc = $('pcAcc').value, s = $('pcStart').value, e = $('pcEnd').value;
@@ -1149,7 +1314,7 @@ function sort(k){
 }
 window.PC = {sort: sort, run: run, refetch: refetch, exp: exp, cancel: cancel,
              render: render, loadCache: loadCache, delCache: delCache, dim: dim,
-             expView: expView};
+             expView: expView, quick: quick};
 function boot(){
   poll(); loadCache();
   $('pcTable').addEventListener('click', function(e){
@@ -1157,6 +1322,9 @@ function boot(){
     if(!th || !th.getAttribute('data-key')) return;
     sort(th.getAttribute('data-key'));
   });
+  $('pcStart').addEventListener('change', markQuick);
+  $('pcEnd').addEventListener('change', markQuick);
+  markQuick();
 }
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
@@ -1186,21 +1354,32 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
             "ratioKeys": cfg.get("ratioKeys", [])}
     unattr_html = """
 <div class="card" id="pcUnattrCard" style="display:none">
-  <h2>未归因的关键词计划 <span class="tagline">快车关键词计划的商品挂在「单元」上，接口不返回 SKU</span></h2>
-  <p class="hint">这些花费无法落到具体 SKU，因此不计入上方任何一行，仅列出计划名供人工对应商品。</p>
+  <h2>未归因花费 <span class="tagline">定位不到 SKU 的钱单列在这里，绝不按比例摊到商品</span></h2>
+  <p class="hint">这些花费已经在合计里（所以能对上京准通），但没有落到具体商品上；
+     要缩小这块，只能让计划带上 spuId / 创意带落地页 / 全站营销走单品推广。</p>
   <div class="tblwrap short">
-    <table><thead><tr><th class="l noSort">计划ID</th><th class="l noSort">计划名称</th>
+    <table><thead><tr><th class="l noSort">项目</th>
       <th class="n noSort">花费(元)</th></tr></thead><tbody id="pcUnattrBody"></tbody></table>
+  </div>
+  <div id="pcUnattrKw" style="display:none;margin-top:16px">
+    <h2>未归因的关键词创意明细</h2>
+    <div class="tblwrap short">
+      <table><thead><tr><th class="l noSort">计划ID</th><th class="l noSort">创意/计划名称</th>
+        <th class="n noSort">花费(元)</th></tr></thead><tbody id="pcUnattrKwBody"></tbody></table>
+    </div>
   </div>
 </div>""" if cfg["showUnattr"] else ""
     metaline = "".join(
         f'<span>{_e(t)}</span>'
         + ('<span class="dot"></span>' if i < len(cfg["metaline"]) - 1 else "")
         for i, t in enumerate(cfg["metaline"]))
+    quick_html = _quick_html("PC")
+    today_iso = _today().isoformat()
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_e(cfg["title"])} · 京东广告运营</title>
 <style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+<style>{QUICK_RANGE_CSS}</style>
 </head><body>
 {report2.navtop(cfg["nav"])}
 <header class="top"><div class="wrap pagehead">
@@ -1224,6 +1403,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     <button class="btn sec" id="pcExport" onclick="PC.exp()" disabled>导出完整 Excel</button>
     <button class="btn ghost" id="pcCancel" onclick="PC.cancel()" style="display:none">取消</button>
   </div>
+{quick_html}
   <div class="hint" id="pcMsg" style="min-height:20px">选账号与区间后点「查询」：有缓存直接读本地（不请求京准通），没有才去抓。</div>
   <div class="pcbar" id="pcBarWrap"><i id="pcBar"></i></div>
 </div>
@@ -1269,6 +1449,8 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
 </div>
 
 </div>
+<script>window.QRANGE_TODAY = "{today_iso}";</script>
+<script>{QUICK_RANGE_JS}</script>
 <script>window.PC_INIT = {json.dumps(init, ensure_ascii=False)};</script>
 <script>{PAYCOMM_JS}</script>
 </body></html>""")
@@ -1418,6 +1600,464 @@ def api_paycomm_spend_cache_delete(account: str | None = None, start: str = "", 
     if not (account and start and end):
         return {"ok": False, "error": "缺少 account / start / end"}
     return _paycomm_spend.delete_cache(account, start, end)
+
+
+# ================================================================ 月度利润分析
+# 商智成交件数 × ERP 到手结算价 / 毛利每件，再扣 CPS 与京准通花费 → 净利。
+# 取数与计算在 jd_roi/profit.py，这里只做页面与接口。
+PROFIT_WEB_KEYS = ["qty", "frontPrice", "supply", "arrival", "grossPerOrder",
+                   "gross", "cpsCost", "jztCost", "net", "netRate"]
+
+PROFIT_KPIS = [
+    {"label": "SKU 数", "key": None, "type": "int"},
+    {"label": "成交件数", "key": "qty", "type": "int"},
+    {"label": "到手金额", "key": "arrival", "type": "money", "sub": "件数 × ERP 到手结算价"},
+    {"label": "毛利", "key": "gross", "type": "money", "sub": "件数 × 毛利/件（未扣广告）"},
+    {"label": "CPS 花费", "key": "cpsCost", "type": "money"},
+    {"label": "京准通花费", "key": "jztCost", "type": "money"},
+    {"label": "净利", "key": "net", "type": "money", "subKind": "netRate"},
+]
+
+PROFIT_JS = r"""
+(function(){
+var INIT = window.PC_INIT || {};
+var API = INIT.api || '/api/profit';
+var FIELDS = INIT.fields || [];
+var WEB = INIT.webKeys || [];
+var KPIS = INIT.kpis || [];
+var RATIO = INIT.ratioKeys || [];
+var LBL = {}, TYP = {};
+FIELDS.forEach(function(f){ LBL[f[0]] = f[1]; TYP[f[0]] = f[2]; });
+var DIM = 'sku', JOB = null, ROWS = [], TOTALS = {}, DATA = {}, SORT = {k:'gross', d:-1}, TIMER = null;
+var FAILS = 0;
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function num(v){ if(v===null||v===undefined||v==='') return null; var n=Number(v); return isNaN(n)?null:n; }
+function fmt(v,t){ var n=num(v); if(n===null) return '—';
+  if(t==='int') return n.toLocaleString('zh-CN');
+  return n.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function msg(s,kind){ var el=$('pfMsg'); if(!el) return; el.textContent=s||'';
+  el.style.color = kind==='bad' ? 'var(--red)' : (kind==='ok' ? 'var(--greenink)' : 'var(--muted)'); }
+function kpi(lbl,val,sub){ return '<div class="kpi"><div class="lbl">'+esc(lbl)+'</div><div class="val">'+val+'</div>'
+  + (sub?'<div class="sub">'+esc(sub)+'</div>':'') + '</div>'; }
+function cols(){ return (DIM==='cat') ? WEB.filter(function(k){ return RATIO.indexOf(k)<0; }) : WEB; }
+function accTip(r){
+  var L = INIT.labels || {};
+  function j(a){ return (a||[]).map(function(k){ return L[k] || k; }).join('、'); }
+  var sale = j(r.accts), spend = j(r.spendAccts);
+  var nm = r.itemName || '';
+  if(!sale && !spend) return nm;
+  return nm + ' ｜ 成交账号：' + (sale||'—') + ' ｜ 花费账号：' + (spend||'—');
+}
+
+function aggregate(list){
+  var map = {}, order = [];
+  list.forEach(function(r){
+    var k = r.category || '未分类';
+    var b = map[k];
+    if(!b){ b = {category:k, __n:0}; cols().forEach(function(kk){ b[kk]=0; }); map[k]=b; order.push(k); }
+    b.__n += 1;
+    cols().forEach(function(kk){ var v = num(r[kk]); if(v!==null) b[kk]+=v; });
+  });
+  return order.map(function(k){
+    var b = map[k];
+    cols().forEach(function(kk){ b[kk] = Math.round(b[kk]*100)/100; });
+    return b;
+  });
+}
+function head(){
+  var cat = (DIM==='cat');
+  var h = cat
+    ? '<tr><th class="l noSort" data-key="category">品类</th><th class="n noSort" data-key="__n">SKU数</th>'
+    : '<tr><th class="l noSort" data-key="skuId">SKU</th><th class="l noSort" data-key="itemName">商品名称</th>';
+  cols().forEach(function(k){
+    var mark = SORT.k===k ? (SORT.d<0?' ↓':' ↑') : '';
+    h += '<th class="n noSort" data-key="'+k+'">'+esc(LBL[k]||k)+mark+'</th>';
+  });
+  return h+'</tr>';
+}
+function rowsHtml(list){
+  var cat = (DIM==='cat');
+  if(!list.length) return '<tr><td colspan="'+(cols().length+2)+'" class="l">没有匹配的行</td></tr>';
+  return list.map(function(r){
+    var tds = cols().map(function(k){
+      var hot = (k==='net') ? ' hot' : '';
+      return '<td class="n'+hot+'">'+fmt(r[k],TYP[k])+'</td>';
+    }).join('');
+    if(cat){
+      return '<tr><td class="l"><b>'+esc(r.category)+'</b></td><td class="n">'+r.__n+'</td>'+tds+'</tr>';
+    }
+    return '<tr><td class="l"><b>'+esc(r.skuId)+'</b></td>'
+      + '<td class="l nm" title="'+esc(accTip(r))+'">'+esc(r.itemName||'—')+'</td>'+tds+'</tr>';
+  }).join('');
+}
+function kpisHtml(){
+  var out = '';
+  KPIS.forEach(function(k){
+    var val, sub = k.sub || '';
+    if(!k.key){
+      val = ROWS.length.toLocaleString('zh-CN');
+    } else {
+      var s = 0;
+      ROWS.forEach(function(r){ s += num(r[k.key]) || 0; });
+      val = (k.type==='int') ? fmt(s,'int') : ('¥' + fmt(s,'money'));
+    }
+    if(k.subKind === 'netRate'){
+      sub = TOTALS.netRate ? ('净利率 ' + fmt(TOTALS.netRate,'num') + '%') : '净利 = 毛利 − 广告花费';
+    }
+    out += kpi(k.label, val, sub);
+  });
+  return out;
+}
+function render(){
+  var cat = (DIM==='cat');
+  var kw = ($('pfFilter').value||'').trim().toLowerCase();
+  var base = cat ? aggregate(ROWS) : ROWS;
+  var list = base.filter(function(r){
+    if(!kw) return true;
+    if(cat) return String(r.category||'').toLowerCase().indexOf(kw) >= 0;
+    return String(r.skuId).indexOf(kw) >= 0
+      || String(r.itemName||'').toLowerCase().indexOf(kw) >= 0
+      || String(r.category||'').toLowerCase().indexOf(kw) >= 0;
+  });
+  list = list.slice().sort(function(a,b){
+    var k = SORT.k;
+    if(cat && (k==='skuId'||k==='itemName'||k==='category')){
+      return String(a.category||'').localeCompare(String(b.category||''))*SORT.d;
+    }
+    if(k==='itemName') return String(a[k]||'').localeCompare(String(b[k]||''))*SORT.d;
+    if(k==='skuId') return String(a.skuId).localeCompare(String(b.skuId))*SORT.d;
+    var x = num(a[k]), y = num(b[k]);
+    if(x===null) x = -1e18;
+    if(y===null) y = -1e18;
+    return (x-y)*SORT.d;
+  });
+  $('pfHead').innerHTML = head();
+  $('pfBody').innerHTML = rowsHtml(list);
+  $('pfKpis').innerHTML = kpisHtml();
+  $('pfKpis').style.display = '';
+  $('pfCount').textContent = cat
+    ? ('共 ' + list.length + ' 个品类 / ' + ROWS.length + ' 个 SKU')
+    : ('共 ' + ROWS.length + ' 个 SKU' + (list.length!==ROWS.length ? ('，筛选后 '+list.length+' 行') : ''));
+}
+function renderNotes(notes){
+  var el = $('pfNotes');
+  if(!el) return;
+  if(!notes || !notes.length){ el.style.display='none'; el.innerHTML=''; return; }
+  el.style.display = '';
+  el.innerHTML = '<b>数据提示</b><ul style="margin:6px 0 0 18px;padding:0">'
+    + notes.map(function(n){ return '<li>'+esc(n)+'</li>'; }).join('') + '</ul>';
+}
+function showTable(){ $('pfTableCard').style.display=''; $('pcExportView').disabled=false; render(); }
+function applyAcc(){
+  var b = DATA[$('pfAcc').value];
+  if(!b){ return; }
+  ROWS = b.rows || [];
+  TOTALS = b.totals || {};
+  if(ROWS.length){ showTable(); }
+  else { $('pfTableCard').style.display='none'; msg('该账号在这个区间没有数据'); }
+}
+function switchAcc(){ if(Object.keys(DATA).length){ applyAcc(); } else { poll(); } }
+
+function poll(silent){
+  var qs = new URLSearchParams({rows: '1'});
+  if(JOB) qs.set('job', JOB);
+  fetch(API + '/status?' + qs.toString()).then(function(r){ return r.json(); }).then(function(j){
+    FAILS = 0;
+    if(!j.ok){ if(!silent){ msg(j.error||'状态查询失败','bad'); } return; }
+    if(j.active){
+      if(j.jobId) JOB = j.jobId;
+      $('pfRun').disabled = true; $('pfRefetch').disabled = true;
+      var pct = j.total ? Math.round(j.done*100/j.total) : 0;
+      $('pfBar').style.width = pct+'%';
+      if(!silent){ msg((j.message||'计算中') + (j.total ? ('　'+j.done+'/'+j.total) : '')); }
+      clearTimeout(TIMER); TIMER = setTimeout(poll, 1500);
+      return;
+    }
+    $('pfRun').disabled = false; $('pfRefetch').disabled = false;
+    $('pfBar').style.width = j.error ? '0' : '100%';
+    if(!silent){
+      if(j.error){ msg(j.message || j.error, 'bad'); }
+      else if(j.message){ msg(j.message, 'ok'); }
+    }
+    if(j.rows && j.rows.length){
+      var rg = j.range || [];
+      var same = rg.length ? (rg[0] === $('pfStart').value && rg[1] === $('pfEnd').value) : true;
+      if(!same){
+        msg('本页最近一次结果是 ' + rg[0] + ' ~ ' + rg[1] + '；当前区间点「查询」即可（有缓存秒出）');
+        return;
+      }
+      JOB = j.jobId;
+      DATA = j.byAccount || {};
+      renderNotes(j.notes || []);
+      if(Object.keys(DATA).length){
+        if(!DATA[$('pfAcc').value]){ $('pfAcc').value = Object.keys(DATA)[0]; }
+        applyAcc();
+      } else {
+        ROWS = j.rows || []; TOTALS = j.totals || {}; showTable();
+      }
+    }
+  }).catch(function(e){
+    FAILS += 1;
+    if(FAILS <= 4){ msg('状态查询失败（'+e+'），2 秒后重试…'); clearTimeout(TIMER); TIMER=setTimeout(poll,2000); return; }
+    $('pfRun').disabled = false; $('pfRefetch').disabled = false;
+    msg('与服务端连接中断（常见于服务重启），刷新页面即可恢复', 'bad');
+  });
+}
+function markQuick(){
+  if(!window.QRANGE) return;
+  window.QRANGE.mark('#pfQuick', $('pfStart').value, $('pfEnd').value);
+}
+function quick(k){
+  var r = window.QRANGE && window.QRANGE.span(k);
+  if(!r) return;
+  $('pfStart').value = r[0];
+  $('pfEnd').value = r[1];
+  markQuick();
+  run();
+}
+function run(force){
+  var acc = $('pfAcc').value, s = $('pfStart').value, e = $('pfEnd').value;
+  if(!s || !e){ msg('请选择起止日期','bad'); return; }
+  if(s > e){ msg('起始日期不能晚于结束日期','bad'); return; }
+  ROWS = []; JOB = null; TOTALS = {};
+  $('pfTableCard').style.display='none';
+  $('pcExportView').disabled = true;
+  $('pfRun').disabled = true; $('pfRefetch').disabled = true;
+  $('pfBar').style.width = '0';
+  msg(force ? '正在重新计算（会覆盖该区间缓存）…' : '查询中（先看本地缓存）…');
+  var qs = new URLSearchParams({account: acc, start: s, end: e});
+  if(force) qs.set('force','1');
+  fetch(API + '/run?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ msg('失败：'+(j.error||''),'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; return; }
+      JOB = j.jobId;
+      if(j.cached){
+        var head = j.stitched
+          ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求商智')
+          : ('命中本地缓存（'+(j.savedAt||'')+' 计算，共 '+(j.rows||0)+' 个 SKU），未请求商智');
+        msg(head + (j.busy ? '；后台还有任务在跑，本次只读缓存' : ''));
+      }
+      poll();
+    }).catch(function(e){ msg('请求失败 '+e,'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; });
+}
+function reprice(){
+  if(!JOB){ msg('还没有结果，先点「查询」','bad'); return; }
+  if(!confirm('只重新拉取 ERP 成本并重算到手价/毛利/净利？\n\n商智成交与 CPS/京准通花费都沿用本地缓存，不会重新抓。')) return;
+  msg('正在重拉 ERP 成本…');
+  $('pfReprice').disabled = true;
+  var qs = new URLSearchParams({job: JOB, account: $('pfAcc').value,
+    start: $('pfStart').value, end: $('pfEnd').value});
+  fetch(API + '/reprice?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
+    .then(function(j){
+      $('pfReprice').disabled = false;
+      if(!j.ok){ msg('更新失败：'+(j.error||''),'bad'); return; }
+      msg('已按最新 ERP 成本重算：' + j.costSku + ' 个 SKU 有成本，'
+          + (j.files || 1) + ' 个区间的表已更新，' + j.changed + ' 行发生变化（接口更新于 '
+          + (j.costUpdatedAt || '—') + '）', 'ok');
+      poll(true);
+    }).catch(function(e){ $('pfReprice').disabled = false; msg('更新失败 '+e,'bad'); });
+}
+function refetch(){
+  if(!confirm('重新计算 ' + $('pfStart').value + ' ~ ' + $('pfEnd').value + '？\n\n会真实请求商智并覆盖该区间缓存。')) return;
+  run(true);
+}
+function exp(){
+  if(!JOB){ msg('还没有数据，先点「查询」','bad'); return; }
+  var qs = new URLSearchParams({job: JOB, account: $('pfAcc').value,
+    start: $('pfStart').value, end: $('pfEnd').value, dim: DIM});
+  window.location = API + '/export?' + qs.toString();
+}
+function expView(){ exp(); }
+function dim(k){
+  DIM = (k === 'cat') ? 'cat' : 'sku';
+  $('pfDimSku').className = 'tab' + (DIM==='sku' ? ' active' : '');
+  $('pfDimCat').className = 'tab' + (DIM==='cat' ? ' active' : '');
+  $('pfTableTitle').textContent = (DIM==='cat') ? '品类汇总' : 'SKU 明细';
+  if(ROWS.length) render();
+}
+function sort(k){
+  if(SORT.k === k) SORT.d = -SORT.d;
+  else SORT = {k:k, d:(k==='itemName'||k==='skuId'||k==='category')?1:-1};
+  render();
+}
+window.PF = {run:run, refetch:refetch, exp:exp, expView:expView, dim:dim, sort:sort,
+             render:render, switchAcc:switchAcc, reprice:reprice, quick:quick};
+function boot(){
+  poll();
+  $('pfTable').addEventListener('click', function(e){
+    var th = e.target.closest('th');
+    if(!th || !th.getAttribute('data-key')) return;
+    sort(th.getAttribute('data-key'));
+  });
+  $('pfStart').addEventListener('change', markQuick);
+  $('pfEnd').addEventListener('change', markQuick);
+  markQuick();
+}
+if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
+})();
+"""
+
+
+@app.get("/profit", response_class=HTMLResponse)
+def profit_page(request: Request):
+    q = request.query_params
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = q.get("account") or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    start, end = _last_month_range()
+    if q.get("start") and q.get("end"):
+        try:
+            start, end = profit.norm_range(q.get("start"), q.get("end"))
+        except ValueError:
+            pass
+    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+                   f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    init = {"api": "/api/profit", "fields": [[k, lab, t] for k, lab, t in profit.FIELDS],
+            "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
+            "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
+            "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
+    quick_html = _quick_html("PF")
+    today_iso = _today().isoformat()
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>月度利润分析 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+<style>{QUICK_RANGE_CSS}</style>
+</head><body>
+{report2.navtop("/profit")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}利润</div>
+  <h1>月度利润分析</h1>
+  <div class="metaline">
+    <span>成交件数：商智商品明细</span><span class="dot"></span>
+    <span>到手结算价：ERP 成本接口</span><span class="dot"></span>
+    <span>毛利/件：报表分析口径（未扣广告）</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/paycomm">CPS 花费 →</a>
+    <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
+    <a class="btn ghost mini" href="/login">登录 / 检查登录态</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="card">
+  <div class="toolbar">
+    <label class="fld">账号 <select id="pfAcc" onchange="PF.switchAcc()">{opts}</select></label>
+    <label class="fld">起 <input type="date" id="pfStart" value="{_e(start)}"></label>
+    <label class="fld">止 <input type="date" id="pfEnd" value="{_e(end)}"></label>
+    <button class="btn" id="pfRun" onclick="PF.run()">查询</button>
+    <button class="btn ghost" id="pfRefetch" onclick="PF.refetch()" title="忽略缓存，重新请求商智">重新计算</button>
+    <button class="btn sec" id="pfReprice" onclick="PF.reprice()"
+            title="只重拉 ERP 成本，商智与花费不动">只更新 ERP 成本</button>
+    <button class="btn sec mini" id="pcExportView" onclick="PF.expView()" style="margin-left:auto"
+            title="按当前维度导出（SKU 或 品类）" disabled>导出当前视图 Excel</button>
+  </div>
+{quick_html}
+  <div class="hint" id="pfMsg" style="min-height:20px">选账号与区间后点「查询」：有缓存直接读本地，没有才去商智取数。</div>
+  <div class="pcbar"><i id="pfBar"></i></div>
+</div>
+
+<div class="grid g4" id="pfKpis" style="display:none;margin-top:18px"></div>
+
+<div class="card" id="pfTableCard" style="display:none">
+  <h2><span id="pfTableTitle">SKU 明细</span> <span class="tagline">点表头可换排序</span></h2>
+  <div class="toolbar">
+    <span class="tabs" style="margin:0 12px 8px 0">
+      <button type="button" class="tab active" id="pfDimSku" onclick="PF.dim('sku')">按 SKU</button>
+      <button type="button" class="tab" id="pfDimCat" onclick="PF.dim('cat')">按品类</button>
+    </span>
+    <input id="pfFilter" placeholder="筛选 SKU / 商品名 / 品类" oninput="PF.render()"
+           style="min-width:240px;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
+    <span class="hint" id="pfCount"></span>
+  </div>
+  <div class="tblwrap long">
+    <table id="pfTable"><thead id="pfHead"></thead><tbody id="pfBody"></tbody></table>
+  </div>
+</div>
+
+<div class="note" id="pfNotes" style="display:none;margin-top:16px"></div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>到手金额</b> = 商智成交件数 × ERP「到手结算价 supply」（京东结算给我们的每件金额，已扣点）。</p>
+  <p><b>毛利</b> = 成交件数 × 「毛利/件」= 到手结算价 − 货款 − 运费 − 包材 − 人工（<b>未扣广告</b>），
+     与「分析报表」里的同一列完全同口径。</p>
+  <p><b>净利</b> = 毛利 − CPS 花费（付款佣金）− 京准通花费（快车：智能投放 / 关键词 / 全站智能推广 + 全站营销）。
+     两个花费都只读「花费一览」的本地缓存，本页不会额外抓取；缺失时会在上方提示，去对应页面抓一次即可。</p>
+  <p><b>只列本账号京准通有投放的商品</b>：行集由京准通决定，商智里有成交但本账号没投的商品不会出现在这张表里
+     （它属于投放它的那个账号）。本表「京准通花费」合计 = 该账号「京准通花费」页的合计。</p>
+  <p><b>成交按 SKU 取</b>：成交件数、前台价、成交额是「这个 SKU 卖了多少」，不属于某个账号，
+     所以会把两个账号的商智合成一张 SKU 表——本账号投的商品即使卖在另一个账号的店铺里，
+     这里也能看到件数与毛利（悬停可看「成交账号」）。两个账号的商智都没有它时，才是 0 件数、毛利 0 的纯花费行。</p>
+  <p>注意：同一个 SKU 若两个账号都在投，会同时出现在两张表里且各自带全额成交，跨账号相加会重复计成交与毛利，
+     按账号单独看才准。</p>
+</div>
+
+</div>
+<script>window.QRANGE_TODAY = "{today_iso}";</script>
+<script>{QUICK_RANGE_JS}</script>
+<script>window.PC_INIT = {json.dumps(init, ensure_ascii=False)};</script>
+<script>{PROFIT_JS}</script>
+</body></html>""")
+
+
+@app.post("/api/profit/run")
+def api_profit_run(account: str | None = None, start: str = "", end: str = "", force: int = 0,
+                   accounts: str = ""):
+    """按 SKU 跨账号合并（花费跟着投放账号走）。
+
+    页面下拉选中的账号排第一：结果默认展示它，其余账号只为跨账号归集成交/花费。
+    """
+    try:
+        wanted = [x for x in (accounts or "").split(",") if x.strip()]
+        all_keys = [a["key"] for a in settings.ACCOUNTS]
+        if wanted:
+            keys = [k for k in all_keys if k in wanted] or wanted
+        elif account and account in all_keys:
+            keys = [account] + [k for k in all_keys if k != account]
+        else:
+            keys = all_keys
+        if not keys:
+            return {"ok": False, "error": "没有可用的账号"}
+        return _profit.run_background(keys[0], start, end, force=bool(force), accounts=keys)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/profit/status")
+def api_profit_status(rows: int = 0, job: str | None = None):
+    snap = _profit.snapshot(with_rows=bool(rows), job=job)
+    snap["ok"] = True
+    snap["active"] = snap.pop("running", False)
+    return snap
+
+
+@app.post("/api/profit/reprice")
+def api_profit_reprice(job: str | None = None, account: str | None = None,
+                       start: str | None = None, end: str | None = None):
+    """只重拉 ERP 成本并重算利润；商智成交与 CPS/京准通花费沿用缓存。"""
+    return _profit.reprice(job, account, start, end)
+
+
+@app.get("/api/profit/export")
+def api_profit_export(job: str | None = None, account: str | None = None,
+                      start: str | None = None, end: str | None = None,
+                      dim: str = "sku"):
+    from urllib.parse import quote
+    got = _profit.export(job, account=account, start=start, end=end, dim=dim)
+    if not got:
+        return JSONResponse({"ok": False, "error": "没有可导出的结果，请先查询一次"}, status_code=404)
+    data, fname = got
+    disp = f"attachment; filename=\"profit.xlsx\"; filename*=UTF-8''{quote(fname)}"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
 
 
 # ================================================================ API
@@ -2433,6 +3073,8 @@ _login = LoginSession()
 # 花费一览两个独立任务（CPS 付款佣金 / 京准通广告花费）：与登录 / 保活共用同一把 Profile 锁
 _paycomm = paycomm.PayCommRunner("cps", profile_lock=_login._profile_lock)
 _paycomm_spend = paycomm.PayCommRunner("spend", profile_lock=_login._profile_lock)
+# 月度利润分析：商智销量 + ERP 成本 + 上面两套花费缓存
+_profit = profit.ProfitRunner(profile_lock=_login._profile_lock)
 
 
 class AiRunner:
