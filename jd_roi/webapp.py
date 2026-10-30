@@ -189,7 +189,11 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
     lm_start = lm_end.replace(day=1)
     pm_end = lm_start - dt.timedelta(days=1)
     pm_start = pm_end.replace(day=1)
-    cal = [("本月", first, today), ("上月", lm_start, lm_end), ("上上月", pm_start, pm_end)]
+    # 今天的数据还没出全（商智只到昨天），所以「本月」一律止于昨天；
+    # 每月 1 号本月还没有完整一天，此时不显示「本月」，避免点出一个空区间。
+    yday = today - dt.timedelta(days=1)
+    cal = ([("本月", first, yday)] if first <= yday else []) + [
+        ("上月", lm_start, lm_end), ("上上月", pm_start, pm_end)]
     cal_html = "".join(
         f'<button type="button" class="pre" onclick="setSpan(\'{s.isoformat()}\',\'{e.isoformat()}\')">'
         f'{_e(lab)}</button>'
@@ -924,8 +928,10 @@ td.hot{font-weight:700;color:var(--ink)}
 # 花费一览（CPS / 京准通）与月度利润共用的时间快捷按钮：昨天 / 本月 / 上月 / 上上月。
 # 不放「今天」：花费当天不结算、商智成交只到昨天，这个区间查不出东西。
 # 基准日期由服务端注入（window.QRANGE_TODAY），避免浏览器时区或页面开着过夜把日期算错。
-QUICK_PRESETS = [("yesterday", "昨天"), ("month", "本月"),
-                 ("lastmonth", "上月"), ("prevmonth", "上上月")]
+QUICK_PRESETS = [("yesterday", "昨天", "昨天一天"),
+                 ("month", "本月", "本月 1 号 ~ 昨天（今天数据没出全，不含今天）"),
+                 ("lastmonth", "上月", "上个自然月整月"),
+                 ("prevmonth", "上上月", "上上个自然月整月")]
 
 QUICK_RANGE_CSS = """
 .qrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:-4px 0 12px}
@@ -954,7 +960,12 @@ window.QRANGE = (function(){
   function span(k){
     var t = today(), y = t.getFullYear(), m = t.getMonth(), d = t.getDate();
     if(k === 'yesterday') return [iso(new Date(y,m,d-1)), iso(new Date(y,m,d-1))];
-    if(k === 'month') return [iso(new Date(y,m,1)), iso(new Date(y,m,d))];
+    if(k === 'month'){
+      // 本月 = 1 号 ~ 昨天：今天数据没出全（商智只到昨天、花费当天不结算）。
+      // 每月 1 号本月还没有完整一天，这时退回「昨天」，不给自己点出一个空区间。
+      var yday = new Date(y,m,d-1);
+      return (d === 1) ? [iso(yday), iso(yday)] : [iso(new Date(y,m,1)), iso(yday)];
+    }
     if(k === 'lastmonth') return [iso(new Date(y,m-1,1)), iso(new Date(y,m,0))];
     if(k === 'prevmonth') return [iso(new Date(y,m-2,1)), iso(new Date(y,m-1,0))];
     return null;
@@ -974,9 +985,9 @@ window.QRANGE = (function(){
 def _quick_html(prefix: str) -> str:
     """快捷区间按钮组。prefix 是页面 JS 命名空间（PC / PF）。"""
     out = ['<span class="qlbl">快捷区间</span>']
-    for k, lab in QUICK_PRESETS:
+    for k, lab, hint in QUICK_PRESETS:
         out.append(f'<button type="button" class="chip" data-k="{k}" '
-                   f'title="{lab}：点一下直接查询（有缓存秒出）" '
+                   f'title="{lab} = {hint}，点一下直接查询（有缓存秒出）" '
                    f'onclick="{prefix}.quick(\'{k}\')">{lab}</button>')
     return f'<div class="qrow" id="{prefix.lower()}Quick">{"".join(out)}</div>'
 
@@ -1839,6 +1850,11 @@ function run(force){
           ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求商智')
           : ('命中本地缓存（'+(j.savedAt||'')+' 计算，共 '+(j.rows||0)+' 个 SKU），未请求商智');
         msg(head + (j.busy ? '；后台还有任务在跑，本次只读缓存' : ''));
+      } else if(j.resumed){
+        // 断点续抓：上次算到哪，这次就从哪接着抓，不回头重抓整段
+        var rp = j.resumed;
+        msg('复用本地 ' + (rp.pieces||[]).join(' + ') + '，只补抓 '
+            + rp.tail[0] + ' ~ ' + rp.tail[1] + '…');
       }
       poll();
     }).catch(function(e){ msg('请求失败 '+e,'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; });

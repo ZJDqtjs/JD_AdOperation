@@ -81,6 +81,11 @@ COSTS_TOKEN = (_env("JD_COSTS_TOKEN", "") or "").strip()
 COSTS_TIMEOUT = _env_int("JD_COSTS_TIMEOUT", 20)
 COSTS_TTL = _env_int("JD_COSTS_TTL", 6 * 3600)          # 拉到的结果本地缓存 6 小时
 COSTS_CACHE_FILE = Path(_env("JD_COSTS_CACHE", str(DATA_DIR / "costs_cache.json")) or ".")
+# 成本表**按区间**各存一份（data/costs/costs_<from>__<to>.json）。
+# 供货方接口给的是「该区间的均价」，10/1~10/27 与 10/1~10/29 是两张不同的表：
+# 以前只有一份全局 costs_cache.json，后查的区间会把先查的覆盖掉，同一 SKU 的
+# 货款成本随区间漂移，拼接/断点续抓就会把两种口径混在一张表里（实测月毛利差十几万）。
+COSTS_CACHE_DIR = Path(_env("JD_COSTS_CACHE_DIR", str(DATA_DIR / "costs")) or ".")
 # ---- 登录态保活 ----
 # 京准通的会话凭据 sdtoken 只有约 30 分钟有效期，无人操作的后台进程必须定时「用一下」
 # 才能续期（京麦客户端就是这么做的）。这里让 Web 服务常驻时按固定间隔访问京准通首页，
@@ -394,21 +399,60 @@ def use_tmp_dir() -> str:
     return p
 
 
-def _costs_cache_read() -> dict:
-    try:
-        return json.loads(COSTS_CACHE_FILE.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return {}
+def _costs_key(date_from: str, date_to: str) -> str:
+    """区间 → 缓存文件名主体。没给区间就是接口默认窗口（近 30 天），单独一份。"""
+    if not date_from and not date_to:
+        return "default"
+    return f"{date_from or 'any'}__{date_to or 'any'}"
 
 
-def _costs_cache_write(data: dict) -> None:
+def _costs_range_file(date_from: str, date_to: str) -> Path:
+    return COSTS_CACHE_DIR / f"costs_{_costs_key(date_from, date_to)}.json"
+
+
+def _costs_cache_read(date_from: str = "", date_to: str = "") -> dict:
+    """读成本缓存：给了区间就读**该区间**那份，不给就读「最近一次拉到的」。
+
+    区间文件还没有、而老的全局文件正好是同一区间（升级到按区间存放之前的缓存）时，
+    把它搬过去，免得升级后白跑一次接口。
+    """
+    if not date_from and not date_to:
+        try:
+            return json.loads(COSTS_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
     try:
-        COSTS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = COSTS_CACHE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(COSTS_CACHE_FILE)
+        return json.loads(_costs_range_file(date_from, date_to).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         pass
+    legacy = _costs_cache_read()
+    q = (legacy or {}).get("_query") or {}
+    if (legacy or {}).get("skus") and q.get("date_from", "") == date_from \
+            and q.get("date_to", "") == date_to:
+        _costs_cache_write(legacy, date_from, date_to)
+        return legacy
+    return {}
+
+
+def costs_cached(date_from: str = "", date_to: str = "") -> dict | None:
+    """本区间的成本表在不在本地。**只读文件**：不发请求、不起线程，给 HTTP 请求线程用。"""
+    data = _costs_cache_read(date_from, date_to)
+    return data if data.get("skus") else None
+
+
+def _costs_cache_write(data: dict, date_from: str = "", date_to: str = "") -> None:
+    """区间文件 + 「最近一次」两份都写（后者给状态页和成本护栏对比用）。"""
+    targets = [COSTS_CACHE_FILE]
+    if date_from or date_to:
+        targets.insert(0, _costs_range_file(date_from, date_to))
+    for p in targets:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(p)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _guard_costs(data: dict, prev: dict) -> dict:
@@ -466,6 +510,7 @@ def _costs_fetch(date_from: str = "", date_to: str = "") -> dict:
         qs["date_from"] = date_from
     if date_to:
         qs["date_to"] = date_to
+    unranged = False
     try:
         data = _get(qs)
     except Exception:  # noqa: BLE001
@@ -474,11 +519,18 @@ def _costs_fetch(date_from: str = "", date_to: str = "") -> dict:
         if not qs:
             raise
         data = _get({})
+        unranged = True
     if not isinstance(data, dict) or not isinstance(data.get("skus"), dict):
         raise ValueError(f"成本接口返回结构异常：{str(data)[:160]}")
-    data = _guard_costs(data, _costs_cache_read())
+    # 护栏要和「同一区间的上一版」比：不同区间的均价本来就不同，跨区间比会误报
+    data = _guard_costs(data, _costs_cache_read(date_from, date_to) or _costs_cache_read())
     data["_fetched_at"] = time.time()
-    data["_query"] = {"date_from": date_from, "date_to": date_to}
+    # _query 必须如实记录「这份表到底是按什么区间算的」：退步取整表时区间没生效，
+    # 就不能冒充是本区间的表 —— 报表要靠它判断成本口径是否对得上。
+    data["_query"] = ({"date_from": "", "date_to": ""} if unranged
+                      else {"date_from": date_from, "date_to": date_to})
+    if unranged:
+        data["_unranged"] = True
     return data
 
 
@@ -521,7 +573,7 @@ def _costs_refresh_async(date_from: str, date_to: str) -> None:
         t0 = time.time()
         try:
             data = _costs_fetch(date_from, date_to)
-            _costs_cache_write(data)
+            _costs_cache_write(data, date_from, date_to)
             print(f"[成本表] 后台刷新完成 {date_from} ~ {date_to}："
                   f"{len(data.get('skus') or {})} 个 SKU，耗时 {time.time() - t0:.1f}s", flush=True)
         except Exception as e:  # noqa: BLE001
@@ -546,42 +598,71 @@ def load_costs(date_from: str = "", date_to: str = "", force: bool = False) -> d
     报表页开一次就同步等接口会白屏好几秒，所以除了「本地无表」和 force（用户点
     「只更新 ERP 成本」）之外，一律**先用本地已有的表秒出**，新区间丢给后台线程刷新，
     下一次请求自然就用上新数据了。
+
+    区间隔离：每个区间一份缓存（见 COSTS_CACHE_DIR），本区间没拉过时宁可明说
+    「借用了另一个区间的均价」，也不再悄悄覆盖别人的表 —— 否则拼接/断点续抓出来的
+    毛利会是两种区间均价的混合值，看着像数据，其实对不上任何一天。
     """
     global COSTS_SOURCE
     if COSTS_URL:
-        cached = _costs_cache_read()
-        has = bool(cached.get("skus"))
-        prev = cached.get("_query") or {}
-        same = prev.get("date_from", "") == date_from and prev.get("date_to", "") == date_to
-        age = time_ago(cached.get("_fetched_at"))
-        if force or not has:
+        rng = f"{date_from or '—'} ~ {date_to or '—'}"
+        own = _costs_cache_read(date_from, date_to)      # 本区间的表
+        own_has = bool(own.get("skus"))
+        own_age = time_ago(own.get("_fetched_at"))
+        latest = _costs_cache_read()                     # 最近一次拉到的（可能是别的区间）
+        latest_has = bool(latest.get("skus"))
+        failed = None
+        if force or not (own_has or latest_has):
             # 用户显式要求刷新，或本地一份都没有：只能同步等接口
             try:
                 t0 = time.time()
-                cached = _costs_fetch(date_from, date_to)
-                _costs_cache_write(cached)
+                fresh = _costs_fetch(date_from, date_to)
+                _costs_cache_write(fresh, date_from, date_to)
+                fq = (fresh.get("_query") or {})
                 COSTS_SOURCE = {"kind": "供货方接口",
-                                "detail": f"{COSTS_URL}｜updatedAt {cached.get('updatedAt', '—')}"
+                                "detail": f"{COSTS_URL}｜请求 {rng}｜实取 "
+                                          f"{fq.get('date_from') or '默认窗口'} ~ "
+                                          f"{fq.get('date_to') or '默认窗口'}｜"
+                                          f"updatedAt {fresh.get('updatedAt', '—')}"
                                           f"｜耗时 {time.time() - t0:.1f}s"}
-                return cached
+                return fresh
             except Exception as e:  # noqa: BLE001  断网/Token 失效/5xx 都走缓存，不阻断报表
                 print(f"[成本表] 接口拉取失败，改用本地缓存/costs.json：{type(e).__name__}: {e}")
-                COSTS_SOURCE = {"kind": "本地缓存" if has else "本地成本文件",
-                                "detail": f"接口失败：{type(e).__name__}: {e}"}
-        elif same and age < COSTS_TTL:
-            COSTS_SOURCE = {"kind": "本地缓存",
-                            "detail": f"接口结果缓存 {int(age / 60)} 分钟前"}
-        else:
-            # 区间变了 / 超过 TTL：先用旧表立即出报表，后台按新区间刷新
-            COSTS_SOURCE = {"kind": "本地缓存",
-                            "detail": (f"先用 {int(age / 60)} 分钟前的成本表立即出报表"
-                                       f"（旧表区间 {prev.get('date_from') or '—'} ~ "
-                                       f"{prev.get('date_to') or '—'}），"
-                                       f"已在后台按 {date_from} ~ {date_to} 刷新，"
-                                       f"刷新后重新打开本页即是新数据")}
-            _costs_refresh_async(date_from, date_to)
-        if cached.get("skus"):
-            return cached
+                failed = e
+        if own_has:
+            if failed:
+                COSTS_SOURCE = {"kind": "本地缓存",
+                                "detail": f"接口失败（{type(failed).__name__}: {failed}），"
+                                          f"沿用 {rng} 的成本表（{int(own_age / 60)} 分钟前）"}
+            elif own_age < COSTS_TTL:
+                COSTS_SOURCE = {"kind": "本地缓存",
+                                "detail": f"{rng} 的成本表，{int(own_age / 60)} 分钟前拉取"}
+            else:
+                COSTS_SOURCE = {"kind": "本地缓存",
+                                "detail": f"{rng} 的成本表已 {int(own_age / 3600)} 小时，"
+                                          f"先用旧值出报表，已在后台按本区间刷新"}
+                _costs_refresh_async(date_from, date_to)
+            return own
+        if latest_has:
+            # 本区间还没拉过：先借最近一版立即出报表（不白屏），并在后台补本区间的表。
+            # 「借」必须写在明面上，报表与成本面板都能看到这个口径差。
+            lq = latest.get("_query") or {}
+            l_age = time_ago(latest.get("_fetched_at"))
+            if failed:
+                COSTS_SOURCE = {"kind": "本地缓存",
+                                "detail": f"接口失败（{type(failed).__name__}: {failed}），"
+                                          f"借用 {lq.get('date_from') or '—'} ~ "
+                                          f"{lq.get('date_to') or '—'} 的成本表"
+                                          f"（{int(l_age / 60)} 分钟前）"}
+            else:
+                COSTS_SOURCE = {"kind": "本地缓存（借用区间）",
+                                "detail": f"{rng} 的成本表本地还没拉过，先用 "
+                                          f"{lq.get('date_from') or '—'} ~ "
+                                          f"{lq.get('date_to') or '—'} 的均价"
+                                          f"（{int(l_age / 60)} 分钟前）立即出报表，"
+                                          f"已在后台按 {rng} 拉取，拉完再查即以本区间为准"}
+                _costs_refresh_async(date_from, date_to)
+            return latest
     if COSTS_FILE.exists():
         try:
             data = json.loads(COSTS_FILE.read_text(encoding="utf-8"))
