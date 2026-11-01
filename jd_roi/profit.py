@@ -697,7 +697,22 @@ class ProfitRunner:
         base.mkdir(parents=True, exist_ok=True)
         return base / f"profit_{start}_{end}.json"
 
-    def load_cached(self, account: str, start: str, end: str) -> dict | None:
+    @staticmethod
+    def _cache_accounts(data: dict) -> set[str]:
+        """这份利润缓存实际算过哪些账号。
+
+        缓存按「区间」存一份、里面装各账号的表。账号是后来才有的时候（例如新登录
+        蛇吞象 / 沛沛佳），老文件里根本没有它们 —— 必须当没命中，否则会把上一个
+        账号的表当成新账号的结果显示出来。
+        """
+        keys = set(data.get("accounts") or [])
+        keys |= set((data.get("byAccount") or {}).keys())
+        if data.get("account"):
+            keys.add(str(data["account"]))
+        return keys
+
+    def load_cached(self, account: str, start: str, end: str,
+                    need: list[str] | None = None) -> dict | None:
         key = account if account == "all" else settings.get_account(account)["key"]
         fp = self._paths(key, start, end)
         if not fp.exists():
@@ -710,6 +725,11 @@ class ProfitRunner:
             return None
         if int(data.get("logicVersion") or 0) != LOGIC_VERSION:
             return None          # 旧口径算的缓存：当没命中，重算一次（文件保留不删）
+        had = self._cache_accounts(data)
+        if key != "all" and key not in had:
+            return None          # 这份缓存没算过这个账号（新登录的店）→ 重算，不拿别人的表顶
+        if need and not set(need) <= had:
+            return None          # 缺账号的表（例如只算过 main/b）→ 重算，避免漏掉成交与花费
         st = fp.stat()
         data["savedAt"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
         by = data.get("byAccount") or {}
@@ -753,8 +773,9 @@ class ProfitRunner:
             cur = _next_day(hit[1])
         return picked
 
-    def _load_parts(self, picked: list[tuple[str, str]]) -> list[tuple[dict, str]] | None:
-        """逐段读出缓存并校验口径；有一段是旧口径/坏文件就整体放弃（拼出来也不可信）。"""
+    def _load_parts(self, picked: list[tuple[str, str]],
+                    need: list[str] | None = None) -> list[tuple[dict, str]] | None:
+        """逐段读出缓存并校验口径；有一段是旧口径/坏文件/缺账号就整体放弃（拼出来也不可信）。"""
         parts: list[tuple[dict, str]] = []
         for s, e in picked:
             fp = self._paths("all", s, e)
@@ -766,11 +787,13 @@ class ProfitRunner:
                 return None
             if int(data.get("logicVersion") or 0) != LOGIC_VERSION:
                 return None
+            if need and not set(need) <= self._cache_accounts(data):
+                return None      # 老表没算过新登录的账号 → 不能拿它当前缀拼接
             parts.append((data, time.strftime("%Y-%m-%d %H:%M",
                                               time.localtime(fp.stat().st_mtime))))
         return parts or None
 
-    def covered_prefix(self, start: str, end: str):
+    def covered_prefix(self, start: str, end: str, need: list[str] | None = None):
         """断点续抓的「断点」：本地缓存从 start 起连续铺到了哪一天。
 
         返回 (前缀结果, 复用的段, 还差的起点)。整段铺满或一段都没缓存时返回 None
@@ -779,7 +802,7 @@ class ProfitRunner:
         picked = self._pick_spans(start, end)
         if not picked or picked[-1][1] >= end:
             return None
-        parts = self._load_parts(picked)
+        parts = self._load_parts(picked, need)
         if not parts:
             return None
         by_account = merge_parts_rows(parts)
@@ -789,15 +812,17 @@ class ProfitRunner:
         return (stitched_payload(by_account, start, covered, picked, parts),
                 picked, _next_day(covered))
 
-    def use_stitched(self, start: str, end: str) -> dict | None:
+    def use_stitched(self, start: str, end: str,
+                     need: list[str] | None = None) -> dict | None:
         """用多段相邻缓存拼出完整区间（如 8 月 + 9 月 + 10/1~10/25），完全不抓取。
 
         只接受首尾正好相接、完整覆盖且不外溢的组合，避免把区间外的数据算进来。
+        need 里的账号必须在每一段里都算过，否则拼出来会缺新账号的成交与花费。
         """
         picked = self._pick_spans(start, end)
         if len(picked) < 2 or picked[-1][1] < end:
             return None          # 没铺满 → 交给 covered_prefix 续抓；单段是精确命中
-        parts = self._load_parts(picked)
+        parts = self._load_parts(picked, need)
         if not parts:
             return None
         by_account = merge_parts_rows(parts)
@@ -821,10 +846,10 @@ class ProfitRunner:
             # 先查缓存：命中缓存不需要抓取，跟正在跑的任务互不冲突，
             # 除非用户明确要求「重新计算」（force），才排队等当前任务结束。
             if not force:
-                cached = self.load_cached(account, start, end)
+                cached = self.load_cached(account, start, end, need=keys)
                 if not cached:
                     # 没有整段缓存时，用多段相邻的月表拼起来（8月 + 9月 + 10/1~10/25）
-                    stitched = self.use_stitched(start, end)
+                    stitched = self.use_stitched(start, end, keys)
                     if stitched:
                         job_id = stitched["jobId"]
                         self._results[job_id] = stitched
@@ -868,7 +893,7 @@ class ProfitRunner:
             # 断点续抓：本地已经算过 10/1~10/25，就只补抓 10/26~昨天，不再整月重抓
             prefix, picked, tail_start = None, None, start
             if not force:
-                cov = self.covered_prefix(start, end)
+                cov = self.covered_prefix(start, end, keys)
                 if cov:
                     prefix, picked, tail_start = cov
             job_id = time.strftime("%Y%m%d%H%M%S") + "-profit-" + key

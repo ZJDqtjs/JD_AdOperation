@@ -18,6 +18,7 @@ SUITES = [
     ("按 SKU 真实成本（收入口径/单位换算/回落/加权保本线）", "tests/test_sku_costs.py"),
     ("利润页花费归属（按京准通投放账号，不按商智成交搬运）", "tests/test_profit_attribution.py"),
     ("利润页断点续抓（复用本地前缀、只补抓尾段、按天本地优先）", "tests/test_profit_resume.py"),
+    ("利润缓存账号校验（新登录的店不命中旧表）", "tests/test_profit_cache_accounts.py"),
     ("ERP 成本表按区间隔离 + 拼接按本次区间重算毛利", "tests/test_cost_range.py"),
     ("京准通花费按 SKU 归集（四路口径 + 未归因 + 计划级对账）", "tests/test_spend_allocate.py"),
     ("商智按 SKU 跨账号归集（成交跟着 SKU 走，不相加）", "tests/test_merge_sz.py"),
