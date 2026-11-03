@@ -3204,7 +3204,8 @@ LOGIN_ACC_JS = r"""
   function loadAccounts(){
     fetch('/api/accounts').then(function(r){ return r.json(); }).then(function(j){
       if(!j.ok) return;
-      var rows = (j.accounts || []).map(function(a){
+      var list = j.accounts || [];
+      var rows = list.map(function(a, i){
         var st = '<span class="badge ' + (CLS[a.state] || 'b-idle') + '">'
                + (LBL[a.state] || a.state) + '</span>';
         var main = a.isMain ? ' <span class="badge b-warn">主账号</span>' : '';
@@ -3214,6 +3215,10 @@ LOGIN_ACC_JS = r"""
           + '<td class="n">' + (a.account_id || '—') + '</td>'
           + '<td class="l">' + st + ' ' + esc(a.message || '') + empty + '</td>'
           + '<td class="n">'
+          + '<button class="btn ghost mini" data-act="up" data-key="' + esc(a.key) + '" '
+          + (i === 0 ? 'disabled ' : '') + 'title="上移（同时调整控制台显示顺序）">↑</button> '
+          + '<button class="btn ghost mini" data-act="down" data-key="' + esc(a.key) + '" '
+          + (i === list.length - 1 ? 'disabled ' : '') + 'title="下移（同时调整控制台显示顺序）">↓</button> '
           + '<button class="btn sec mini" data-act="rename" data-key="' + esc(a.key) + '">改名</button> '
           + '<button class="btn ghost mini" data-act="detect" data-key="' + esc(a.key) + '">识别账户ID</button> '
           + '<button class="btn danger mini" data-act="delete" data-key="' + esc(a.key) + '">删除</button>'
@@ -3232,6 +3237,14 @@ LOGIN_ACC_JS = r"""
         if(!j.ok){ tip('添加失败：' + (j.error || ''), 'bad'); return; }
         tip('已添加「' + j.account.label + '」，key=' + j.account.key + '，正在刷新…', 'ok');
         setTimeout(function(){ location.reload(); }, 700);
+      });
+  }
+  function moveAccount(key, dir){
+    post('/api/accounts/move?key=' + encodeURIComponent(key) + '&dir=' + encodeURIComponent(dir))
+      .then(function(j){
+        if(!j.ok){ tip('调整顺序失败：' + (j.error || ''), 'bad'); return; }
+        tip('已调整顺序，控制台与各页面下拉框会同步生效', 'ok');
+        setTimeout(function(){ location.reload(); }, 400);
       });
   }
   function renameAccount(key){
@@ -3275,6 +3288,7 @@ LOGIN_ACC_JS = r"""
     if(act === 'rename') renameAccount(key);
     else if(act === 'delete') delAccount(key);
     else if(act === 'detect') detectId(key);
+    else if(act === 'up' || act === 'down') moveAccount(key, act);
   });
   document.getElementById('addAccBtn').addEventListener('click', addAccount);
   loadAccounts();
@@ -3489,6 +3503,33 @@ def api_accounts_rename(key: str = "", name: str = ""):
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "account": {"key": acc["key"], "label": acc["label"],
                                     "account_id": acc.get("account_id") or 0}}
+
+
+@app.post("/api/accounts/move")
+def api_accounts_move(key: str = "", dir: str = "up"):
+    """调整账号显示顺序（up/down）：写回 accounts.json，控制台与各页下拉框同步。
+
+    只改顺序，不改主账号：主账号由 accounts.json 的 `main: true` 显式记录。
+    """
+    if dir not in ("up", "down"):
+        return {"ok": False, "error": "dir 只能是 up 或 down"}
+    try:
+        accs = settings.move_account(key, dir)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "main": settings.MAIN_ACCOUNT,
+            "accounts": [{"key": a["key"], "label": a.get("label") or a["key"]} for a in accs]}
+
+
+@app.post("/api/accounts/setmain")
+def api_accounts_setmain(key: str = ""):
+    """把某个账号设为「主账号」（之后调整顺序不会改变它）。"""
+    try:
+        acc = settings.set_main_account(key)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "account": {"key": acc["key"], "label": acc.get("label") or acc["key"]},
+            "main": settings.MAIN_ACCOUNT}
 
 
 @app.post("/api/accounts/delete")

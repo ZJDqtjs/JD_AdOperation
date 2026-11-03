@@ -207,8 +207,29 @@ def _normalize(accs: list) -> list:
         acc["label"] = a.get("label") or key
         acc["account_id"] = a.get("account_id") or 0
         acc["user_data_dir"] = a.get("user_data_dir") or default_profile_dir(key)
+        # 「主账号」用显式标记，不再依赖列表第一位：调整显示顺序时主账号不会跟着漂
+        acc["main"] = bool(a.get("main"))
         out.append(acc)
     return out
+
+
+def _ensure_main(accs: list) -> str:
+    """保证有且只有一个 main 标记，返回主账号 key。
+
+    老配置文件没有 main 字段：默认把第一位的账号当主账号（与历史行为一致）。
+    """
+    if not accs:
+        return "main"
+    for a in accs:
+        if a.get("main"):
+            for b in accs:
+                if b is not a:
+                    b["main"] = False
+            return a["key"]
+    accs[0]["main"] = True
+    for b in accs[1:]:
+        b["main"] = False
+    return accs[0]["key"]
 
 
 def load_accounts() -> list:
@@ -242,7 +263,7 @@ if _scope:
     else:
         print(f"[settings][warn] JD_SCOPE={_scope} 未匹配到任何账号，已忽略", flush=True)
 
-MAIN_ACCOUNT = ACCOUNTS[0]["key"] if ACCOUNTS else "main"
+MAIN_ACCOUNT = _ensure_main(ACCOUNTS) if ACCOUNTS else "main"
 
 
 def get_account(key: str | None = None) -> dict:
@@ -267,6 +288,8 @@ def _accounts_payload(accs: list) -> list:
         custom_dir = a.get("user_data_dir")
         if custom_dir and str(custom_dir) != default_profile_dir(key):
             item["user_data_dir"] = str(custom_dir)
+        if a.get("main"):
+            item["main"] = True
         out.append(item)
     return out
 
@@ -290,7 +313,7 @@ def apply_accounts(accs: list) -> list:
     norm = _normalize(list(accs))
     ACCOUNTS.clear()
     ACCOUNTS.extend(norm)
-    MAIN_ACCOUNT = ACCOUNTS[0]["key"] if ACCOUNTS else "main"
+    MAIN_ACCOUNT = _ensure_main(ACCOUNTS) if ACCOUNTS else "main"
     # config.py 里有一份 import 时拷贝的值，CLI 脚本会用到，这里同步一下
     try:
         from . import config as _config
@@ -348,6 +371,40 @@ def delete_account(key: str) -> dict:
     save_accounts(accs)
     apply_accounts(accs)
     return {"ok": True, "key": key}
+
+
+def move_account(key: str, direction: str = "up") -> list:
+    """调整账号显示顺序（up/down），写回 accounts.json。
+
+    只改顺序，不动「主账号」标记：主账号用 `main: true` 显式记录，顺序变了它也不会跟着变。
+    顺序会影响：登录页账号表、控制台数据覆盖表/日历、各页面账号下拉框的排列。
+    """
+    key = str(key or "")
+    keys = [a["key"] for a in ACCOUNTS]
+    if key not in keys:
+        raise ValueError("账号不存在")
+    i = keys.index(key)
+    j = i - 1 if str(direction).lower() == "up" else i + 1
+    if j < 0 or j >= len(keys):
+        return ACCOUNTS                     # 已经在最上/最下，不动
+    accs = _accounts_payload(ACCOUNTS)
+    accs[i], accs[j] = accs[j], accs[i]
+    save_accounts(accs)
+    apply_accounts(accs)
+    return ACCOUNTS
+
+
+def set_main_account(key: str) -> dict:
+    """把某个账号设为「主账号」（新装/CLI 默认账号、控制台主账号标记）。"""
+    key = str(key or "")
+    accs = _accounts_payload(ACCOUNTS)
+    if not any(a["key"] == key for a in accs):
+        raise ValueError("账号不存在")
+    for a in accs:
+        a["main"] = (a["key"] == key)
+    save_accounts(accs)
+    apply_accounts(accs)
+    return get_account(key)
 
 
 def set_account_id(key: str, account_id: int) -> bool:
