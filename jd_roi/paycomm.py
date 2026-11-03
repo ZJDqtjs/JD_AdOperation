@@ -778,28 +778,35 @@ def fetch_spend(page, start: str, end: str, account_id: int | None = None) -> di
         page.wait_for_timeout(6000)
     except Exception:  # noqa: BLE001
         pass
-    jst = jst_fetch(page, "sku", start, end)
+    # 每一路都单独兜错：某个产品线没开通/没权限（-301/-203）时，其余几路照样要出数，
+    # 不能因为一个报表没权限就把整次查询打挂（例：蛇吞象蔬菜只投全站智能推广，报表中心不可用）
+    src_errors: dict[str, str] = {}
+    jst: dict = {"rows": []}
+    try:
+        jst = jst_fetch(page, "sku", start, end)
+    except Exception as exc:  # noqa: BLE001
+        src_errors["智能投放"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     _sleep(DELAY_PAGE)
 
     creatives: list[dict] = []
     try:
         creatives = fetch_creative_rows(page, start, end, account_id)
-    except Exception:  # noqa: BLE001
-        creatives = []
+    except Exception as exc:  # noqa: BLE001
+        src_errors["关键词"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     _sleep(DELAY_PAGE)
 
     plans: list[dict] = []
     try:
         plans = fetch_msa_plans(page, start, end, account_id)
-    except Exception:  # noqa: BLE001
-        plans = []
+    except Exception as exc:  # noqa: BLE001
+        src_errors["计划级报表"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     _sleep(DELAY_PAGE)
 
     swa: list[dict] = []
     try:
         swa = fetch_swa_plans(page, start, end)
-    except Exception:  # noqa: BLE001
-        swa = []
+    except Exception as exc:  # noqa: BLE001
+        src_errors["全站营销"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     _sleep(DELAY_PAGE)
 
     # 推广管理页：关键词创意直接给 skuId；全站营销计划给「实际投放 SKU」
@@ -827,13 +834,17 @@ def fetch_spend(page, start: str, end: str, account_id: int | None = None) -> di
     except Exception:  # noqa: BLE001
         shop_delivery = {}
 
-    out = allocate(jst.get("rows") or [], creatives, plans, camps.get("rows") or [], swa,
-                   kw_skus=kw_skus, swa_delivery=swa_delivery, shop_delivery=shop_delivery)
+    out = allocate(jst.get("rows") or [], creatives, plans, camps.get("rows") or [],
+                   swa, kw_skus=kw_skus, swa_delivery=swa_delivery,
+                   shop_delivery=shop_delivery)
     ext = camps.get("ext") or {}
     try:
         out["totals"]["campaignTotal"] = round(float(ext.get("cost") or 0), 2)
     except (TypeError, ValueError):
         out["totals"]["campaignTotal"] = None
+    if src_errors:
+        out["totals"]["sourceErrors"] = src_errors
+        out["sourceErrors"] = src_errors
     return out
 
 
@@ -1236,7 +1247,7 @@ class PayCommRunner:
             data = json.loads(fp.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             return None
-        if not data.get("rows"):
+        if not data.get("rows") and not (self.mode == "spend" and data.get("noSpend")):
             return None
         if self.mode == "spend" and int(data.get("schema") or 1) < SPEND_SCHEMA:
             # 旧口径（无全站营销、漏已删计划）当缓存未命中：文件保留不删，重抓一次即可
@@ -1570,7 +1581,16 @@ class PayCommRunner:
                              col: u.get("cost") or 0.0,
                              "jztCost": u.get("cost") or 0.0})
             rows.sort(key=lambda r: (r.get("jztCost") or -1), reverse=True)
-            say(f"京准通花费已取到 {len(rows)} 个 SKU", total=len(rows), done=len(rows))
+            errs = spend.get("sourceErrors") or {}
+            if errs:
+                spend["warnings"] = [
+                    f"{name} 取数失败（{msg}）——这一路按 0 计，其余几路正常；"
+                    f"常见原因：该账号没开通这个产品线/报表，或接口临时返回 -301"
+                    for name, msg in errs.items()]
+                say(f"京准通花费已取到 {len(rows)} 个 SKU"
+                    f"（{len(errs)} 路接口失败，已按 0 计）", total=len(rows), done=len(rows))
+            else:
+                say(f"京准通花费已取到 {len(rows)} 个 SKU", total=len(rows), done=len(rows))
             extra["spend"] = spend
         else:
             say("正在读取商品列表…")
@@ -1642,8 +1662,15 @@ class PayCommRunner:
                           message=f"已取消，未写入缓存（本次已取 {len(rows)} 个 SKU 作废）",
                           error=None)
                 return
+            # 0 花费不是错误：有些账号整月没投广告（例如只靠自然流量），
+            # 这时也要写一份「空表」缓存，页面显示 0，而不是每次查询都报错重抓。
+            no_spend = False
             if not rows:
-                raise RuntimeError("没有抓到任何 SKU 数据")
+                zero = abs(float((spend.get("totals") or {}).get("total") or 0)) < 0.01
+                if self.mode == "spend" and zero:
+                    no_spend = True
+                else:
+                    raise RuntimeError("没有抓到任何 SKU 数据")
 
             sort_key = "jztCost" if self.mode == "spend" else "payCommAmount"
             rows.sort(key=lambda r: (r.get(sort_key) if r.get(sort_key) is not None else -1),
@@ -1651,7 +1678,7 @@ class PayCommRunner:
             label = settings.get_account(account).get("label") or account
 
             payload = {"jobId": job_id, "mode": self.mode, "account": account,
-                       "schema": SPEND_SCHEMA,
+                       "schema": SPEND_SCHEMA, "noSpend": no_spend,
                        "accountLabel": label, "start": start, "end": end, "rows": rows,
                        "finishedAt": settings.now_iso()}
             if self.mode == "spend":
@@ -1673,10 +1700,12 @@ class PayCommRunner:
             else:
                 total_pay = round(sum((float(r.get("payCommAmount") or 0)) for r in rows), 2)
                 detail = f"付款佣金合计 {total_pay:,.2f} 元"
+            done_msg = (f"完成：该区间没有任何广告花费（0 元），已写入本地缓存"
+                        if no_spend else
+                        f"完成：{len(rows)} 个 SKU，{detail}（已写入本地缓存）")
             self._set(running=False, cancelled=False, cached=False,
                       finishedAt=settings.now_iso(), total=len(rows), done=len(rows),
-                      message=f"完成：{len(rows)} 个 SKU，{detail}（已写入本地缓存）",
-                      error=None)
+                      message=done_msg, error=None)
         except Exception as exc:  # noqa: BLE001
             self._set(running=False, error=f"{type(exc).__name__}: {exc}",
                       finishedAt=settings.now_iso(), message=f"失败：{exc}")
@@ -1687,16 +1716,23 @@ def fetch_into_cache(page, mode: str, account: str, start: str, end: str,
     """借一个已打开的京准通页面，同步抓某区间花费并写成与「花费一览」相同的缓存文件。
 
     「月度利润分析」发现花费缓存缺失时直接调用它补齐，用户不必再去别的页面手动抓一次。
-    返回落盘的 payload；一个 SKU 都没抓到（该区间确实没有花费）则返回 None、不写盘。
+    返回落盘的 payload；京准通花费为 0 时写一份「空表」缓存（noSpend），
+    CPS 一个 SKU 都没抓到则返回 None、不写盘。
     """
     start, end = norm_range(start, end)
     key = settings.get_account(account)["key"]
     runner = PayCommRunner(mode)
     rows, extra = runner._collect(page, key, start, end, on_progress)
+    no_spend = False
     if not rows:
-        return None
+        spend = extra.get("spend") or {}
+        if mode == "spend" and abs(float((spend.get("totals") or {}).get("total") or 0)) < 0.01:
+            no_spend = True
+        else:
+            return None
     job_id = time.strftime("%Y%m%d%H%M%S") + "-" + mode + "-" + key
     payload = {"jobId": job_id, "mode": mode, "account": key, "schema": SPEND_SCHEMA,
+               "noSpend": no_spend,
                "accountLabel": settings.get_account(key).get("label") or key,
                "start": start, "end": end, "rows": rows,
                "finishedAt": settings.now_iso(), "autoFilled": True}

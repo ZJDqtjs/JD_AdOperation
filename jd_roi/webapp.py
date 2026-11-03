@@ -1118,6 +1118,11 @@ function render(){
   $('pcBody').innerHTML = rowsHtml(list);
   $('pcKpis').innerHTML = kpisHtml();
   $('pcKpis').style.display = '';
+  if($('pcWarn')){
+    var ws = (SPEND && SPEND.warnings) || [];
+    if(ws.length){ $('pcWarn').innerHTML = '⚠ ' + ws.map(esc).join('<br>⚠ '); $('pcWarn').style.display=''; }
+    else { $('pcWarn').innerHTML = ''; $('pcWarn').style.display='none'; }
+  }
   var cnt = cat ? ('共 '+list.length+' 个品类 / '+ROWS.length+' 个 SKU')
                 : ('共 '+ROWS.length+' 个 SKU'
                    + (list.length!==ROWS.length ? ('，筛选后 '+list.length+' 行') : ''));
@@ -1189,7 +1194,13 @@ function poll(silent){
     $('pcCancel').style.display = 'none';
     $('pcBar').style.width = j.error ? '0' : '100%';
     if(!silent){
-      if(j.error){ msg(j.message || j.error, 'bad'); }
+      if(j.error){
+        msg(j.message || j.error, 'bad');
+        // 失败时清掉上一次（可能是别的账号）的 KPI 与表格，避免误读成本账号数据
+        ROWS = []; SPEND = {};
+        if($('pcKpis')){ $('pcKpis').innerHTML = ''; $('pcKpis').style.display = 'none'; }
+        $('pcTableCard').style.display = 'none'; $('pcCount').textContent = '';
+      }
       else if(j.message){ msg(j.message, 'ok'); }
     }
     if(j.rows && j.rows.length){
@@ -1234,6 +1245,9 @@ function run(force){
   if(s > e){ msg('起始日期不能晚于结束日期','bad'); return; }
   ROWS = []; JOB = null; SPEND = {};
   $('pcTableCard').style.display = 'none';
+  if($('pcKpis')){ $('pcKpis').innerHTML = ''; $('pcKpis').style.display = 'none'; }
+  if($('pcWarn')){ $('pcWarn').style.display = 'none'; $('pcWarn').innerHTML = ''; }
+  $('pcCount').textContent = '';
   $('pcExport').disabled = true;
   $('pcRun').disabled = true;
   $('pcRefetch').disabled = true;
@@ -1420,6 +1434,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
 </div>
 
 <div class="grid {cfg.get("grid", "g4")}" id="pcKpis" style="display:none;margin-top:18px"></div>
+<div class="hint" id="pcWarn" style="display:none;margin-top:10px;color:var(--red)"></div>
 
 <div class="card" id="pcCacheCard">
   <h2>本地缓存 <span class="tagline">不自动清理，删除由你决定</span></h2>

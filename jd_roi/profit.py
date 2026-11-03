@@ -1189,13 +1189,27 @@ class ProfitRunner:
             # 行集只看京准通：本账号**有投放**的商品才出现在这张表里（商智没投放的商品不列）。
             # 成交件数/前台价再从全局商智按 SKU 补——SKU 在别家店铺卖，就取那家的数据。
             parts = {}
+            no_spend: list[str] = []
             for account in done_accounts:
                 keys = set((jzt_parts.get(account) or {}).keys())
-                cps_used = {k: v for k, v in (cps_parts.get(account) or {}).items()
-                            if k in keys}
+                cps_all = cps_parts.get(account) or {}
+                has_spend = (any(float(v or 0) > 0 for v in (jzt_parts.get(account) or {}).values())
+                             or any(float(v or 0) > 0 for v in cps_all.values()))
+                if not has_spend:
+                    # 这个账号区间内没有任何广告花费：利润表按商智全部成交商品列出（净利=毛利），
+                    # 否则「行集只看京准通」会让一个纯自然成交的账号显示空表。
+                    no_spend.append(account)
+                    parts[account] = collect(list(sz_parts.get(account) or []), {}, {},
+                                             names=names_parts.get(account) or {},
+                                             accounts=[account])
+                    continue
+                cps_used = {k: v for k, v in cps_all.items() if k in keys}
                 sz_used = [r for r in (sz_parts.get(account) or []) if sz_sku(r) in keys]
                 parts[account] = collect(sz_used, cps_used, jzt_parts.get(account) or {},
                                          names=names_parts.get(account) or {}, accounts=[account])
+            for account in no_spend:
+                notes.append(f"{settings.get_account(account).get('label') or account}：该区间没有任何"
+                             f"京准通/CPS 花费，本表按商智全部成交商品列出（净利 = 毛利）。")
 
             filled = 0
             for account in done_accounts:
@@ -1284,7 +1298,8 @@ class ProfitRunner:
                                  for a in done_accounts)
             notes.append(f"京准通花费按投放账号归集（谁投的算谁的，不跨账号搬运）："
                          f"{spend_txt} 元。该数应等于各账号「京准通花费」页的合计。")
-            notes.append("表里只列本账号京准通有投放的商品；CPS 佣金也只算这些商品的，"
+            notes.append("表里只列本账号京准通有投放的商品（整月没有任何花费的账号例外，"
+                         "按商智全部成交商品列出）；CPS 佣金也只算这些商品的，"
                          "账号全部佣金看「CPS 花费」页。")
             for acc in done_accounts:
                 total_cps = round(sum((cps_parts.get(acc) or {}).values()), 2)
