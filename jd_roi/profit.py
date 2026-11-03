@@ -437,6 +437,54 @@ def totals_of(rows: list[dict]) -> dict:
             "noSupply": len(rows) - len(with_arr)}
 
 
+def merge_all_accounts(by_account: dict[str, dict]) -> dict:
+    """把各账号的利润表合成「全部账号」总览。
+
+    花费（京准通 / CPS）**相加**：一笔钱只有一个投放账号，不会重复；
+    成交件数、毛利按 **SKU 只取一份**：商智是一个 SKU 一份数据，同一 SKU 若两个账号都在投，
+    两张表里带的是同一份全额成交，直接相加会把毛利算两遍。
+    """
+    merged: dict[int, dict] = {}
+    for acc, block in (by_account or {}).items():
+        if acc == "all":
+            continue
+        for r in (block or {}).get("rows") or []:
+            try:
+                sid = int(r.get("skuId"))
+            except (TypeError, ValueError):
+                continue
+            cur = merged.get(sid)
+            if cur is None:
+                cur = dict(r)
+                cur["accts"] = list(r.get("accts") or [])
+                cur["spendAccts"] = list(r.get("spendAccts") or [])
+                merged[sid] = cur
+                continue
+            # 花费相加
+            cur["cpsCost"] = round(float(cur.get("cpsCost") or 0) + float(r.get("cpsCost") or 0), 2)
+            cur["jztCost"] = round(float(cur.get("jztCost") or 0) + float(r.get("jztCost") or 0), 2)
+            for key, field in (("accts", "accts"), ("spendAccts", "spendAccts")):
+                for a in r.get(field) or []:
+                    if a not in cur[key]:
+                        cur[key].append(a)
+            # 成交/毛利：只保留一份（取件数大的那行，避免空行覆盖有成交的行）
+            if int(r.get("qty") or 0) > int(cur.get("qty") or 0):
+                keep_cost = (cur["cpsCost"], cur["jztCost"])
+                cur.update({k: v for k, v in r.items()
+                            if k not in ("cpsCost", "jztCost", "accts", "spendAccts")})
+                cur["cpsCost"], cur["jztCost"] = keep_cost
+            if not cur.get("itemName") and r.get("itemName"):
+                cur["itemName"] = r["itemName"]
+    rows = []
+    for sid, r in merged.items():
+        _recalc(r)
+        if not r.get("category"):
+            r["category"] = catalog.category_of(r.get("itemName") or "")
+        rows.append(r)
+    rows.sort(key=lambda r: -float(r.get("gross") or 0))
+    return {"rows": rows, "totals": totals_of(rows), "label": "全部账号"}
+
+
 # ================================================================ 小工具
 def _recalc(r: dict) -> None:
     r["net"] = round(float(r.get("gross") or 0) - float(r.get("cpsCost") or 0)
@@ -733,7 +781,16 @@ class ProfitRunner:
         st = fp.stat()
         data["savedAt"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
         by = data.get("byAccount") or {}
-        if key != "all" and key in by:
+        if key == "all":
+            blk = by.get("all") or merge_all_accounts(by)
+            if blk:
+                by["all"] = blk
+                data["byAccount"] = by
+                data["rows"] = blk.get("rows") or []
+                data["totals"] = blk.get("totals") or {}
+                data["account"] = "all"
+                data["accountLabel"] = "全部账号"
+        elif key in by:
             # 原地改，别用 dict(...) 复制：调用方（reprice）持有的可能是同一份对象的浅拷贝，
             # 复制会导致内存里的 totals 不更新，只有磁盘是新的
             data["rows"] = by[key].get("rows") or []
@@ -839,7 +896,13 @@ class ProfitRunner:
     def run_background(self, account: str, start: str, end: str, force: bool = False,
                        accounts: list[str] | None = None) -> dict:
         start, end = norm_range(start, end)
-        keys = [settings.get_account(a)["key"] for a in (accounts or [account])]
+        want = [str(a) for a in (accounts or [account or ""]) if str(a)]
+        if not want or "all" in want:
+            # 「全部账号」：把当前所有账号都算一遍，再合成一张总览表
+            keys = [a["key"] for a in settings.ACCOUNTS]
+        else:
+            keys = [settings.get_account(a)["key"] for a in want]
+        keys = list(dict.fromkeys(keys))
         key = keys[0] if len(keys) == 1 else "all"
         with self._lock:
             running = bool(self._state.get("running"))
@@ -917,9 +980,7 @@ class ProfitRunner:
     def export(self, job_id: str | None = None, account: str | None = None,
                start: str | None = None, end: str | None = None,
                dim: str = "sku") -> tuple[bytes, str] | None:
-        data = self._results.get(job_id or "") or None
-        if data is None and account and start and end:
-            data = self.load_cached(account, start, end)
+        data = self._payload(job_id, account, start, end)
         if data is None:
             latest = sorted((Path(settings.DATA_DIR) / "reports").glob("profit_*.json"),
                             key=lambda p: p.stat().st_mtime, reverse=True)
@@ -952,6 +1013,14 @@ class ProfitRunner:
         data = self._results.get(job_id or "") or None
         if data is None and account and start and end:
             data = self.load_cached(account, start, end)
+        if data and account == "all":
+            blk = (data.get("byAccount") or {}).get("all")
+            if blk:
+                data = dict(data)
+                data["rows"] = blk.get("rows") or []
+                data["totals"] = blk.get("totals") or {}
+                data["account"] = "all"
+                data["accountLabel"] = "全部账号"
         return data
 
     @staticmethod
@@ -1269,7 +1338,10 @@ class ProfitRunner:
                 rows = rows_for_account(parts, attributed, acc, costs=costs)
                 by_account[acc] = {"rows": rows, "totals": totals_of(rows),
                                    "label": settings.get_account(acc).get("label") or acc}
-            main_acc = done_accounts[0]
+            # 「全部账号」总览：花费相加、成交/毛利按 SKU 只取一份（避免同一笔成交算两遍）
+            if len(by_account) > 1:
+                by_account["all"] = merge_all_accounts(by_account)
+            main_acc = "all" if "all" in by_account else done_accounts[0]
             rows = by_account[main_acc]["rows"]
             totals = by_account[main_acc]["totals"]
             if not any(b["rows"] for b in by_account.values()):
@@ -1374,4 +1446,86 @@ class ProfitRunner:
         except Exception as exc:  # noqa: BLE001
             self._set(running=False, error=f"{type(exc).__name__}: {exc}",
                       finishedAt=settings.now_iso(), message=f"失败：{exc}")
+
+
+# ================================================================ 本地缓存清单
+_CACHE_NEW = re.compile(r"^profit_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.json$")
+# 老版本按账号分开存（profit_all_/profit_main_/profit_b_…）：现在不会再命中，只占地方
+_CACHE_OLD = re.compile(r"^profit_([A-Za-z0-9_]+)_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.json$")
+
+
+def _reports_dir() -> Path:
+    return Path(settings.DATA_DIR) / "reports"
+
+
+def cache_entries() -> list[dict]:
+    """本地利润缓存清单（`data/reports/profit_<start>_<end>.json`）。
+
+    现在一次算一份、里面同时装各账号的表；老版本按账号分开存的文件已经不会被
+    命中，这里标成 legacy 让用户能一并清掉。stale 表示口径版本过期（重算才会命中）。
+    """
+    base = _reports_dir()
+    items: list[dict] = []
+    for fp in base.glob("profit_*.json"):
+        new = _CACHE_NEW.match(fp.name)
+        old = None if new else _CACHE_OLD.match(fp.name)
+        if not new and not old:
+            continue
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            data = {}
+        start = new.group(1) if new else old.group(2)
+        end = new.group(2) if new else old.group(3)
+        by = data.get("byAccount") or {}
+        accs = [str(x) for x in (data.get("accounts") or [])] or list(by)
+        blk = by.get("all") or {}
+        rows = data.get("rows") or blk.get("rows") or []
+        net = (data.get("totals") or {}).get("net")
+        if net is None:
+            net = (blk.get("totals") or {}).get("net")
+        ver = int(data.get("logicVersion") or 0)
+        st = fp.stat()
+        items.append({
+            "mode": "profit",
+            "account": "all" if new else (old.group(1) if old else "all"),
+            "accountLabel": (f"全部账号（{len(accs)} 份表）" if new
+                             else f"旧格式：{old.group(1) if old else '?'}"),
+            "start": start, "end": end,
+            "rows": len(rows),
+            "total": round(float(net or 0), 2),
+            "accounts": accs,
+            "logicVersion": ver,
+            "stale": bool(new) and ver != LOGIC_VERSION,
+            "legacy": bool(old),
+            "savedAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "sizeKB": round(st.st_size / 1024, 1),
+            "files": [fp.name],
+        })
+    items.sort(key=lambda x: x["savedAt"], reverse=True)
+    return items
+
+
+def delete_cache(start: str = "", end: str = "", file: str = "") -> dict:
+    """删一份利润缓存：新格式按区间删（json + 同名 xlsx）；legacy 只能按文件名删。"""
+    base = _reports_dir()
+    if file:
+        name = Path(str(file)).name
+        if not name.startswith("profit_") or "/" in str(file) or "\\" in str(file):
+            return {"ok": False, "error": "只能删除 data/reports 下 profit_ 开头的缓存文件"}
+        targets = [base / name, base / f"{Path(name).stem}.xlsx"]
+    elif start and end:
+        targets = [base / f"profit_{start}_{end}.json", base / f"profit_{start}_{end}.xlsx"]
+    else:
+        return {"ok": False, "error": "缺少 start / end 或 file"}
+    deleted = []
+    for fp in targets:
+        if fp.exists():
+            try:
+                fp.unlink()
+                deleted.append(fp.name)
+            except Exception:  # noqa: BLE001
+                pass
+    return {"ok": True, "deleted": deleted,
+            "error": None if deleted else "没有找到对应的缓存文件"}
 

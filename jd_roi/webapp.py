@@ -1002,7 +1002,8 @@ var KPIS = INIT.kpis || [];
 var RATIO = INIT.ratioKeys || [];
 var LBL = {}, TYP = {};
 FIELDS.forEach(function(f){ LBL[f[0]] = f[1]; TYP[f[0]] = f[2]; });
-var DIM = 'sku', JOB = null, ROWS = [], SPEND = {}, SORT = {k: (INIT.sort || 'payCommAmount'), d: -1}, TIMER = null;
+var DIM = 'sku', JOB = null, ROWS = [], SPEND = {}, WARN = [],
+    SORT = {k: (INIT.sort || 'payCommAmount'), d: -1}, TIMER = null;
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
@@ -1119,7 +1120,7 @@ function render(){
   $('pcKpis').innerHTML = kpisHtml();
   $('pcKpis').style.display = '';
   if($('pcWarn')){
-    var ws = (SPEND && SPEND.warnings) || [];
+    var ws = (SPEND && SPEND.warnings) || WARN || [];
     if(ws.length){ $('pcWarn').innerHTML = '⚠ ' + ws.map(esc).join('<br>⚠ '); $('pcWarn').style.display=''; }
     else { $('pcWarn').innerHTML = ''; $('pcWarn').style.display='none'; }
   }
@@ -1185,6 +1186,15 @@ function poll(silent){
       $('pcCancel').style.display = '';
       var pct = j.total ? Math.round(j.done*100/j.total) : 0;
       $('pcBar').style.width = pct+'%';
+      // 「全部账号」部分命中：先把已有缓存的账号照出来，缺的账号后台补抓，抓完自动整体刷新
+      if(j.partial && j.rows && j.rows.length){
+        var rg0 = j.range || [];
+        if(!rg0.length || (rg0[0] === $('pcStart').value && rg0[1] === $('pcEnd').value)){
+          ROWS = j.rows; SPEND = j.spend || {};
+          WARN = (SPEND && SPEND.warnings) || j.warnings || [];
+          showTable();
+        }
+      }
       msg((j.message||'抓取中') + (j.total ? ('　'+j.done+'/'+j.total+'（'+pct+'%）') : ''));
       clearTimeout(TIMER); TIMER = setTimeout(poll, 1500);
       return;
@@ -1207,7 +1217,9 @@ function poll(silent){
       var rg = j.range || [];
       var same = rg.length ? (rg[0] === $('pcStart').value && rg[1] === $('pcEnd').value) : true;
       if(same){
-        JOB = j.jobId; ROWS = j.rows; SPEND = j.spend || {}; showTable();
+        JOB = j.jobId; ROWS = j.rows; SPEND = j.spend || {};
+        WARN = (SPEND && SPEND.warnings) || j.warnings || [];
+        showTable();
       } else {
         msg('本页最近一次结果是 ' + rg[0] + ' ~ ' + rg[1] + '；当前区间点「查询」即可（有缓存秒出）');
       }
@@ -1263,13 +1275,18 @@ function run(force){
       }
       JOB = j.jobId;
       if(j.cached){
-        msg(j.stitched
-          ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求京准通')
-          : ('命中本地缓存（' + (j.savedAt||'') + ' 抓取，共 ' + (j.rows||0) + ' 个 SKU），未请求京准通'));
+        if(j.partial){
+          msg('先用已缓存的 ' + (j.rows||0) + ' 个 SKU 出表；'
+              + (j.missing||[]).join('、') + ' 还没有该区间缓存，正在后台补抓（抓完自动刷新）');
+        } else {
+          msg(j.stitched
+            ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求京准通')
+            : ('命中本地缓存（' + (j.savedAt||'') + ' 抓取，共 ' + (j.rows||0) + ' 个 SKU），未请求京准通'));
+        }
       } else {
         msg('该区间没有完整缓存，已开始在后台抓取（约 20 秒 / 或几分钟）；完成后自动写入缓存');
       }
-      poll(); loadCache();
+      poll();
     }).catch(function(e){
       msg('请求失败 '+e,'bad');
       $('pcRun').disabled=false; $('pcRefetch').disabled=false;
@@ -1280,41 +1297,6 @@ function refetch(){
   var tip = '重新抓取 ' + s + ' ~ ' + e + '，会真实请求京准通并覆盖该区间缓存。继续？';
   if(!confirm(tip)) return;
   run(true);
-}
-function loadCache(){
-  fetch(API + '/cache').then(function(r){ return r.json(); }).then(function(j){
-    if(!j.ok || !j.entries){ return; }
-    var list = j.entries;
-    if(!list.length){
-      $('pcCacheBody').innerHTML = '<tr><td colspan="7" class="l">还没有缓存，点「查询」抓一次就会存下来</td></tr>';
-      return;
-    }
-    var html = list.map(function(en){
-      return '<tr><td class="l">'+esc(en.accountLabel || en.account)+'</td>'
-        + '<td class="l">'+esc(en.start)+' ~ '+esc(en.end)+'</td>'
-        + '<td class="n">'+esc(en.rows)+'</td>'
-        + '<td class="n">'+fmt(en.total,'money')+'</td>'
-        + '<td class="l">'+esc(en.savedAt)+'</td>'
-        + '<td class="n">'+esc(en.sizeKB)+' KB</td>'
-        + '<td class="n"><button class="btn danger mini" data-acc="'+esc(en.account)+'" '
-        + 'data-start="'+esc(en.start)+'" data-end="'+esc(en.end)+'" '
-        + 'onclick="PC.delCache(this)">删除</button></td></tr>';
-    }).join('');
-    $('pcCacheBody').innerHTML = html;
-  }).catch(function(){});
-}
-function delCache(btn){
-  var account = btn.getAttribute('data-acc');
-  var start = btn.getAttribute('data-start');
-  var end = btn.getAttribute('data-end');
-  if(!confirm('删除 ' + account + ' ' + start + ' ~ ' + end + ' 的本地缓存？删掉后下次查询会重新请求京准通。')) return;
-  var qs = new URLSearchParams({account: account, start: start, end: end});
-  fetch(API + '/cache/delete?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
-    .then(function(j){
-      msg(j.ok && (j.deleted||[]).length ? ('已删除：'+j.deleted.join('、')) : (j.error||'删除失败'),
-          j.ok ? 'ok' : 'bad');
-      loadCache();
-    }).catch(function(e){ msg('删除失败 '+e,'bad'); });
 }
 function cancel(){
   fetch(API + '/cancel', {method:'POST'}).then(function(r){ return r.json(); })
@@ -1338,10 +1320,11 @@ function sort(k){
   render();
 }
 window.PC = {sort: sort, run: run, refetch: refetch, exp: exp, cancel: cancel,
-             render: render, loadCache: loadCache, delCache: delCache, dim: dim,
-             expView: expView, quick: quick};
+             render: render, dim: dim, expView: expView, quick: quick};
 function boot(){
-  poll(); loadCache();
+  poll();
+  // 从「缓存管理」点「查看」带区间打开：自动查一次，有缓存就直接秒出
+  if(INIT.auto) run();
   $('pcTable').addEventListener('click', function(e){
     var th = e.target.closest('th');
     if(!th || !th.getAttribute('data-key')) return;
@@ -1362,7 +1345,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = q.get("account") or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     start, end = _last_month_range()
     if q.get("start") and q.get("end"):
@@ -1370,10 +1353,14 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
             start, end = paycomm.norm_range(q.get("start"), q.get("end"))
         except ValueError:
             pass
-    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-                   f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    opts = ('<option value="all"%s>全部账号（总览）</option>'
+            % (" selected" if acc == "all" else "")) + "".join(
+        f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
     fields = paycomm.FIELDS if kind == "cps" else paycomm.SPEND_FIELDS
     init = {"mode": kind, "api": cfg["api"], "sort": cfg["sort"],
+            # 带 start/end 打开（缓存管理点「查看」）：进页面自动查一次，命中缓存直接秒出
+            "auto": bool(q.get("start") and q.get("end")),
             "fields": [[k, lab, t] for k, lab, t in fields],
             "webKeys": cfg["webKeys"], "kpis": cfg["kpis"], "showUnattr": cfg["showUnattr"],
             "ratioKeys": cfg.get("ratioKeys", [])}
@@ -1413,6 +1400,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
   <div class="metaline">{metaline}</div>
   <div class="actions">
     <a class="btn ghost mini" href="{_e(cfg["switch"][0])}">{_e(cfg["switch"][1])}</a>
+    <a class="btn ghost mini" href="/cache?kind={kind}">缓存管理 →</a>
     <a class="btn ghost mini" href="/login">登录 / 检查登录态</a>
   </div>
 </div></header>
@@ -1440,14 +1428,9 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
   <h2>本地缓存 <span class="tagline">不自动清理，删除由你决定</span></h2>
   <p class="hint">抓一次存一份：<code>{_e(str(settings.DATA_DIR))}/reports/</code>。
   同一账号 + 同一区间再点「查询」直接读文件，<b>不会请求京准通</b>；需要最新数据时点「重新抓取」覆盖这一份。
-  这里没有任何自动过期、也没有自动清理逻辑。</p>
-  <div class="tblwrap short">
-    <table><thead><tr>
-      <th class="l noSort">账号</th><th class="l noSort">区间</th><th class="n noSort">SKU</th>
-      <th class="n noSort">合计(元)</th><th class="l noSort">抓取时间</th>
-      <th class="n noSort">大小</th><th class="n noSort">操作</th>
-    </tr></thead><tbody id="pcCacheBody"></tbody></table>
-  </div>
+  没有任何自动过期、也没有自动清理逻辑。</p>
+  <p class="hint">缓存清单（按时间 / 按账号、搜索、删除、旧口径清理）已独立成页：</p>
+  <p><a class="btn ghost" href="/cache?kind={kind}">打开缓存管理 →</a></p>
 </div>
 
 <div class="card" id="pcTableCard" style="display:none">
@@ -1505,6 +1488,62 @@ def _paycomm_other_running(mode: str) -> str | None:
 def _paycomm_start(runner, account, start, end, force: bool = False) -> dict:
     """查询入口：默认先吃本地缓存（同账号+同区间），force=1 才重新请求京准通。"""
     acc = account or settings.MAIN_ACCOUNT
+    if str(acc).lower() == "all":
+        # 「全部账号」：先用已有的缓存秒出总览；缺的账号在后台补抓，抓完前端自动刷新。
+        # 一个账号都没有缓存时才整批抓（否则页面白等几分钟）。
+        if not force:
+            got = runner.all_payload(start, end, allow_missing=True)
+            if got is not None and got.get("rows"):
+                job_id = f"all-{runner.mode}-{start}_{end}"
+                got["jobId"] = job_id
+                missing = [settings.get_account(k).get("label") or k
+                           for k in (got.get("missing") or [])]
+                runner._results[job_id] = got
+                runner._state.update(
+                    {"running": False, "cached": True, "jobId": job_id, "account": "all",
+                     "range": [start, end], "total": len(got["rows"]),
+                     "done": len(got["rows"]), "error": None,
+                     "finishedAt": settings.now_iso(),
+                     "message": ("命中本地缓存：各账号已合并成一张总览" if not missing else
+                                 f"先用已有缓存出总览；还有 {len(missing)} 个账号在后台补抓："
+                                 f"{'、'.join(missing)}")})
+                if not missing:
+                    return {"ok": True, "cached": True, "jobId": job_id, "rows": len(got["rows"])}
+                out = {"ok": True, "cached": True, "partial": True, "jobId": job_id,
+                       "rows": len(got["rows"]), "missing": missing}
+                busy = _paycomm_other_running(runner.mode)
+                info = scrape_day.lock_info()
+                if busy or (info.get("locked") and info.get("alive")):
+                    out["warnings"] = ["现在有别的抓取任务占用浏览器登录态，"
+                                       "等它结束后再点「查询」会自动补抓缺的账号"]
+                    return out
+                started = runner.run_all_background(
+                    start, end,
+                    note=f"先用已有缓存出总览，正在补抓缺的 {len(missing)} 个账号…")
+                if not started.get("ok"):
+                    out["warnings"] = [started.get("error") or "后台补抓没能启动"]
+                    return out
+                # 补抓任务换了新 jobId：把这份部分结果挂上去，轮询时先显示这批数据
+                got["partial"] = True
+                got["missing"] = missing[:]
+                got["warnings"] = list(got.get("warnings") or [])
+                got["warnings"].append(f"以下账号还没有该区间缓存，正在后台补抓："
+                                       f"{'、'.join(missing)}（抓完自动刷新）")
+                runner._results[started["jobId"]] = got
+                out["backfill"] = started["jobId"]
+                return out
+        busy = _paycomm_other_running(runner.mode)
+        if busy:
+            return {"ok": False, "error": busy}
+        info = scrape_day.lock_info()
+        if info.get("locked") and info.get("alive"):
+            who = info.get("name") or info.get("thread") or "抓取任务"
+            return {"ok": False,
+                    "error": f"正在执行数据抓取（{who}，{info.get('acquiredAt') or ''} 开始），"
+                             f"浏览器登录态被占用，等它结束再查"}
+        note = ("「全部账号」：有账号还没有该区间缓存，正在逐个补抓…" if not force
+                else "「全部账号」重新抓取中（会覆盖各账号该区间缓存）…")
+        return runner.run_all_background(start, end, note=note)
     try:
         if not force:
             # 1) 精确命中（账号+起+止完全一致）  2) 多段相邻缓存拼接（8月 + 9月 → 8/1~9/30）
@@ -1626,6 +1665,270 @@ def api_paycomm_spend_cache_delete(account: str | None = None, start: str = "", 
     if not (account and start and end):
         return {"ok": False, "error": "缺少 account / start / end"}
     return _paycomm_spend.delete_cache(account, start, end)
+
+
+# ================================================================ 缓存管理（二级页）
+# 三类缓存各自的落盘文件：paycomm_*.json（CPS）/ paycomm_spend_*.json（京准通）/ profit_*.json
+CACHE_KINDS = [("all", "全部"), ("cps", "CPS 花费"), ("spend", "京准通花费"),
+               ("profit", "月度利润")]
+CACHE_LABELS = {"cps": "CPS 花费", "spend": "京准通花费", "profit": "月度利润"}
+CACHE_HREF = {"cps": "/paycomm", "spend": "/paycomm/spend", "profit": "/profit"}
+
+CACHE_CSS = """
+.cgGrp{margin-bottom:18px}
+.cgGrp h3{font-size:14px;margin:0 0 10px;color:var(--ink)}
+.cgGrp h3 span{font-weight:400;color:var(--muted);margin-left:10px;font-size:12px}
+.cgBadge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;
+  border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.cgBadge.warn{color:var(--red);border-color:var(--red)}
+.cgBadge.legacy{border-style:dashed}
+"""
+
+CACHE_JS = r"""
+(function(){
+var INIT = window.CACHE_INIT || {};
+var ALL = [], KIND = INIT.kind || 'all', VIEW = 'time', Q = '';
+var LABEL = INIT.labels || {}, HREF = INIT.href || {};
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function fmtKB(kb){ var n = Number(kb||0);
+  return n >= 1024 ? (n/1024).toFixed(1)+' MB' : (Math.round(n*10)/10)+' KB'; }
+function money(v){ var n = Number(v||0);
+  return n.toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function match(en){
+  if(KIND !== 'all' && en.kind !== KIND) return false;
+  if(!Q) return true;
+  return [en.kindLabel, en.account, en.accountLabel, en.start, en.end]
+    .join(' ').toLowerCase().indexOf(Q) >= 0;
+}
+function sumKB(list){ var t = 0; list.forEach(function(e){ t += Number(e.sizeKB||0); }); return t; }
+function badges(en){
+  var out = '';
+  if(en.legacy) out += ' <span class="cgBadge legacy" title="旧命名/按账号存的缓存，现在的查询不会命中">旧格式</span>';
+  if(en.stale) out += ' <span class="cgBadge warn" title="口径版本已升级，这份缓存不会被命中，需要重算">口径过期</span>';
+  return out;
+}
+function buttons(en){
+  return '<button class="btn ghost mini" data-act="open" data-kind="'+esc(en.kind)+'" '
+    + 'data-acc="'+esc(en.account||'')+'" data-s="'+esc(en.start)+'" data-e="'+esc(en.end)+'">查看</button> '
+    + '<button class="btn danger mini" data-act="del" data-kind="'+esc(en.kind)+'" '
+    + 'data-acc="'+esc(en.account||'')+'" data-s="'+esc(en.start)+'" data-e="'+esc(en.end)+'" '
+    + 'data-file="'+esc((en.files||[])[0]||'')+'">删除</button>';
+}
+function rowsHtml(list, withKind){
+  return list.map(function(en){
+    return '<tr>'
+      + (withKind ? '<td class="l"><span class="cgBadge">'+esc(en.kindLabel)+'</span></td>' : '')
+      + '<td class="l">'+esc(en.accountLabel || en.account)+badges(en)+'</td>'
+      + '<td class="l">'+esc(en.start)+' ~ '+esc(en.end)+'</td>'
+      + '<td class="n">'+esc(en.rows)+'</td>'
+      + '<td class="n" title="'+(en.kind==='profit'?'净利合计':(en.kind==='cps'?'付款佣金合计':'京准通花费合计'))+'">'
+      + money(en.total)+(en.kind==='profit'?' <span class="cgBadge">净利</span>':'')+'</td>'
+      + '<td class="l">'+esc(en.savedAt)+'</td>'
+      + '<td class="n">'+fmtKB(en.sizeKB)+'</td>'
+      + '<td class="n" style="white-space:nowrap">'+buttons(en)+'</td></tr>';
+  }).join('');
+}
+function byTime(list, withKind){
+  return '<div class="card"><div class="tblwrap long"><table><thead><tr>'
+    + (withKind ? '<th class="l noSort">类型</th>' : '')
+    + '<th class="l noSort">账号</th><th class="l noSort">区间</th><th class="n noSort">行数</th>'
+    + '<th class="n noSort">合计(元)</th><th class="l noSort">抓取时间</th>'
+    + '<th class="n noSort">大小</th><th class="n noSort">操作</th>'
+    + '</tr></thead><tbody>' + rowsHtml(list, withKind) + '</tbody></table></div></div>';
+}
+function byAcct(list){
+  var groups = {}, order = [];
+  list.forEach(function(en){
+    var k = en.kind + '|' + (en.account || 'all');
+    if(!groups[k]){
+      groups[k] = {kind: en.kind, label: en.accountLabel || en.account || '全部账号', items: []};
+      order.push(k);
+    }
+    groups[k].items.push(en);
+  });
+  return order.map(function(k){
+    var g = groups[k];
+    return '<div class="card cgGrp"><h3>' + esc(g.label)
+      + '<span>' + esc(LABEL[g.kind] || g.kind) + ' · ' + g.items.length + ' 份 · '
+      + fmtKB(sumKB(g.items)) + '</span></h3>'
+      + '<div class="tblwrap short"><table><thead><tr>'
+      + '<th class="l noSort">区间</th><th class="n noSort">行数</th><th class="n noSort">合计(元)</th>'
+      + '<th class="l noSort">抓取时间</th><th class="n noSort">大小</th><th class="n noSort">操作</th>'
+      + '</tr></thead><tbody>' + rowsHtml(g.items, false) + '</tbody></table></div></div>';
+  }).join('');
+}
+function render(){
+  var list = ALL.filter(match);
+  var stat = '共 ' + list.length + ' 份 · ' + fmtKB(sumKB(list));
+  if(list.length !== ALL.length) stat += '（全部 ' + ALL.length + ' 份）';
+  $('cgStat').textContent = stat;
+  if(!list.length){
+    $('cgBody').innerHTML = '<div class="card"><p class="hint">没有匹配的缓存：换个类型或清空搜索试试。</p></div>';
+    return;
+  }
+  $('cgBody').innerHTML = (VIEW === 'acct')
+    ? byAcct(list)
+    : byTime(list, KIND === 'all');
+}
+function syncTabs(){
+  var nodes = document.querySelectorAll('#cgKinds [data-kind]');
+  for(var i=0;i<nodes.length;i++){
+    nodes[i].className = 'tab' + (nodes[i].getAttribute('data-kind') === KIND ? ' active' : '');
+  }
+}
+function openCache(d){
+  var base = HREF[d.kind] || '/';
+  var qs = new URLSearchParams({start: d.start, end: d.end});
+  qs.set('account', d.kind === 'profit' ? 'all' : (d.account || 'all'));
+  window.location = base + '?' + qs.toString();
+}
+function delCache(d){
+  var tip = '删除「' + (LABEL[d.kind] || d.kind) + '」' + (d.account || '') + ' '
+    + d.start + ' ~ ' + d.end + ' 的本地缓存？\n删掉后下次查询会重新请求京东接口。';
+  if(!confirm(tip)) return;
+  var qs = new URLSearchParams({kind: d.kind, account: d.account || '',
+                                start: d.start, end: d.end, file: d.file || ''});
+  fetch('/api/cache/delete?' + qs.toString(), {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      $('cgMsg').textContent = (j.ok && (j.deleted||[]).length)
+        ? ('已删除：' + j.deleted.join('、')) : (j.error || '删除失败');
+      load();
+    }).catch(function(e){ $('cgMsg').textContent = '删除失败：' + e; });
+}
+function load(){
+  fetch('/api/cache/list').then(function(r){ return r.json(); }).then(function(j){
+    if(!j.ok){ $('cgMsg').textContent = '读取缓存清单失败' + (j.error ? '：' + j.error : ''); return; }
+    ALL = j.entries || [];
+    var parts = [];
+    ['cps','spend','profit'].forEach(function(k){
+      var n = (j.counts || {})[k] || 0;
+      if(n) parts.push((LABEL[k] || k) + ' ' + n + ' 份');
+    });
+    $('cgMsg').textContent = parts.length
+      ? ('当前：' + parts.join(' · ') + '；删除后下次查询会重新请求京东接口。')
+      : '还没有任何缓存，去花费/利润页查询一次就会存下来。';
+    render();
+  }).catch(function(e){ $('cgMsg').textContent = '读取缓存清单失败：' + e; });
+}
+function kind(k){ KIND = k; syncTabs(); render(); }
+function view(v){
+  VIEW = (v === 'acct') ? 'acct' : 'time';
+  $('cgVTime').className = 'tab' + (VIEW === 'time' ? ' active' : '');
+  $('cgVAcc').className = 'tab' + (VIEW === 'acct' ? ' active' : '');
+  render();
+}
+function search(){ Q = ($('cgQ').value || '').trim().toLowerCase(); render(); }
+window.CG = {kind: kind, view: view, search: search, load: load};
+document.getElementById('cgBody').addEventListener('click', function(ev){
+  var b = ev.target.closest ? ev.target.closest('button[data-act]') : null;
+  if(!b) return;
+  var d = {kind: b.getAttribute('data-kind'), account: b.getAttribute('data-acc') || '',
+           start: b.getAttribute('data-s'), end: b.getAttribute('data-e'),
+           file: b.getAttribute('data-file') || ''};
+  if(b.getAttribute('data-act') === 'open') openCache(d); else delCache(d);
+});
+load();
+})();
+"""
+
+
+@app.get("/api/cache/list")
+def api_cache_list():
+    """三类缓存合成一张清单：花费两份 + 利润一份，条目自带 kind。"""
+    entries: list[dict] = []
+    for en in _paycomm.cache_entries():
+        en["kind"] = "cps"
+        entries.append(en)
+    for en in _paycomm_spend.cache_entries():
+        en["kind"] = "spend"
+        entries.append(en)
+    for en in profit.cache_entries():
+        en["kind"] = "profit"
+        entries.append(en)
+    counts = {"cps": 0, "spend": 0, "profit": 0}
+    for en in entries:
+        en["kindLabel"] = CACHE_LABELS.get(en["kind"], en["kind"])
+        counts[en["kind"]] = counts.get(en["kind"], 0) + 1
+    entries.sort(key=lambda e: e.get("savedAt") or "", reverse=True)
+    return {"ok": True, "entries": entries, "count": len(entries), "counts": counts,
+            "totalKB": round(sum(float(e.get("sizeKB") or 0) for e in entries), 1)}
+
+
+@app.post("/api/cache/delete")
+def api_cache_delete(kind: str = "", account: str = "", start: str = "",
+                     end: str = "", file: str = ""):
+    if kind == "cps":
+        return _paycomm.delete_cache(account, start, end)
+    if kind == "spend":
+        return _paycomm_spend.delete_cache(account, start, end)
+    if kind == "profit":
+        return profit.delete_cache(start, end, file=file)
+    return {"ok": False, "error": "未知的缓存类型（kind 只能是 cps / spend / profit）"}
+
+
+@app.get("/cache", response_class=HTMLResponse)
+def cache_page(request: Request):
+    """本地缓存管理（二级页）：按时间 / 按账号两种视图，可搜索、可删。"""
+    kind = request.query_params.get("kind") or "all"
+    if kind not in CACHE_LABELS:
+        kind = "all"
+    tabs = "".join(
+        f'<button type="button" class="tab{" active" if k == kind else ""}" '
+        f'data-kind="{k}" onclick="CG.kind(\'{k}\')">{lab}</button>'
+        for k, lab in CACHE_KINDS)
+    init = {"kind": kind, "labels": CACHE_LABELS, "href": CACHE_HREF}
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本地缓存管理 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+<style>{CACHE_CSS}</style>
+</head><body>
+{report2.navtop("/cache")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}缓存</div>
+  <h1>本地缓存管理</h1>
+  <div class="metaline">
+    <span>一次抓取 = 一份文件（<code>{_e(str(settings.DATA_DIR))}/reports/</code>）</span><span class="dot"></span>
+    <span>不自动过期，删除由你决定</span><span class="dot"></span>
+    <span>旧格式 / 口径过期的缓存不会被命中</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/paycomm">CPS 花费 →</a>
+    <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
+    <a class="btn ghost mini" href="/profit">月度利润 →</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="card">
+  <div class="toolbar">
+    <span class="tabs" id="cgKinds">{tabs}</span>
+    <span class="tabs" style="margin-left:16px">
+      <button type="button" class="tab active" id="cgVTime" onclick="CG.view('time')">按时间</button>
+      <button type="button" class="tab" id="cgVAcc" onclick="CG.view('acct')">按账号</button>
+    </span>
+    <input id="cgQ" placeholder="搜索账号 / 区间 / 类型" oninput="CG.search()"
+           style="min-width:240px;padding:7px 10px;border-radius:8px;border:1px solid var(--line);margin-left:16px">
+    <span class="hint" id="cgStat" style="margin-left:auto"></span>
+  </div>
+  <div class="hint" id="cgMsg" style="min-height:20px">读取缓存清单…</div>
+</div>
+
+<div id="cgBody" style="margin-top:18px"></div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>CPS 花费 / 京准通花费</b>：每个「账号 + 区间」一份，点「查看」会带着区间跳到对应页面并直接命中这份缓存。</p>
+  <p><b>月度利润</b>：每个区间一份，里面同时装各账号的表；切账号不用重算。口径版本升级后旧文件不再命中，标「口径过期」的可以删掉。</p>
+  <p>删除只影响本地文件，京东侧数据不受影响；下次查询会重新抓取一次。</p>
+</div>
+
+</div>
+<script>window.CACHE_INIT = {json.dumps(init, ensure_ascii=False)};</script>
+<script>{CACHE_JS}</script>
+</body></html>""")
 
 
 # ================================================================ 月度利润分析
@@ -1918,6 +2221,8 @@ window.PF = {run:run, refetch:refetch, exp:exp, expView:expView, dim:dim, sort:s
              render:render, switchAcc:switchAcc, reprice:reprice, quick:quick};
 function boot(){
   poll();
+  // 从「缓存管理」点「查看」带区间打开：自动查一次，有缓存就直接秒出
+  if(INIT.auto) run();
   $('pfTable').addEventListener('click', function(e){
     var th = e.target.closest('th');
     if(!th || !th.getAttribute('data-key')) return;
@@ -1938,7 +2243,7 @@ def profit_page(request: Request):
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = q.get("account") or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     start, end = _last_month_range()
     if q.get("start") and q.get("end"):
@@ -1946,9 +2251,13 @@ def profit_page(request: Request):
             start, end = profit.norm_range(q.get("start"), q.get("end"))
         except ValueError:
             pass
-    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-                   f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    opts = ('<option value="all"%s>全部账号（总览）</option>'
+            % (" selected" if acc == "all" else "")) + "".join(
+        f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
     init = {"api": "/api/profit", "fields": [[k, lab, t] for k, lab, t in profit.FIELDS],
+            # 带 start/end 打开（缓存管理点「查看」）：进页面自动查一次，命中缓存直接秒出
+            "auto": bool(q.get("start") and q.get("end")),
             "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
             "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
@@ -1972,6 +2281,7 @@ def profit_page(request: Request):
   <div class="actions">
     <a class="btn ghost mini" href="/paycomm">CPS 花费 →</a>
     <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
+    <a class="btn ghost mini" href="/cache?kind=profit">缓存管理 →</a>
     <a class="btn ghost mini" href="/login">登录 / 检查登录态</a>
   </div>
 </div></header>
