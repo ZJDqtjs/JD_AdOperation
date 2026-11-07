@@ -34,10 +34,18 @@ from . import llm, settings
 DATA_DIR = settings.DATA_DIR
 ANALYSIS = DATA_DIR / "analysis2.json"
 
-# 方法论来源：优先读已安装的 skill（jd-ad-roi-optimizer.zip 解出的 references/）
+# 方法论来源：优先读本项目随仓库维护的知识库（官方课程提炼），
+# 再读本机已安装的 skill（jd-ad-roi-optimizer.zip 解出的 references/）。
+# 顺序即优先级；同名文件只取先命中的那份，避免两处副本重复喂给模型。
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_SKILL = _PROJECT_ROOT / ".trae" / "skills" / "jd-ad-roi-optimizer"
 _SKILL_DIR = Path.home() / ".workbuddy" / "skills" / "jd-ad-roi-optimizer"
 METHODOLOGY_CANDIDATES = [
+    _PROJECT_SKILL / "references" / "kuaiche-playbook.md",
+    _SKILL_DIR / "references" / "kuaiche-playbook.md",
+    _PROJECT_SKILL / "references" / "methodology.md",
     _SKILL_DIR / "references" / "methodology.md",
+    _PROJECT_SKILL / "references" / "diagnosis-playbook.md",
     _SKILL_DIR / "references" / "diagnosis-playbook.md",
 ]
 
@@ -92,7 +100,8 @@ def _f(v, d=0.0) -> float:
 def _w(x: dict) -> dict:
     return {"cost": round(x.get("cost", 0), 1), "roi": round(x.get("roi", 0), 2),
             "ctr": round(x.get("ctr", 0), 2), "cvr": round(x.get("cvr", 0), 2),
-            "cpc": round(x.get("cpc", 0), 2),
+            "cpc": round(x.get("cpc", 0), 2), "aov": round(x.get("aov", 0), 2),
+            "imp": x.get("imp", 0), "clk": x.get("clk", 0),
             "ord": x.get("ord", 0), "amt": round(x.get("amt", 0), 1)}
 
 
@@ -165,16 +174,36 @@ def build_digest(data: dict, account: str | None = None, *, max_skus: int = 30,
                     "ord": v.get("ord", 0), "n": v.get("n", 0)}
                 for t, v in (per.get(wk) or {}).items()}
 
+    # 观察期/日点击要用「所选区间」的实际天数，不能默认 7 天
+    _rng = meta.get("range") or {}
+    try:
+        _days = (_rng["end"] and _rng["start"] and
+                 (dt.date.fromisoformat(str(_rng["end"])) -
+                  dt.date.fromisoformat(str(_rng["start"]))).days + 1) or 7
+    except Exception:  # noqa: BLE001
+        _days = 7
+
     plans = [p for p in data.get("plans", []) if not account or p.get("account") in keys]
     for p in plans:
         wins = p.get("wins", {})
         if sum((wins.get(wk) or {}).get("cost", 0) for wk in ("w0", "w1", "w2")) <= 0:
             continue          # 三期都没花费的计划没有决策价值，剔除以压小输入
+        m = wins.get("w2") if (wins.get("w2") or {}).get("cost", 0) > 0 else wins.get("w1") or {}
+        be = _f(p.get("breakeven"))
+        margin = _f(p.get("planMargin")) or ((1 / be) if be > 0 else 0.0)
+        aov = _f(m.get("aov")); cvr = _f(m.get("cvr")) / 100.0; cpc = _f(m.get("cpc"))
+        be_cpc = round(aov * cvr * margin, 2) if (aov > 0 and cvr > 0 and margin > 0) else None
         digest["plans"].append({
             "campaignId": p.get("campaignId"), "name": p.get("name"),
             "account": p.get("account"), "type": p.get("typeLabel"),
             "breakeven": p.get("breakeven"), "grow_line": p.get("growLine"),
             "cost_mapped": p.get("costMapped"),
+            "margin": round(margin, 4),
+            # 代码先算好保本 CPC 与提价空间，模型只解释、不重算（避免算数幻觉）
+            "breakeven_cpc": be_cpc,
+            "cpc_headroom_pct": (round((be_cpc - cpc) / be_cpc * 100, 1)
+                                 if (be_cpc and cpc) else None),
+            "clicks_per_day": round(_f(m.get("clk")) / _days, 1),
             **{wk: _w(wins[wk]) for wk in ("w0", "w1", "w2") if wins.get(wk)},
         })
 
@@ -195,20 +224,32 @@ def build_digest(data: dict, account: str | None = None, *, max_skus: int = 30,
         })
 
     words = data.get("words", {})
+    type_of = {p.get("name"): p.get("typeLabel") for p in plans}
     for a in accts:
         aw = words.get(a["key"], {}).get("w2", {})
         for pname, pv in aw.items():
-            sw = pv.get("sw", [])
-            if not sw:
+            # 快车关键词计划没有搜索词明细，改用关键词报表；两者都空才跳过
+            sw, kw = pv.get("sw") or [], pv.get("kw") or []
+            bank = sw or kw
+            if not bank:
                 continue
+            src = "searchTerm" if sw else "keywordName"
+
             def pick(kind):
                 return [{"w": x["word"], "roi": round(x.get("roi", 0), 2),
                          "cost": round(x.get("cost", 0), 1), "ord": x.get("ord", 0),
                          "clk": x.get("clk", 0)}
-                        for x in sorted([y for y in sw if y.get("kind") == kind],
+                        for x in sorted([y for y in bank if y.get("kind") == kind],
                                         key=lambda z: -z.get("cost", 0))[:words_per_kind]]
-            digest["words"][pname] = {"good": pick("good"), "waste": pick("waste"),
-                                      "low": pick("low")}
+            n_kind = {k: sum(1 for y in bank if y.get("kind") == k)
+                      for k in ("good", "waste", "low")}
+            digest["words"][pname] = {
+                "plan_type": type_of.get(pname) or "未知",
+                "source": src,
+                "sample_size": len(bank),
+                "counts": n_kind,
+                "good": pick("good"), "waste": pick("waste"), "low": pick("low"),
+            }
 
     # 定向维度（人群/地域）—— 判断「有没有在用定向功能」的直接证据。
     # 只给客观行，不下结论；缺口由规则层 targeting_gaps 先算好，AI 只负责解释与给建议。
@@ -290,19 +331,40 @@ _INLINE_RUBRIC = """\
 5. 曝光低→出价/词太小/低出高溢锁死；点击率低→创意+人群匹配（直接影响链接权重）；转化率低→内功（商详/评价/客服/物流/价格）。
 6. 高客单、小众精准品应改用标准计划+高溢价人群定向，而不是智能化泛投。
 7. 标准计划初期亏损是正常的（拉新成本），盈利靠智能计划收割；不能只看总 ROI 一刀切。
+
+【官方课程《1小时吃透快车》硬规则（选词/出价/调整必用）】
+8. 排名 = 出价 × 质量分；扣费 = 下一名出价 × 下一名质量分 ÷ 你的质量分 + 0.01。
+   出价高 ≠ 排名高，出价 ≠ 扣费；质量分低时硬抢 TOP1 只会烧钱。
+9. 质量分四构成：基础（销量/评价/动销/库存）、相关性（词与三级类目/标题）、
+   创意（点击率）、转化（转化率，权重最高）。质量分没有后台数值，看「平均点击成本是否持续下降」。
+10. 选词：三级类目下选；精准长尾 70% + 品类核心大词 30%；建车期 20~50 个词；
+    长尾初始出价 = 行业均值 ×0.8~1.0，核心大词 ×1.10~1.20。
+11. 最终出价 = 基础出价 × 时间折扣 × 人群溢价 × 抢排名溢价（乘法链）；新品期不圈人群、不溢价。
+12. 日预算 ≈ 日均点击成本 × 50~100 点击；至少跑 3~4 天再调词/调价，单日数据无代表性。
+13. 高消耗 0 产出的「吸血词」要否定；优质词抢排名或单独建计划给足预算。
+    否定词入口只在「关键词计划 → 计划 → 单元 → 关键词 → 否定词设置」；
+    智能化 / 全站智能推广**没有否定词入口**，只能改目标投产比/预算/商品黑名单。
 """
 
 
 def load_methodology() -> tuple[str, str]:
-    parts = []
+    """加载方法论：本项目课程知识库优先，已安装 skill 兜底，最后退回内置要点。
+
+    返回 (正文, 来源标签)。来源标签会展示在报表/AI 台上，用来确认本次分析
+    到底吃到了哪份知识库（例如 `skill-file:kuaiche-playbook+methodology`）。
+    """
+    parts, names, seen = [], [], set()
     for p in METHODOLOGY_CANDIDATES:
-        if p.exists():
-            try:
-                parts.append(p.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
-                pass
+        if p.name in seen or not p.exists():
+            continue
+        try:
+            parts.append(p.read_text(encoding="utf-8"))
+            names.append(p.stem)
+            seen.add(p.name)
+        except Exception:  # noqa: BLE001
+            continue
     if parts:
-        return "\n\n---\n\n".join(parts), "skill-file"
+        return "\n\n---\n\n".join(parts), "skill-file:" + "+".join(names)
     return _INLINE_RUBRIC, "inline"
 
 
@@ -318,6 +380,37 @@ SCHEMA = {
         "impact": "这个事实对投产比或长期流量的影响",
     }],
     "account_reads": [{"account": "账号key", "read": "该账号的打法特征与主要问题"}],
+    "quality_diagnosis": [{
+        "campaignId": "必须来自输入的 plans（最多 4 条，按 w2 花费降序）",
+        "name": "计划名",
+        "items": [{
+            "part": "基础质量分/相关性/创意质量分/转化质量分 之一",
+            "level": "高/中/低/无法判断",
+            "evidence": "引用输入里的销量评价线索、CTR、CVR、CPC 趋势、词与类目匹配等客观事实",
+            "action": "针对这一构成项的可执行动作（如换主图测点击率、补评价、改标题相关性）",
+        }],
+        "summary": "该计划质量分的整体判断与最优先补的一项",
+    }],
+    "bid_plan": [{
+        "campaignId": "必须来自输入的 plans（最多 5 条）",
+        "name": "计划名",
+        "current_cpc": "输入的 w2 cpc",
+        "breakeven_cpc": "输入里代码算好的 breakeven_cpc（不要自己重算）",
+        "headroom": "有提价空间/接近保本/已超保本",
+        "suggest": "结合最终出价=基础×时间×人群×抢排名，给出具体动作：抬价幅度、抢排名、还是降价/关溢价",
+    }],
+    "playbook_audit": [{
+        "campaignId": "必须来自输入的 plans（最多 6 条，按 w2 花费降序）",
+        "name": "计划名",
+        "stage": "拉新/收割/收割+放大",
+        "checks": [{
+            "item": "词量/词配比/出价空间/日点击预算/观察周期/否定词入口 之一",
+            "status": "达标/不足/超限/不适用/需人工确认",
+            "evidence": "必须引用输入里的数字（词量、CPC vs 保本CPC、点击/天、最近调整距今天数、计划类型）",
+            "action": "对应课程规则的可执行动作（可复制的后台路径/参数）",
+        }],
+        "conclusion": "先观察/可放大/需改造/建议收缩 之一，并写一句话理由",
+    }],
     "plan_judgements": [{
         "campaignId": "必须来自输入的 plans（最多 8 条，按 w2 花费降序取最关键的）",
         "name": "计划名", "stage": "拉新/收割/收割+放大",
@@ -381,7 +474,18 @@ SYSTEM = """你是资深京东快车（搜索广告）投放操盘手。你的�
   注意：分时 ROI 按**点击所在小时**归因，越晚的时段归因窗口越短、ROI 天然偏低，
   所以对 23:00 这类时段的判断要留余地，别只凭一天的数据下死结论。
 - 【只给待审建议】不要发号施令，只给**待人工审阅**的建议。
-- 【控制篇幅，务必输出完整 JSON】diagnosis ≤5 条；plan_judgements 最多 8 条（按 w2 花费从高到低，
+- 【课程硬规则必须落地】方法论里的《1小时吃透快车》规则不是背景知识，必须在下列字段里被引用：
+  * `quality_diagnosis`：按「基础质量分 / 相关性 / 创意质量分 / 转化质量分」四项拆，
+    每项给 level + 证据 + 动作；没有数据的项写「无法判断」，不要编。
+  * `bid_plan`：直接采用输入里代码算好的 `breakeven_cpc`，对比 `cpc` 判断「有提价空间/接近保本/已超保本」；
+    建议必须体现「最终出价 = 基础出价 × 时间折扣 × 人群溢价 × 抢排名溢价」。
+  * `playbook_audit`：逐计划检查「词量（建车 20~50）、词配比（长尾70/核心大词30，无法判定就写需人工确认）、
+    日点击是否 50~100、观察周期是否满 3~4 天、否定词入口是否可用」；status 必须用给定枚举。
+- 【否定词入口硬约束】`keyword_plan` 只能给**关键词计划**（type 含「关键词/快车」）的否定词；
+  智能化/全站智能推广**没有否定词入口**，其 waste/low 词只能在 `playbook_audit` 里写成
+  「无否定入口 → 改目标投产比/预算/商品黑名单」，绝不能写进 `keyword_plan`。
+- 【控制篇幅，务必输出完整 JSON】diagnosis ≤5 条；quality_diagnosis ≤4 条；bid_plan ≤5 条；
+  playbook_audit ≤6 条；plan_judgements 最多 8 条（按 w2 花费从高到低，
   只判断最关键的，不要逐个计划都写）；keyword_plan 只对「确有可否定/可提价词」的计划给；
   targeting_advice ≤5 条（按 priority 高到低，优先未启用的）；
   dayparting_advice ≤4 条（账号级时段策略优先，其次只挑时段差异最大的 1-2 个计划）；
@@ -454,6 +558,41 @@ def normalize(advice: dict) -> dict:
     # 诊断
     if "diagnosis" not in advice and isinstance(advice.get("findings"), list):
         advice["diagnosis"] = advice.pop("findings")
+    # 课程 SOP 三段：容忍不同模型返回的字段名漂移
+    for std, alts in (
+        ("playbook_audit", ("sop_audit", "sop_checks", "playbook", "plan_sop")),
+        ("quality_diagnosis", ("quality_score", "quality_breakdown", "quality_audit")),
+        ("bid_plan", ("bidding_advice", "bid_advice", "bid_space", "cpc_plan")),
+    ):
+        if std not in advice:
+            for alt in alts:
+                if isinstance(advice.get(alt), list):
+                    advice[std] = advice.pop(alt)
+                    break
+    for x in advice.get("playbook_audit", []) or []:
+        if isinstance(x, dict) and not x.get("checks") and isinstance(x.get("items"), list):
+            x["checks"] = x.pop("items")
+        if isinstance(x, dict) and not x.get("conclusion"):
+            for alt in ("verdict", "summary", "result"):
+                if x.get(alt):
+                    x["conclusion"] = x[alt]
+                    break
+    for x in advice.get("quality_diagnosis", []) or []:
+        if isinstance(x, dict) and not x.get("items") and isinstance(x.get("parts"), list):
+            x["items"] = x.pop("parts")
+    for x in advice.get("bid_plan", []) or []:
+        if not isinstance(x, dict):
+            continue
+        if not x.get("current_cpc"):
+            for alt in ("cpc", "now_cpc", "actual_cpc"):
+                if x.get(alt):
+                    x["current_cpc"] = x[alt]
+                    break
+        if not x.get("breakeven_cpc"):
+            for alt in ("be_cpc", "breakeven_cpc", "break_even_cpc"):
+                if x.get(alt):
+                    x["breakeven_cpc"] = x[alt]
+                    break
     # 未使用/待优化功能建议
     if "targeting_advice" not in advice:
         for alt in ("unused_features", "feature_advice", "targeting", "targetingAdvice"):
@@ -561,13 +700,26 @@ def validate(advice: dict, digest: dict) -> dict:
             if k and k in claim:
                 warnings.append(f"dayparting_advice 引用了本轮没有分时数据的账号「{k}」")
 
+    # 新增的课程 SOP 段落同样校验 campaignId，防止模型编计划
+    for sec in ("quality_diagnosis", "bid_plan", "playbook_audit"):
+        for x in advice.get(sec, []) or []:
+            if not isinstance(x, dict):
+                continue
+            cid = str(x.get("campaignId", ""))
+            if cid and cid not in plan_ids:
+                issues.append(f"{sec} 引用了不存在的 campaignId={cid}（{x.get('name')}）")
+
     n_pj = len([x for x in (advice.get("plan_judgements") or []) if isinstance(x, dict)])
     n_kp = len([x for x in (advice.get("keyword_plan") or []) if isinstance(x, dict)])
     n_ta = len([x for x in (advice.get("targeting_advice") or []) if isinstance(x, dict)])
     n_dp = len([x for x in (advice.get("dayparting_advice") or []) if isinstance(x, dict)])
+    n_q = len([x for x in (advice.get("quality_diagnosis") or []) if isinstance(x, dict)])
+    n_bid = len([x for x in (advice.get("bid_plan") or []) if isinstance(x, dict)])
+    n_sop = len([x for x in (advice.get("playbook_audit") or []) if isinstance(x, dict)])
     return {"ok": not issues, "issues": issues, "warnings": warnings,
             "n_plan_judgements": n_pj, "n_keyword_plan": n_kp,
             "n_targeting_advice": n_ta, "n_dayparting_advice": n_dp,
+            "n_quality_diagnosis": n_q, "n_bid_plan": n_bid, "n_playbook_audit": n_sop,
             "n_plan_actions": n_pj}   # 兼容旧前端字段
 
 
@@ -644,6 +796,11 @@ CHAT_SYSTEM = """你是资深京东快车（搜索广告）投放操盘手，正
   （`days` 字段写明是哪天），**不是**所选区间的分布；引用时必须带上那个日期，严禁当成区间结论。
   某账号 `hourly.available=false` 表示本轮没抓分时，不要编造时段数字。
   分时 ROI 按点击所在小时归因，越晚的时段归因窗口越短、ROI 天然偏低，别只凭一天对深夜时段下死结论。
+- 【课程规则优先】选词/出价/质量分/否定词/预算/调整节奏的问题，按方法论里的
+  《1小时吃透快车》硬规则回答（排名=出价×质量分、最终出价=基础×时间×人群×抢排名、
+  长尾70/核心大词30、日预算≈CPC×50~100点击、至少跑3~4天再调）。
+- 【否定词入口】只有关键词计划能设否定词；智能化/全站智能推广没有否定词入口，
+  只能改目标投产比/预算/商品黑名单，回答时必须区分，不能给错入口。
 - 【篇幅】一般 300~600 字，条理清晰（可用小标题 / 列表）；用户明确要求详细时才展开。
 - 一律用简体中文回答。
 """
@@ -745,6 +902,31 @@ def _to_markdown(out: dict) -> str:
         for x in a["account_reads"]:
             L.append(f"- **{x.get('account')}**：{x.get('read')}")
         L.append("")
+    if a.get("playbook_audit"):
+        L += ["## 快车 SOP 体检（官方课程硬规则）", ""]
+        for x in a["playbook_audit"]:
+            L.append(f"### {x.get('name')}（{x.get('campaignId')}） → {x.get('conclusion', '')}")
+            for c in (x.get("checks") or []):
+                L.append(f"- [{c.get('status', '')}] {c.get('item', '')}：{c.get('evidence', '')}"
+                         f" → {c.get('action', '')}")
+            L.append("")
+    if a.get("quality_diagnosis"):
+        L += ["## 质量分四构成诊断", ""]
+        for x in a["quality_diagnosis"]:
+            L.append(f"### {x.get('name')}（{x.get('campaignId')}）")
+            for it in (x.get("items") or []):
+                L.append(f"- {it.get('part', '')}：{it.get('level', '')} —— "
+                         f"{it.get('evidence', '')} → {it.get('action', '')}")
+            if x.get("summary"):
+                L.append(f"- 小结：{x['summary']}")
+            L.append("")
+    if a.get("bid_plan"):
+        L += ["## 出价与保本 CPC 空间", ""]
+        for x in a["bid_plan"]:
+            L.append(f"### {x.get('name')}（{x.get('campaignId')}）")
+            L.append(f"- 实际 CPC {x.get('current_cpc')} ｜ 保本 CPC {x.get('breakeven_cpc')} ｜ {x.get('headroom', '')}")
+            L.append(f"- 建议：{x.get('suggest', '')}")
+            L.append("")
     if a.get("targeting_advice"):
         L += ["## 未用起来 / 待优化的投放功能", ""]
         for t in a["targeting_advice"]:

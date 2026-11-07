@@ -1196,6 +1196,339 @@ def page_word(d) -> str:
     return "".join(out)
 
 
+# ---------------------------------------------------------------- 页面：快车 SOP 体检
+# 规则全部来自《1小时吃透快车：选词·出价·调整》08 期（吕双庆，2026-04-20）。
+# 这一页只做「代码可复算的确定性检查」，不做语义推断；AI 深度解读在上方 AI 卡片。
+_SOP_RULES = [
+    ("排名", "出价 × 质量分", "出价高 ≠ 排名高；新品质量分低时别硬抢 TOP1"),
+    ("扣费", "下一名出价 × 下一名质量分 ÷ 你的质量分 + 0.01", "出价只是参与下一名竞争的筹码"),
+    ("质量分", "基础 / 相关性 / 创意(CTR) / 转化(CVR)", "没有后台数值，用「平均点击成本是否持续下降」观测"),
+    ("选词", "精准长尾 70% + 品类核心大词 30%", "三级类目下选；建车期 20~50 个词"),
+    ("初始出价", "长尾=行业均值×0.8~1.0；核心大词=×1.10~1.20", "先比行业均值，再按词型定档"),
+    ("最终出价", "基础出价 × 时间折扣 × 人群溢价 × 抢排名溢价", "乘法链，不是加法；新品期不圈人群、不溢价"),
+    ("日预算", "日均点击成本 × 50~100 点击", "主推只放 1 个 SKU，预算才集中"),
+    ("调整节奏", "至少跑 3~4 天再动", "单日数据无代表性；四指标分开归因"),
+    ("否定词", "关键词 → 计划 → 单元 → 关键词 → 否定词设置", "高消耗 0 产出直接加黑"),
+    ("入口限制", "智能化 / 全站智能推广没有否定词入口", "只能改目标投产比/预算/商品黑名单（≤10 SKU）"),
+]
+
+
+def _sop_tone(v: str) -> str:
+    """把 SOP 结论映射到颜色：放大=绿，收缩=红，观察=灰，其余=琥珀。"""
+    if v == "可放大":
+        return "ok"
+    if v in ("建议收缩", "需改造"):
+        return "bad"
+    if v in ("先观察",):
+        return "info"
+    return "warn"
+
+
+def _sop_tone2(v: str) -> str:
+    """详情卡里的 tone 可能直接是 ok/warn/bad/info，也可能是结论词。"""
+    return v if v in ("ok", "warn", "bad", "info") else _sop_tone(v)
+
+
+def _sop_days(d) -> int:
+    from datetime import date
+    r = (d.get("meta") or {}).get("range") or {}
+    try:
+        s = date.fromisoformat(str(r.get("start") or ""))
+        e = date.fromisoformat(str(r.get("end") or ""))
+        return max((e - s).days + 1, 1)
+    except Exception:  # noqa: BLE001
+        return 7
+
+
+def _sop_bank(d, acct, name, wk):
+    pv = ((d.get("words") or {}).get(acct) or {}).get(wk, {}).get(name) or {}
+    kw, sw = pv.get("kw") or [], pv.get("sw") or []
+    if kw:
+        return kw, "关键词"
+    if sw:
+        return sw, "搜索词"
+    return [], ""
+
+
+def _sop_ops(d, acct, cid, name):
+    from datetime import date
+    out = []
+    for o in (d.get("ops") or []):
+        if not o.get("manual") or o.get("account") != acct:
+            continue
+        if str(o.get("targetId") or "") == str(cid):
+            out.append(o)
+            continue
+        t = (o.get("target") or "").strip()
+        if t and (t in name or name in t):
+            out.append(o)
+    days = []
+    for o in out:
+        try:
+            days.append(date.fromisoformat(str(o["time"])[:10]))
+        except Exception:  # noqa: BLE001
+            pass
+    return out, days
+
+
+def _sop_check(d, p, days: int, end_day) -> dict:
+    """一个计划的 SOP 自检：返回 checks / 结论 / 可复制动作。"""
+    wk = "w2" if _n(p["wins"]["w2"]["cost"]) > 0 else "w1"
+    m = p["wins"][wk]
+    be = _n(p.get("breakeven"))
+    margin = _n(p.get("planMargin")) or ((1 / be) if be > 0 else 0)
+    aov, cvr, cpc = _n(m.get("aov")), _n(m.get("cvr")) / 100.0, _n(m.get("cpc"))
+    be_cpc = aov * cvr * margin if (aov > 0 and cvr > 0 and margin > 0) else 0.0
+    clicks_day = _n(m.get("clk")) / days
+    bank, src = _sop_bank(d, p["account"], p.get("name") or "", wk)
+    smart = p.get("type") in (61, 153) or "智能" in (p.get("name") or "")
+    waste = [w for w in bank if w.get("kind") == "waste"]
+    low = [w for w in bank if w.get("kind") == "low"]
+    good = [w for w in bank if w.get("kind") == "good"]
+    bad_words = sorted(waste + low, key=lambda x: -_n(x.get("cost")))[:8]
+    boost_words = sorted(good, key=lambda x: -_n(x.get("roi")))[:6]
+    ops, opdays = _sop_ops(d, p["account"], p["campaignId"], p.get("name") or "")
+
+    checks = []   # (item, status, tone, evidence, action)
+
+    # 1) 日点击（课程：50~100 点击/天）
+    if clicks_day <= 0:
+        checks.append(("日点击", "无数据", "info", "所选区间没有点击", "先确认计划在投、预算未耗尽"))
+    elif clicks_day < 50:
+        checks.append(("日点击", "不足", "warn", f"日均 {clicks_day:.0f} 点击（课程建议 50~100）",
+                       "先确认 ROI≥保本，再提预算/出价或补词；不要为了凑点击盲加价"))
+    else:
+        checks.append(("日点击", "达标", "ok", f"日均 {clicks_day:.0f} 点击",
+                       "点击量已够，把精力放到词效率与转化率"))
+
+    # 2) 出价空间（保本 CPC = AOV × CVR × 毛利率）
+    if be_cpc > 0 and cpc > 0:
+        gap = (be_cpc - cpc) / be_cpc
+        if gap >= 0.15:
+            checks.append(("出价空间", "有提价空间", "ok",
+                           f"实际 CPC ¥{cpc:.2f} < 保本 CPC ¥{be_cpc:.2f}（余量 {gap * 100:.0f}%）",
+                           "按课程把核心大词抬到行业均值 +10%~20%，或抢排名/单独建计划；"
+                           "最终出价 = 基础 × 时间 × 人群 × 抢排名"))
+        elif gap >= -0.05:
+            checks.append(("出价空间", "接近保本", "warn",
+                           f"实际 CPC ¥{cpc:.2f} ≈ 保本 CPC ¥{be_cpc:.2f}（余量 {gap * 100:.0f}%）",
+                           "先不加价，观察 3 天；ROI 仍 ≥ 保本再小步提价，优先提高效词"))
+        else:
+            checks.append(("出价空间", "已超保本", "bad",
+                           f"实际 CPC ¥{cpc:.2f} > 保本 CPC ¥{be_cpc:.2f}（超出 {-gap * 100:.0f}%）",
+                           "降基础出价/关人群与抢排名溢价；把超出的花费拿去做否定词或降价"))
+    else:
+        checks.append(("出价空间", "无法计算", "info", "缺 AOV / CVR / 毛利率",
+                       "先补齐成本与转化数据，再判断提价空间"))
+
+    # 3) 词量与词结构
+    if smart:
+        checks.append(("词量", "不适用", "info", "智能化/全站由系统自动选词",
+                       "不人工加词；把精力放在商品黑名单、目标投产比与预算"))
+    elif bank:
+        n = len(bank)
+        if n < 20:
+            checks.append(("词量", "不足", "warn", f"{src}样本 {n} 个（建车期建议 20~50）",
+                           "补精准长尾词：长尾 70% + 品类核心大词 30%，三级类目下选"))
+        elif n > 50:
+            checks.append(("词量", "偏多", "warn", f"{src}样本 {n} 个（建议 20~50）",
+                           "先砍 0 单/低 ROI 词，再补长尾；词太多会摊薄预算"))
+        else:
+            checks.append(("词量", "达标", "ok", f"{src}样本 {n} 个",
+                           "按花费排序每周扫一遍，保持 70% 长尾 / 30% 核心大词"))
+    else:
+        checks.append(("词量", "无词数据", "info", "本区间没有该计划的搜索词/关键词明细",
+                       "换到有词数据的窗口，或先在报表中心抓词"))
+
+    # 4) 否定词 / 词效率
+    if bank and (waste or low):
+        cost_wa = sum(_n(w.get("cost")) for w in waste + low)
+        if smart:
+            checks.append(("否定词入口", "不可用", "bad",
+                           f"废词 {len(waste)} / 低效 {len(low)} 个，花费 ¥{cost_wa:,.0f}",
+                           "智能化/全站智能推广没有否定词入口：改商品黑名单（≤10 SKU），"
+                           "或降目标投产比/智能出价；不要承诺否定词"))
+        else:
+            checks.append(("词效率", "需处理", "warn",
+                           f"废词 {len(waste)} / 低效 {len(low)} 个，花费 ¥{cost_wa:,.0f}",
+                           "在 关键词→计划→单元→关键词→否定词设置 加黑高消耗 0 产出词；"
+                           "先跨 2 个窗口确认，避免误否高效大词"))
+    elif bank:
+        checks.append(("词效率", "达标", "ok", "样本内没有高消耗 0 产出词",
+                       "保持；继续按花费降序每周扫词"))
+
+    # 5) 观察周期（课程：至少 3~4 天再动）
+    recent_gap = None
+    if opdays:
+        last = max(opdays)
+        try:
+            recent_gap = (end_day - last).days
+        except Exception:  # noqa: BLE001
+            recent_gap = None
+        closing = sorted(opdays)
+        gaps = [(closing[i + 1] - closing[i]).days for i in range(len(closing) - 1)]
+        if recent_gap is not None and recent_gap < 3:
+            checks.append(("观察周期", "不足", "warn",
+                           f"最近调整 {last}，距今 {recent_gap} 天",
+                           "课程要求至少跑 3~4 天再动；先观察，别继续改出价/预算"))
+        else:
+            checks.append(("观察周期", "达标", "ok",
+                           f"最近调整 {last}，距今 {recent_gap} 天" if recent_gap is not None else f"最近调整 {last}",
+                           "已跑够观察期，可按展现/CTR/CVR/ROI 分开归因再决策"))
+        if len(opdays) >= 3 and gaps and min(gaps) < 3:
+            checks.append(("调整频率", "过频", "warn",
+                           f"区间内人工调整 {len(opdays)} 次，最短间隔 {min(gaps)} 天",
+                           "同一计划 3 天内反复改会让数据不可归因；固定一个观察窗口再动"))
+    else:
+        checks.append(("观察周期", "无近期调整", "info", "区间内没有人工操作",
+                       "可直接按当前数据决策；改完后至少留 3~4 天观察"))
+
+    # 结论
+    tone_rank = {"bad": 3, "warn": 2, "ok": 1, "info": 0}
+    worst = max((tone_rank.get(c[2], 0) for c in checks), default=0)
+    tier = p.get("tier") or ""
+    if recent_gap is not None and recent_gap < 3:
+        verdict = "先观察"
+    elif tier in ("止损", "严重亏损"):
+        verdict = "建议收缩"
+    elif tier == "放大" and worst <= 1:
+        verdict = "可放大"
+    elif worst >= 2:
+        verdict = "需改造"
+    else:
+        verdict = "可优化"
+
+    return {"wk": wk, "m": m, "be": be, "be_cpc": be_cpc, "cpc": cpc,
+            "clicks_day": clicks_day, "bank": bank, "src": src, "smart": smart,
+            "waste": waste, "low": low, "good": good,
+            "bad_words": bad_words, "boost_words": boost_words,
+            "ops": ops, "recent_gap": recent_gap,
+            "checks": checks, "verdict": verdict}
+
+
+def page_playbook(d) -> str:
+    days = _sop_days(d)
+    r = (d.get("meta") or {}).get("range") or {}
+    from datetime import date
+    try:
+        end_day = date.fromisoformat(str(r.get("end") or ""))
+    except Exception:  # noqa: BLE001
+        end_day = date.today()
+
+    plans = [p for p in (d.get("plans") or [])
+             if _n(p["wins"]["w2"]["cost"]) + _n(p["wins"]["w1"]["cost"]) > 0]
+    plans.sort(key=lambda p: -(_n(p["wins"]["w2"]["cost"]) + _n(p["wins"]["w1"]["cost"])))
+    rows, checks_by = [], {}
+    for i, p in enumerate(plans):
+        c = _sop_check(d, p, days, end_day)
+        checks_by[id(p)] = c
+        w = p["wins"][c["wk"]]
+        be_cpc = f'¥{c["be_cpc"]:.2f}' if c["be_cpc"] > 0 else "—"
+        words_cell = (f'不适用（系统选词）' if c["smart"]
+                      else (f'样本 {len(c["bank"])}<div class="mini">好 {len(c["good"])} / 废 {len(c["waste"])} / 低 {len(c["low"])}</div>'
+                            if c["bank"] else '无词数据'))
+        recent = f'{c["recent_gap"]} 天前' if c["recent_gap"] is not None else "无"
+        rows.append(
+            f'<tr>'
+            f'<td class="l"><b>{_e(p["name"])}</b><div class="sid">{_e(p["accountLabel"])} · {_e(p["campaignId"])}</div></td>'
+            f'<td class="l">{_e(p["typeLabel"])}</td>'
+            f'<td class="mono">¥{_money(w["cost"])}</td>'
+            f'<td class="mono {_roi_cls(w["roi"], p["breakeven"])}">{_n(w["roi"]):.2f}</td>'
+            f'<td class="mono">{_n(p["breakeven"]):.2f}</td>'
+            f'<td class="mono">¥{c["cpc"]:.2f}<div class="mini">保本 {be_cpc}</div></td>'
+            f'<td class="mono">{c["clicks_day"]:.0f}</td>'
+            f'<td class="l">{words_cell}</td>'
+            f'<td class="l">{recent}</td>'
+            f'<td class="l"><span class="sopv {_sop_tone(c["verdict"])}">{_e(c["verdict"])}</span></td>'
+            f'</tr>')
+
+    n_low_click = sum(1 for p in plans if checks_by[id(p)]["clicks_day"] < 50)
+    n_room = sum(1 for p in plans if any(x[1] == "有提价空间" for x in checks_by[id(p)]["checks"]))
+    n_smart = sum(1 for p in plans if checks_by[id(p)]["smart"])
+    n_recent = sum(1 for p in plans if (checks_by[id(p)]["recent_gap"] or 99) < 3)
+
+    detail = []
+    for p in plans[:8]:
+        c = checks_by[id(p)]
+        m = c["m"]
+        items = "".join(
+            f'<div class="sopitem"><b class="{_sop_tone2(x[2])}">{_e(x[1])}</b> '
+            f'<span class="sopk">{_e(x[0])}</span>'
+            f'<div class="mini">{_e(x[3])}</div>'
+            f'<div class="sopact">{_e(x[4])}</div></div>'
+            for x in c["checks"])
+        bad = _word_pills([w for w in c["bad_words"]], "waste")
+        good = _word_pills([w for w in c["boost_words"]], "good")
+        if c["smart"]:
+            neg_block = ('<div class="b"><b>否定词入口：</b>'
+                         '<span class="down">不可用</span> —— 智能化/全站智能推广没有否定词设置，'
+                         '只能改目标投产比/预算/商品黑名单（≤10 SKU）</div>')
+        else:
+            neg_block = (f'<div class="b"><b>可否定（高消耗 0 单/低 ROI）：</b>{bad}</div>'
+                         f'<div class="b"><b>可提价（高效词）：</b>{good}</div>')
+        detail.append(f"""
+<div class="sopcard">
+  <div class="sophd"><b>{_e(p["name"])}</b>
+    <span class="sopv {_sop_tone2(c["verdict"])}">{_e(c["verdict"])}</span>
+    <span class="mini">{_e(p["typeLabel"])} · {_e(p["accountLabel"])} · {c["wk"]} 窗口</span>
+  </div>
+  <div class="sopmetrics">
+    <span>花费 <b>¥{_money(m["cost"])}</b></span>
+    <span>ROI <b class="{_roi_cls(m["roi"], p["breakeven"])}">{_n(m["roi"]):.2f}</b> / 保本 {_n(p["breakeven"]):.2f}</span>
+    <span>CTR <b>{_n(m["ctr"]):.2f}%</b></span>
+    <span>CVR <b>{_n(m["cvr"]):.2f}%</b></span>
+    <span>CPC <b>¥{c["cpc"]:.2f}</b></span>
+    <span>点击/天 <b>{c["clicks_day"]:.0f}</b></span>
+  </div>
+  {neg_block}
+  <div class="sopchecks">{items}</div>
+</div>""")
+
+    kpis = "".join([
+        _kpi("体检计划", f"{len(plans)} 个", f"区间 {days} 天 · 按花费排序"),
+        _kpi("日均点击不足 50", f"{n_low_click} 个", "课程建议 50~100 点击/天"),
+        _kpi("有提价空间", f"{n_room} 个", "实际 CPC 低于保本 CPC ≥15%"),
+        _kpi("智能化无否定入口", f"{n_smart} 个", "只能改目标投产比/预算/黑名单"),
+    ])
+
+    rules = "".join(
+        f'<tr><td class="l"><b>{_e(a)}</b></td><td class="l">{_e(b)}</td>'
+        f'<td class="l">{_e(c)}</td></tr>' for a, b, c in _SOP_RULES)
+
+    return f"""
+<div class="card">
+  <h2>快车 SOP 体检 <span class="tagline">官方课程硬规则 × 当前区间实抓数据</span></h2>
+  <p class="hint">
+    本页是<b>确定性自检</b>：阈值与判断由代码按《1小时吃透快车》硬规则计算，不依赖 AI；
+    深度取舍与话术见上方「AI 运营解读」。{n_recent} 个计划在最近 3 天内被调整，按课程应先观察、别继续改。
+  </p>
+  <div class="grid g4">{kpis}</div>
+  <div class="tblwrap">
+    <table><thead><tr>
+      <th class="l noSort">计划</th><th class="l noSort">类型</th><th data-num="1">花费</th>
+      <th data-num="1">ROI</th><th data-num="1">保本ROI</th><th data-num="1">CPC / 保本CPC</th>
+      <th data-num="1">点击/天</th><th class="l noSort">词样本</th><th class="l noSort">最近调整</th>
+      <th class="l noSort">SOP 结论</th>
+    </tr></thead><tbody>{''.join(rows) or '<tr><td colspan="10" class="l">当前区间没有在投计划</td></tr>'}</tbody></table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>计划 SOP 明细 <span class="tagline">花费最高的 {len(detail)} 个计划</span></h2>
+  <div class="sopgrid">{''.join(detail)}</div>
+</div>
+
+<div class="card">
+  <h2>运营知识库速查 <span class="tagline">《1小时吃透快车：选词·出价·调整》08 期</span></h2>
+  <p class="hint">这张表已随仓库维护，并作为 AI 分析台的系统提示词来源（优先于本机旧版 skill）。</p>
+  <div class="tblwrap short">
+    <table><thead><tr><th class="l noSort">主题</th><th class="l noSort">硬规则</th><th class="l noSort">落地提醒</th></tr></thead>
+    <tbody>{rules}</tbody></table>
+  </div>
+</div>
+"""
+
+
 # ---------------------------------------------------------------- 页面：行动清单
 def page_action(d) -> str:
     adv = d["advice"]
@@ -1310,6 +1643,27 @@ UI_CSS = """
 .rangebar a{color:var(--primary);font-size:12.5px;text-decoration:none;margin-left:6px;font-weight:500}
 .rangebar a:hover{text-decoration:underline}
 @media(max-width:760px){.rangebar{gap:9px}.rangebar .sep{display:none}}
+/* 快车 SOP 体检 */
+.sopgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}
+.sopcard{border:1px solid var(--hair);border-radius:var(--r-md);background:var(--canvas);padding:14px 16px}
+.sophd{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:14px;color:var(--ink);
+  padding-bottom:9px;border-bottom:1px solid var(--hair);margin-bottom:10px}
+.sophd .mini{margin-left:auto}
+.sopv{display:inline-block;border-radius:9999px;padding:2px 9px;font-size:11.5px;font-weight:600;line-height:1.6}
+.sopv.ok{background:var(--greenbg);color:var(--greenink)}
+.sopv.warn{background:var(--amberbg);color:var(--amberink)}
+.sopv.bad{background:var(--redbg);color:var(--redink)}
+.sopv.info{background:var(--surface-card);color:var(--muted)}
+.sopmetrics{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted);margin-bottom:9px}
+.sopmetrics b{color:var(--ink);font-variant-numeric:tabular-nums}
+.sopchecks{display:grid;gap:6px;margin-top:8px}
+.sopitem{border-top:1px dashed var(--hair);padding-top:6px;font-size:12.5px;line-height:1.65;color:var(--body)}
+.sopitem:first-child{border-top:0;padding-top:0}
+.sopitem>b{display:inline-block;min-width:56px;font-size:11.5px}
+.sopitem>b.ok{color:var(--greenink)} .sopitem>b.warn{color:var(--amberink)}
+.sopitem>b.bad{color:var(--redink)} .sopitem>b.info{color:var(--muted)}
+.sopitem .sopk{font-weight:600;color:var(--strong);margin-left:4px}
+.sopitem .sopact{color:var(--muted);margin-top:1px}
 """
 
 
@@ -1409,7 +1763,8 @@ def _coverage_notice(d) -> str:
 
 # ---------------------------------------------------------------- 组装
 TABS = [("p-ov", "① 总结"), ("p-sku", "② 商品ROI"), ("p-adj", "③ 调整复盘"),
-        ("p-plan", "④ 计划明细"), ("p-word", "⑤ 搜索词诊断"), ("p-act", "⑥ 行动清单")]
+        ("p-plan", "④ 计划明细"), ("p-word", "⑤ 搜索词诊断"), ("p-sop", "⑥ 快车SOP体检"),
+        ("p-act", "⑦ 行动清单")]
 
 
 _ECHARTS_CACHE: dict = {"src": None}
@@ -1491,7 +1846,7 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
     <span class="aimeta">当前区间（{_e(start)} ~ {_e(end)}）暂无 AI 解读</span>
     <button class="aibtn" onclick="genAi(this, '{_e(start)}', '{_e(end)}', '{_e(keys)}')">生成本区间解读</button>
   </div>
-  <div class="aidisc">每晚自动任务会**贴着本地已抓取的数据**生成 AI 解读（套用《京东快车底层逻辑》方法论）；
+  <div class="aidisc">每晚自动任务会**贴着本地已抓取的数据**生成 AI 解读（套用《京东快车底层逻辑》+《1小时吃透快车》官方课程知识库）；
 也可点按钮即时生成（约 1~2 分钟）。</div>
 </div>"""
 
@@ -1526,6 +1881,64 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
         for x in (a.get("diagnosis") or []))
     diag = (f'<details class="aidt"{opn}><summary>诊断（套方法论，{len(a.get("diagnosis") or [])} 条）</summary>'
             f'{diags}</details>' if diags else "")
+
+    # 课程 SOP 体检（playbook_audit）：逐计划列出课程硬规则检查结果
+    def _sop_t(v):
+        if v in ("达标", "有提价空间", "可放大"):
+            return "ok"
+        if v in ("超限", "已超保本", "建议收缩"):
+            return "bad"
+        if v in ("不足", "需处理", "不可用", "过频", "接近保本", "需改造"):
+            return "warn"
+        return "info"
+
+    sop_cards = []
+    for x in (a.get("playbook_audit") or []):
+        cs = "".join(
+            f'<div class="b"><span class="sopv {_sop_t(c.get("status"))}">{_e(str(c.get("status") or ""))}</span> '
+            f'<b>{_e(str(c.get("item") or ""))}</b>：{_e(str(c.get("evidence") or ""))}'
+            f'<div class="sopact">→ {_e(str(c.get("action") or ""))}</div></div>'
+            for c in (x.get("checks") or []))
+        sop_cards.append(
+            f'<div class="aip"><div class="t">{_e(str(x.get("name") or ""))}'
+            f'（{_e(str(x.get("campaignId") or ""))}） · {_e(str(x.get("stage") or ""))} → '
+            f'<span class="sopv {_sop_t(x.get("conclusion"))}">{_e(str(x.get("conclusion") or ""))}</span></div>'
+            f'{cs}</div>')
+    sop_block = (f'<details class="aidt"{opn}><summary>快车 SOP 体检（课程硬规则，'
+                 f'{len(sop_cards)} 个计划）</summary>{"".join(sop_cards)}</details>'
+                 if sop_cards else "")
+
+    # 质量分四构成
+    q_cards = []
+    for x in (a.get("quality_diagnosis") or []):
+        items = "".join(
+            f'<div class="b"><b>{_e(str(it.get("part") or ""))}</b>'
+            f'<span class="sopv {_sop_t(str(it.get("level") or ""))}">{_e(str(it.get("level") or ""))}</span> '
+            f'{_e(str(it.get("evidence") or ""))}'
+            f'<div class="sopact">→ {_e(str(it.get("action") or ""))}</div></div>'
+            for it in (x.get("items") or []))
+        q_cards.append(f'<div class="aip"><div class="t">{_e(str(x.get("name") or ""))}'
+                       f'（{_e(str(x.get("campaignId") or ""))}）</div>{items}'
+                       + (f'<div class="b"><b>小结：</b>{_e(str(x.get("summary") or ""))}</div>'
+                          if x.get("summary") else "") + '</div>')
+    q_block = (f'<details class="aidt"><summary>质量分四构成诊断（{len(q_cards)} 个计划）</summary>'
+               f'{"".join(q_cards)}</details>' if q_cards else "")
+
+    # 出价 / 保本 CPC 空间
+    bid_rows = "".join(
+        f'<tr><td class="l"><b>{_e(str(x.get("name") or ""))}</b>'
+        f'<div class="sid">{_e(str(x.get("campaignId") or ""))}</div></td>'
+        f'<td class="mono">¥{_num(x.get("current_cpc"), 2)}</td>'
+        f'<td class="mono">¥{_num(x.get("breakeven_cpc"), 2)}</td>'
+        f'<td class="l"><span class="sopv {_sop_t(x.get("headroom"))}">{_e(str(x.get("headroom") or ""))}</span></td>'
+        f'<td class="l">{_e(str(x.get("suggest") or ""))}</td></tr>'
+        for x in (a.get("bid_plan") or []))
+    bid_block = (f'<details class="aidt"><summary>出价与保本 CPC 空间（{len(a.get("bid_plan") or [])} 个计划）</summary>'
+                 f'<div class="tblwrap short"><table><thead><tr>'
+                 f'<th class="l noSort">计划</th><th data-num="1">实际CPC</th>'
+                 f'<th data-num="1">保本CPC</th><th class="l noSort">判断</th><th class="l noSort">动作</th>'
+                 f'</tr></thead><tbody>{bid_rows}</tbody></table></div></details>'
+                 if bid_rows else "")
 
     reads = "".join(f'<li><b>{_e(str(x.get("account")))}</b>：{_e(str(x.get("read")))}</li>'
                     for x in (a.get("account_reads") or []))
@@ -1641,8 +2054,9 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
         f'（{len(a.get("account_reads") or [])} 账号 / {len(a.get("sequence") or [])} 步）</summary>'
         f'{_mid_inner}</details>' if _mid_has else "")
 
-    return (f'<div class="aicard">{head}{hd}{hl}{diag}{mid_block}{dp_block}{tgt_block}{dt}{kw_block}'
-            f'<div class="aidisc">AI 套用《京东快车底层逻辑》方法论生成，<b>仅供参考</b>；'
+    return (f'<div class="aicard">{head}{hd}{hl}{diag}{sop_block}{q_block}{bid_block}'
+            f'{mid_block}{dp_block}{tgt_block}{dt}{kw_block}'
+            f'<div class="aidisc">AI 套用《京东快车底层逻辑》+《1小时吃透快车》官方课程知识库生成，<b>仅供参考</b>；'
             f'算数与口径由规则层代码保证，执行前请人工复核。'
             + (f'　<a href="/ai?start={_e(start)}&end={_e(end)}&accounts={_e(keys)}">'
                f'打开 AI 分析台（可追问）→</a>' if link else '') + '</div></div>')
@@ -1683,6 +2097,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
         ("p-adj", page_adj(d)),
         ("p-plan", page_plan(d)),
         ("p-word", page_word(d)),
+        ("p-sop", page_playbook(d)),
         ("p-act", page_action(d)),
     ]
     body = "".join(

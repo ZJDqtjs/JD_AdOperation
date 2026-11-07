@@ -514,8 +514,9 @@ def render(ai, d, ui: str = "", title: str = "AI 运营分析台") -> str:
     if not ai:
         report_html = (
             '<div class="aicard empty"><div class="aihd"><span class="aibadge off">AI</span> 暂无本区间解读'
-            '</div><div class="aidisc">点下面「生成本区间解读」，AI 会套用《京东快车底层逻辑》方法论，'
-            '贴着本地已抓取的数据出一份详细报告（含诊断、逐计划判断、词级建议、'
+            '</div><div class="aidisc">点下面「生成本区间解读」，AI 会套用《京东快车底层逻辑》+'
+            '《1小时吃透快车》官方课程知识库，贴着本地已抓取的数据出一份详细报告（含诊断、'
+            'SOP 体检（词量/配比/出价空间/观察周期）、质量分四构成、出价与保本 CPC、逐计划判断、词级建议、'
             '以及定向人群/地域等**还没用起来的功能**建议）。生成过程中可实时看到它的思考过程，'
             '中途离开页面也不会中断。</div>'
             '<div class="aidt" style="margin-top:10px"><button class="aibig" style="max-width:320px" '
