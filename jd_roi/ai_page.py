@@ -240,6 +240,7 @@ function renderChat(force){
     log.innerHTML='<div class="chatempty">就当前区间向 AI 追问，例如：<br>'
       + '· 定向人群（DMP 人群包）到底要不要做？先怎么做？<br>'
       + '· 哪些地域该屏蔽、哪些该加价？<br>'
+      + '· 行业大盘里本店和行业的 CTR/转化率差在哪？<br>'
       + '· 这周只改三件事，先改哪三件？</div>';
     log.__stick = true; toggleJump(); return;
   }
@@ -492,6 +493,8 @@ document.addEventListener('DOMContentLoaded', bootstrap);
 
 _QUICK = ["定向人群（DMP 人群包）要不要做？先怎么做？",
           "哪些地域该屏蔽、哪些该加价？",
+          "行业大盘里本店 CTR/转化率和行业差多少？先改什么？",
+          "行业热词和飙升词有哪些本店还没投？怎么加词测试？",
           "昨天哪几个时段在烧钱？分时折扣怎么设？",
           "这周只改三件事，先改哪三件？",
           "拉新和收割的计划结构平衡吗？",

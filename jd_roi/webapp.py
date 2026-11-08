@@ -6,7 +6,7 @@
 
 页面：
     /            控制台（区间选择、数据覆盖、立即抓取、扫码登录）
-    /report      任意区间的聚合分析报表（自带区间选择器）
+    /report      任意区间的聚合分析报表（自带区间选择器；⑧行业大盘页签）
     /ai          独立 AI 分析台：每日 AI 报告 + 可追问对话框（含思考过程流式展示）
     /paycomm     CPS 花费：按 SKU 看付款佣金金额，可导出 Excel
     /paycomm/spend  京准通花费：按 SKU 看广告花费（智能投放 + 全站智能推广），可导出 Excel
@@ -16,6 +16,9 @@ API：
     GET  /api/status            运行状态 / 登录状态 / 最近一次任务
     GET  /api/coverage          按天数据覆盖情况
     GET  /api/analysis          区间分析 JSON
+    GET  /api/industry/status   行业大盘缓存补齐进度
+    POST /api/industry/run      起后台任务补齐/重抓行业大盘
+    POST /api/industry/refresh  报表页「重新抓取」→ 重抓后跳回报表
     GET  /api/run/status        抓取进度 + 抓取锁状态
     POST /api/run               触发抓取（后台线程）
     POST /api/run/cancel        取消当前抓取 / 解锁卡死的抓取锁
@@ -48,10 +51,10 @@ from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
-                               Response, StreamingResponse)
+                               RedirectResponse, Response, StreamingResponse)
 
 from . import (aijobs, ai_page, analyze2, analyze_ai, config, dailystore as ds,
-               paycomm, profit, report2, scrape_day, settings)
+               industry, paycomm, profit, report2, scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -172,6 +175,15 @@ def account_list(accounts) -> list:
         return settings.ACCOUNTS
     got = [a for a in settings.ACCOUNTS if a["key"] in keys]
     return got or settings.ACCOUNTS
+
+
+def _ensure_industry(keys: list, start: str, end: str, *, force: bool = False) -> dict:
+    """报表/AI 生成前先命中本地缓存；缺的账号起后台补齐，不阻塞页面渲染。"""
+    try:
+        return industry.ensure(keys, start, end, force=force)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "blocks": {}, "missing": list(keys), "status": {}}
 
 
 def _range_bar(start: str, end: str, keys: list, action: str = "/report",
@@ -772,6 +784,8 @@ def report(request: Request):
     q = request.query_params
     start, end = ui_range(q.get("start"), q.get("end"), q.get("days"), 7)
     accounts = account_list(q.getlist("accounts"))
+    keys = [a["key"] for a in accounts]
+    _ensure_industry(keys, start, end)
     t0 = time.time()
     try:
         data = analyze2.build(start=start, end=end, accounts=accounts)
@@ -785,7 +799,6 @@ def report(request: Request):
 <p><a class="btn" href="/">← 回到控制台</a>
 <a class="btn sec" href="/report?start={_e(start)}&end={_e(end)}&days=">重试</a></p></div></div></body></html>""",
             status_code=200)
-    keys = [a["key"] for a in accounts]
     ui = _range_bar(start, end, keys, "/report",
                     extra='<a href="/">← 控制台</a>'
                           '<a href="/ai?start=%s&end=%s&accounts=%s">AI 分析台（可追问）→</a>'
@@ -810,6 +823,8 @@ def ai_console(request: Request):
     q = request.query_params
     start, end = ui_range(q.get("start"), q.get("end"), q.get("days"), 7)
     accounts = account_list(q.getlist("accounts"))
+    keys = [a["key"] for a in accounts]
+    _ensure_industry(keys, start, end)
     try:
         data = analyze2.build(start=start, end=end, accounts=accounts)
     except FileNotFoundError as exc:
@@ -821,7 +836,6 @@ def ai_console(request: Request):
 <p class="hint">区间 {_e(start)} ~ {_e(end)} 内没有任何一天的京准通数据。</p>
 <p><a class="btn" href="/">← 回到控制台</a></p></div></div></body></html>""",
             status_code=200)
-    keys = [a["key"] for a in accounts]
     ui = _range_bar(start, end, keys, "/ai")
     title = f"AI 运营分析台 {start} ~ {end}"
     cached = analyze_ai.load_latest()
@@ -1668,11 +1682,13 @@ def api_paycomm_spend_cache_delete(account: str | None = None, start: str = "", 
 
 
 # ================================================================ 缓存管理（二级页）
-# 三类缓存各自的落盘文件：paycomm_*.json（CPS）/ paycomm_spend_*.json（京准通）/ profit_*.json
+# 四类缓存各自的落盘文件：paycomm_*.json / paycomm_spend_*.json / profit_*.json / industry_*.json
 CACHE_KINDS = [("all", "全部"), ("cps", "CPS 花费"), ("spend", "京准通花费"),
-               ("profit", "月度利润")]
-CACHE_LABELS = {"cps": "CPS 花费", "spend": "京准通花费", "profit": "月度利润"}
-CACHE_HREF = {"cps": "/paycomm", "spend": "/paycomm/spend", "profit": "/profit"}
+               ("profit", "月度利润"), ("industry", "行业大盘")]
+CACHE_LABELS = {"cps": "CPS 花费", "spend": "京准通花费",
+                "profit": "月度利润", "industry": "行业大盘"}
+CACHE_HREF = {"cps": "/paycomm", "spend": "/paycomm/spend",
+              "profit": "/profit", "industry": "/report"}
 
 CACHE_CSS = """
 .cgGrp{margin-bottom:18px}
@@ -1723,7 +1739,7 @@ function rowsHtml(list, withKind){
       + '<td class="l">'+esc(en.accountLabel || en.account)+badges(en)+'</td>'
       + '<td class="l">'+esc(en.start)+' ~ '+esc(en.end)+'</td>'
       + '<td class="n">'+esc(en.rows)+'</td>'
-      + '<td class="n" title="'+(en.kind==='profit'?'净利合计':(en.kind==='cps'?'付款佣金合计':'京准通花费合计'))+'">'
+      + '<td class="n" title="'+(en.kind==='profit'?'净利合计':(en.kind==='cps'?'付款佣金合计':(en.kind==='industry'?'本店广告花费（行业数据为指数，不计费）':'京准通花费合计')))+'">'
       + money(en.total)+(en.kind==='profit'?' <span class="cgBadge">净利</span>':'')+'</td>'
       + '<td class="l">'+esc(en.savedAt)+'</td>'
       + '<td class="n">'+fmtKB(en.sizeKB)+'</td>'
@@ -1781,7 +1797,8 @@ function syncTabs(){
 function openCache(d){
   var base = HREF[d.kind] || '/';
   var qs = new URLSearchParams({start: d.start, end: d.end});
-  qs.set('account', d.kind === 'profit' ? 'all' : (d.account || 'all'));
+  if(d.kind === 'industry') qs.set('accounts', d.account || 'all');
+  else qs.set('account', d.kind === 'profit' ? 'all' : (d.account || 'all'));
   window.location = base + '?' + qs.toString();
 }
 function delCache(d){
@@ -1803,13 +1820,13 @@ function load(){
     if(!j.ok){ $('cgMsg').textContent = '读取缓存清单失败' + (j.error ? '：' + j.error : ''); return; }
     ALL = j.entries || [];
     var parts = [];
-    ['cps','spend','profit'].forEach(function(k){
+    ['cps','spend','profit','industry'].forEach(function(k){
       var n = (j.counts || {})[k] || 0;
       if(n) parts.push((LABEL[k] || k) + ' ' + n + ' 份');
     });
     $('cgMsg').textContent = parts.length
       ? ('当前：' + parts.join(' · ') + '；删除后下次查询会重新请求京东接口。')
-      : '还没有任何缓存，去花费/利润页查询一次就会存下来。';
+      : '还没有任何缓存，去花费/利润/分析报表页查询一次就会存下来。';
     render();
   }).catch(function(e){ $('cgMsg').textContent = '读取缓存清单失败：' + e; });
 }
@@ -1837,7 +1854,7 @@ load();
 
 @app.get("/api/cache/list")
 def api_cache_list():
-    """三类缓存合成一张清单：花费两份 + 利润一份，条目自带 kind。"""
+    """四类缓存合成一张清单：花费两份 + 利润 + 行业大盘，条目自带 kind。"""
     entries: list[dict] = []
     for en in _paycomm.cache_entries():
         en["kind"] = "cps"
@@ -1848,7 +1865,10 @@ def api_cache_list():
     for en in profit.cache_entries():
         en["kind"] = "profit"
         entries.append(en)
-    counts = {"cps": 0, "spend": 0, "profit": 0}
+    for en in industry.cache_entries():
+        en["kind"] = "industry"
+        entries.append(en)
+    counts = {"cps": 0, "spend": 0, "profit": 0, "industry": 0}
     for en in entries:
         en["kindLabel"] = CACHE_LABELS.get(en["kind"], en["kind"])
         counts[en["kind"]] = counts.get(en["kind"], 0) + 1
@@ -1866,7 +1886,9 @@ def api_cache_delete(kind: str = "", account: str = "", start: str = "",
         return _paycomm_spend.delete_cache(account, start, end)
     if kind == "profit":
         return profit.delete_cache(start, end, file=file)
-    return {"ok": False, "error": "未知的缓存类型（kind 只能是 cps / spend / profit）"}
+    if kind == "industry":
+        return industry.delete_cache(account, start, end)
+    return {"ok": False, "error": "未知的缓存类型（kind 只能是 cps / spend / profit / industry）"}
 
 
 @app.get("/cache", response_class=HTMLResponse)
@@ -1899,6 +1921,7 @@ def cache_page(request: Request):
     <a class="btn ghost mini" href="/paycomm">CPS 花费 →</a>
     <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
     <a class="btn ghost mini" href="/profit">月度利润 →</a>
+    <a class="btn ghost mini" href="/report">行业大盘（报表页签）</a>
   </div>
 </div></header>
 <div class="wrap">
@@ -2447,6 +2470,33 @@ def api_analysis(start: str | None = None, end: str | None = None,
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     return {"ok": True, "range": {"start": s, "end": e}, "data": data}
+
+
+# ---------------------------------------------------------------- 行业大盘接口
+@app.get("/api/industry/status")
+def api_industry_status():
+    """后台补齐进度（报表页据此自动刷新）。"""
+    return {"ok": True, **industry.status()}
+
+
+@app.post("/api/industry/run")
+def api_industry_run(start: str | None = None, end: str | None = None,
+                     days: int | None = None, accounts: list[str] | None = Query(None),
+                     force: int = 0):
+    """手动起一次补齐；force=1 才强制重抓（平时一律先命中本地缓存）。"""
+    s, e = ui_range(start, end, days)
+    keys = [a["key"] for a in account_list(accounts)]
+    res = industry.ensure(keys, s, e, force=bool(force), auto=True)
+    return {"ok": True, "range": {"start": s, "end": e}, "accounts": keys, **res}
+
+
+@app.post("/api/industry/refresh")
+def api_industry_refresh(start: str, end: str, accounts: str = ""):
+    """报表页表单：显式重抓行业大盘后跳回报表（避免刷新页面时反复 force）。"""
+    keys = [a["key"] for a in account_list(accounts)]
+    industry.ensure(keys, start, end, force=True, auto=True)
+    return RedirectResponse(
+        f"/report?start={start}&end={end}&accounts={','.join(keys)}", status_code=303)
 
 
 @app.get("/api/run/status")
@@ -3411,6 +3461,9 @@ def _autofill_account_id(page, key: str) -> None:
 
 
 _login = LoginSession()
+# 行业大盘补齐与扫码登录 / 保活 / 花费抓取共用同一把 Profile 锁，
+# 避免两个 Chromium 同时打开同一个 user_data_dir 把登录态顶掉。
+industry.set_profile_lock(_login._profile_lock)
 # 花费一览两个独立任务（CPS 付款佣金 / 京准通广告花费）：与登录 / 保活共用同一把 Profile 锁
 _paycomm = paycomm.PayCommRunner("cps", profile_lock=_login._profile_lock)
 _paycomm_spend = paycomm.PayCommRunner("spend", profile_lock=_login._profile_lock)
@@ -3449,6 +3502,11 @@ class AiRunner:
         def _work():
             try:
                 job.emit("phase", f"正在读取本地按天库（{start} ~ {end}）…")
+                # 行业大盘缺缓存就地自动补齐；等落盘后再生成解读，AI 才拿得到行业基准
+                ind_res = industry.ensure(keys, start, end)
+                if ind_res.get("missing"):
+                    job.emit("phase", "行业大盘缓存补齐中（地域/关键词/客户/趋势）…")
+                    industry.wait_for(ind_res["missing"], start, end, timeout=300)
                 data = analyze2.build(start=start, end=end,
                                       accounts=[a for a in settings.ACCOUNTS if a["key"] in keys])
                 job.emit("phase", "数据就绪（保本线 / 词分层 / 定向缺口已算好），交给模型套方法论判断…")
@@ -3982,6 +4040,14 @@ def api_login_qr():
 # ================================================================ 调度
 def _nightly_job():
     """回刷最近 REFRESH_DAYS 天，并补齐停机期间的空洞。"""
+    # 行业大盘按「本地实际有数据的区间」单独补一份缓存：
+    # 即使按天数据已经最新，也要让明天的报表 / AI 解读能直接命中行业基准。
+    try:
+        lr = analyze_ai.local_range(settings.ACCOUNTS)
+        if lr:
+            industry.ensure([a["key"] for a in settings.ACCOUNTS], lr[0], lr[1])
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"行业大盘补齐未启动：{type(exc).__name__}: {exc}")
     rng = scrape_day.catchup_range()
     if rng is None:
         _log_progress("数据已是最新，无需抓取")

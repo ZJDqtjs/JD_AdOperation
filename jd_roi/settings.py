@@ -97,6 +97,30 @@ KEEPALIVE_JITTER = _env_int("JD_KEEPALIVE_JITTER", 120)           # 每次随机
 # AI 解读层：夜间抓取完成后自动生成「最近 N 天」的 AI 运营解读，报表页展示。
 AI_ENABLED = _env_bool("JD_AI_ENABLED", True)
 AI_RANGE_DAYS = _env_int("JD_AI_RANGE_DAYS", 7)                   # 自动生成的区间天数
+
+# ---------------- 京准通「行业大盘」 ----------------
+# 1=启用报表里的行业大盘页签；缺缓存时自动起后台任务补齐（与登录/保活共用 Profile 锁）。
+# dev 里把 JD_INDUSTRY_AUTO_FETCH=0，避免冷冻的登录态副本打出真实请求。
+INDUSTRY_ENABLED = _env_bool("JD_INDUSTRY", True)
+INDUSTRY_AUTO_FETCH = _env_bool("JD_INDUSTRY_AUTO_FETCH", True)
+# 指定类目：可写单个 cid3，或 "main:13575,b:13576" 按账号指定；留空=取京准通返回的首个三级类目。
+INDUSTRY_CID3_RAW = (_env("JD_INDUSTRY_CID3", "") or "").strip()
+INDUSTRY_CID3: dict[str, int] = {}
+for _part in INDUSTRY_CID3_RAW.split(","):
+    _part = _part.strip()
+    if not _part:
+        continue
+    if ":" in _part:
+        _k, _v = _part.split(":", 1)
+        try:
+            INDUSTRY_CID3[_k.strip()] = int(_v.strip())
+        except ValueError:
+            pass
+    else:
+        try:
+            INDUSTRY_CID3["*"] = int(_part)
+        except ValueError:
+            pass
 # 保活时依次访问的页面（逗号分隔）。模仿京麦：打开真实业务页 → 页面 JS 会自发
 # 三层心跳（sso/rac 续期、bypass 风控、sgm 埋点），比只访问首页更接近真人使用。
 # 顺序访问 + 每页停留数秒，让前端脚本有时间把心跳发出去。

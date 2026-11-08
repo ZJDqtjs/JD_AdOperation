@@ -25,6 +25,7 @@ SUITES = [
     ("「全部账号」总览合并（花费相加、成交/毛利只取一份）", "tests/test_profit_all.py"),
     ("花费一览「全部账号」合并（花费相加、CPS 比率不瞎合并）", "tests/test_paycomm_all.py"),
     ("缓存管理（清单/删除/「全部账号」部分命中先出表）", "tests/test_cache_manage.py"),
+    ("行业大盘（缓存/本店 vs 行业/地域词缺口/AI 摘要/页签）", "tests/test_industry.py"),
     ("按天索引缓存（跨进程可见性）", "tests/test_day_cache.py"),
     ("抓取锁（成功/异常都释放、可取消、stale 可解锁）", "tests/test_scrape_lock.py"),
     ("任务中心（登记/失败/取消/重跑/落盘）", "tests/test_tasks.py"),

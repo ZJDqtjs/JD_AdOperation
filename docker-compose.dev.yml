@@ -39,6 +39,7 @@ services:
       JD_KEEPALIVE: "0"
       # ---- 其余尽量压低，避免调试时打出真实流量 ----
       JD_AI_ENABLED: "0"          # 不自动调 LLM，省额度；需要时改 1
+      JD_INDUSTRY_AUTO_FETCH: "0" # dev 登录态是冷冻副本，不要自动打京准通；验证时点报表里的「重新抓取」
       JD_REFRESH_DAYS: "1"        # dev 只回刷 1 天
       JD_MAX_BACKFILL_DAYS: "3"
       JD_SCOPE: ""                # 留空 = accounts.json 里的全部账号

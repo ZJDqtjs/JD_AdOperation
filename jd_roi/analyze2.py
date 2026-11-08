@@ -19,7 +19,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from . import config, settings, store
+from . import config, industry, settings, store
 
 # ---------------- 窗口定义 ----------------
 # 报表固定展示 3 期：w2 = 用户所选区间，w1/w0 = 等长的前两期（用于环比与趋势）
@@ -1526,7 +1526,7 @@ def build(start=None, end=None, windows=None, accounts=None):
     beBlend, marginBlend = blended_breakeven(
         [{"amt": s["wins"]["w1"]["amt"], "margin": s["margin"]} for s in skus])
 
-    return {
+    out = {
         "meta": {
             "windows": [{"key": w[0], "start": w[1], "end": w[2], "label": w[3]} for w in wins],
             "range": {"start": win2[1], "end": win2[2]},
@@ -1560,6 +1560,11 @@ def build(start=None, end=None, windows=None, accounts=None):
         "runtime": {"generatedAt": settings.now_str("%Y-%m-%d %H:%M:%S")},
         "advice": advice,
     }
+    # 行业大盘只读本地缓存；自动补齐由 webapp 在渲染报表前起后台任务，
+    # 这里绝不在分析过程中请求京东，保证 /api/analysis、夜间任务、测试都可离线跑。
+    out["meta"]["caliber"] += "；行业大盘=京准通数据中心指数化口径（只对比率，不与金额相加）"
+    out["industry"] = industry.collect(out)
+    return out
 
 
 def analyze(start=None, end=None, accounts=None, out_path=None):

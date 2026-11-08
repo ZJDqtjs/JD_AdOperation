@@ -29,7 +29,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import llm, settings
+from . import industry, llm, settings
 
 DATA_DIR = settings.DATA_DIR
 ANALYSIS = DATA_DIR / "analysis2.json"
@@ -149,6 +149,8 @@ def build_digest(data: dict, account: str | None = None, *, max_skus: int = 30,
         "targeting_gaps": [],
         "hourly": {},
         "hourly_gaps": [],
+        "industry": {},
+        "industry_gaps": [],
     }
 
     for a in accts:
@@ -308,6 +310,16 @@ def build_digest(data: dict, account: str | None = None, *, max_skus: int = 30,
     digest["hourly_gaps"] = [g for g in (data.get("hourlyGaps") or [])
                              if not account or g.get("account") == account]
 
+    # 行业大盘：客观事实 + 规则层算好的缺口；指数只用于比率对比，模型不许换算成金额
+    ind = industry.compact_for_ai(data.get("industry"))
+    if account:
+        ind["accounts"] = [a for a in (ind.get("accounts") or [])
+                           if a.get("account") == account]
+        ind["gaps"] = [g for g in (ind.get("gaps") or [])
+                       if g.get("account") == account]
+    digest["industry"] = ind
+    digest["industry_gaps"] = ind.get("gaps") or []
+
     # 近期人工操作（只给事实：改了什么、前后 ROI），不下判定，交给模型复盘
     adjs = [x for x in (data.get("adjustments") or [])
             if not account or x.get("account") in keys]
@@ -444,6 +456,14 @@ SCHEMA = {
         "suggest": "可执行做法：折扣幅度/预算调整量/先测几天；以及要盯的验证指标",
         "priority": "高/中/低",
     }],
+    "industry_advice": [{
+        "topic": "行业趋势/本店 vs 行业/地域/关键词/热词与飙升词/新客/品牌/时段 之一",
+        "finding": "只引用 industry 里的客观事实，必须带具体数字（含单位/pp）",
+        "benchmark": "对应的行业基准数字，或「无行业基准」",
+        "evidence": "引用 industry / industry_gaps 里的事实，不得改写数字",
+        "suggest": "可落地的动作：加什么词/地域、怎么测、先盯哪个指标、观察几天",
+        "priority": "高/中/低",
+    }],
     "sequence": [{"step": 1, "do": "先做什么", "because": "为什么这个顺序（哪些能立即止损、哪些要等内功）"}],
     "watchlist": ["上线后要盯的信号/验证点（用哪个指标、期望变成什么）"],
     "risks": ["数据或执行上的风险提示"],
@@ -473,6 +493,12 @@ SYSTEM = """你是资深京东快车（搜索广告）投放操盘手。你的�
   （`hourly_gaps` 已算好，直接引用其中的小时、花费、ROI）；同时指出高 ROI 时段该怎么加。
   注意：分时 ROI 按**点击所在小时**归因，越晚的时段归因窗口越短、ROI 天然偏低，
   所以对 23:00 这类时段的判断要留余地，别只凭一天的数据下死结论。
+- 【行业大盘必须单独总结并给建议】输入 `industry.available=true` 时，在 `industry_advice` 里
+  按「行业趋势 → 本店 vs 行业 → 地域 → 关键词/热词 → 新客/品牌 → 时段」挑最关键的 3~5 条写，
+  每条必须有 `finding`（引用具体数字）、`benchmark`（行业基准）、`evidence`、`suggest`（可执行动作）、`priority`；
+  `industry_gaps` 是代码算好的缺口，优先引用。**指数不是金额**：展现/点击/加购指数不能相加、不能当花费，
+  也不能和本店成交额比大小；只对比 CTR/转化率/加购率等比率，且必须写清「pp」或「%」。
+  若 `industry.available=false` 或某账号没有行业缓存，就明说本轮没有行业数据，不要编造行业数字。
 - 【只给待审建议】不要发号施令，只给**待人工审阅**的建议。
 - 【课程硬规则必须落地】方法论里的《1小时吃透快车》规则不是背景知识，必须在下列字段里被引用：
   * `quality_diagnosis`：按「基础质量分 / 相关性 / 创意质量分 / 转化质量分」四项拆，
@@ -489,6 +515,7 @@ SYSTEM = """你是资深京东快车（搜索广告）投放操盘手。你的�
   只判断最关键的，不要逐个计划都写）；keyword_plan 只对「确有可否定/可提价词」的计划给；
   targeting_advice ≤5 条（按 priority 高到低，优先未启用的）；
   dayparting_advice ≤4 条（账号级时段策略优先，其次只挑时段差异最大的 1-2 个计划）；
+  industry_advice ≤5 条（按 priority 高到低，优先有明确行业基准与缺口的）；
   account_reads ≤2 条；sequence ≤5 步。宁可少而精，也不要写半截 —— 输出被截断会导致整份解读不可用。
 - 输出**只含一个 JSON 对象**，符合给定 schema，不要任何额外解释文字。
 """
@@ -634,6 +661,22 @@ def normalize(advice: dict) -> dict:
                 if d.get(alt):
                     d["suggest"] = d[alt]
                     break
+    # 行业大盘观察/建议：容忍模型字段名漂移
+    if "industry_advice" not in advice:
+        for alt in ("market_advice", "industry", "industryAdvice", "benchmark_advice"):
+            if isinstance(advice.get(alt), list):
+                advice["industry_advice"] = advice.pop(alt)
+                break
+    for x in advice.get("industry_advice", []) or []:
+        if not isinstance(x, dict):
+            continue
+        if not x.get("suggest"):
+            for alt in ("action", "advice", "recommend", "howto"):
+                if x.get(alt):
+                    x["suggest"] = x[alt]
+                    break
+        if not x.get("finding") and x.get("observation"):
+            x["finding"] = x["observation"]
     return advice
 
 
@@ -716,10 +759,14 @@ def validate(advice: dict, digest: dict) -> dict:
     n_q = len([x for x in (advice.get("quality_diagnosis") or []) if isinstance(x, dict)])
     n_bid = len([x for x in (advice.get("bid_plan") or []) if isinstance(x, dict)])
     n_sop = len([x for x in (advice.get("playbook_audit") or []) if isinstance(x, dict)])
+    n_ind = len([x for x in (advice.get("industry_advice") or []) if isinstance(x, dict)])
+    if n_ind and not (digest.get("industry") or {}).get("available"):
+        warnings.append("本轮没有行业大盘缓存，但模型输出了 industry_advice（可能编造行业数据）")
     return {"ok": not issues, "issues": issues, "warnings": warnings,
             "n_plan_judgements": n_pj, "n_keyword_plan": n_kp,
             "n_targeting_advice": n_ta, "n_dayparting_advice": n_dp,
             "n_quality_diagnosis": n_q, "n_bid_plan": n_bid, "n_playbook_audit": n_sop,
+            "n_industry_advice": n_ind,
             "n_plan_actions": n_pj}   # 兼容旧前端字段
 
 
@@ -796,6 +843,10 @@ CHAT_SYSTEM = """你是资深京东快车（搜索广告）投放操盘手，正
   （`days` 字段写明是哪天），**不是**所选区间的分布；引用时必须带上那个日期，严禁当成区间结论。
   某账号 `hourly.available=false` 表示本轮没抓分时，不要编造时段数字。
   分时 ROI 按点击所在小时归因，越晚的时段归因窗口越短、ROI 天然偏低，别只凭一天对深夜时段下死结论。
+- 【行业大盘只对比率】摘要里 `industry` / `industry_gaps` 是京准通按三级类目汇总的**指数化**数据：
+  展现/点击/加购指数不是金额、不能相加、不能和成交额比大小；只能引用 CTR/转化率/加购率等比率及
+  规则层算好的地域/关键词/新客缺口。用户问行业、地域大盘、热词、竞品时，优先引用 `industry` 里的
+  客观数字与 `industry_gaps` 的建议；`industry.available=false` 就说明本轮没有行业数据，不要编造。
 - 【课程规则优先】选词/出价/质量分/否定词/预算/调整节奏的问题，按方法论里的
   《1小时吃透快车》硬规则回答（排名=出价×质量分、最终出价=基础×时间×人群×抢排名、
   长尾70/核心大词30、日预算≈CPC×50~100点击、至少跑3~4天再调）。
