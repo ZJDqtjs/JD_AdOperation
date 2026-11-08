@@ -610,6 +610,223 @@ def _own_words(data: dict, account: str) -> set[str]:
     return out
 
 
+def _own_word_map(data: dict, account: str) -> dict[str, dict]:
+    """把本店 w2 关键词按词聚合（跨计划），用于和行业榜/对比做逐词出价建议。"""
+    per = (data.get("words") or {}).get(account, {}).get("w2") or {}
+    out: dict[str, dict] = {}
+    for plan, pv in per.items():
+        for row in pv.get("kw") or []:
+            word = str(row.get("word") or "").strip()
+            if not word:
+                continue
+            v = out.setdefault(word, {"word": word, "cost": 0.0, "amt": 0.0,
+                                      "ord": 0, "clk": 0, "imp": 0,
+                                      "be": 0.0, "plans": []})
+            v["cost"] += _f(row.get("cost"))
+            v["amt"] += _f(row.get("amt"))
+            v["ord"] += int(_f(row.get("ord")))
+            v["clk"] += int(_f(row.get("clk")))
+            v["imp"] += int(_f(row.get("imp")))
+            v["be"] = max(v["be"], _f(row.get("be")))
+            if plan and str(plan) not in v["plans"]:
+                v["plans"].append(str(plan))
+    for v in out.values():
+        cost, clk, amt, imp = v["cost"], v["clk"], v["amt"], v["imp"]
+        v["roi"] = round(amt / cost, 2) if cost else 0.0
+        v["cpc"] = round(cost / clk, 2) if clk else 0.0
+        v["ctr"] = round(clk / imp * 100, 2) if imp else 0.0
+        v["cvr"] = round(v["ord"] / clk * 100, 2) if clk else 0.0
+    return out
+
+
+def _industry_word_map(ds: dict) -> dict[str, dict]:
+    """合并关键词榜 / 热词 / 飙升词 / 新词 / 品牌词 / 本店对比，按词留一份行业信号。"""
+    out: dict[str, dict] = {}
+
+    def touch(word, source: str, **kw) -> None:
+        word = str(word or "").strip()
+        if not word:
+            return
+        v = out.setdefault(word, {"word": word, "sources": []})
+        if source and source not in v["sources"]:
+            v["sources"].append(source)
+        for k, val in kw.items():
+            if val is None or val == "":
+                continue
+            v[k] = _f(val) if k != "sources" else val
+
+    for r in ds.get("billboard") or []:
+        touch(r.get("keyWord"), "关键词榜", ctr=r.get("ctr"), cvr=r.get("cvs"),
+              ref_bid=r.get("kwImpressionBid"), imp_exponent=r.get("impressionExponent"),
+              click_exponent=r.get("clickExponent"))
+    for r in ds.get("hotWords") or []:
+        touch(r.get("keyWord"), "热词", rank=r.get("keyWordRank"),
+              search_exponent=r.get("searchExponent"), competitiveness=r.get("kwCompetitiveness"))
+    for r in ds.get("soaringWords") or []:
+        touch(r.get("keyWord"), "飙升词", rank=r.get("keyWordRank"),
+              search_exponent=r.get("searchExponent"), rise_rate=r.get("riseRate"),
+              competitiveness=r.get("kwCompetitiveness"))
+    for r in ds.get("newWords") or []:
+        touch(r.get("keyWord"), "新词", rank=r.get("keyWordRank"),
+              search_exponent=r.get("searchExponent"), competitiveness=r.get("kwCompetitiveness"))
+    for r in ds.get("brandHotWords") or []:
+        touch(r.get("keyWord"), "品牌词", rank=r.get("keyWordRank"),
+              search_exponent=r.get("searchExponent"), competitiveness=r.get("kwCompetitiveness"))
+    for r in ds.get("brandSoaringWords") or []:
+        touch(r.get("keyWord"), "品牌飙升词", rank=r.get("keyWordRank"),
+              search_exponent=r.get("searchExponent"), rise_rate=r.get("riseRate"),
+              competitiveness=r.get("kwCompetitiveness"))
+    for r in ds.get("brandNewWords") or []:
+        touch(r.get("keyWord"), "品牌新词", rank=r.get("keyWordRank"),
+              search_exponent=r.get("searchExponent"), competitiveness=r.get("kwCompetitiveness"))
+    for r in ds.get("compete") or []:
+        s, i = r.get("self") or {}, r.get("industry") or {}
+        touch(r.get("keyWord"), "本店对比", ctr=i.get("ctr"), cvr=i.get("cvs"),
+              ref_bid=i.get("kwImpressionBid"), self_roi=s.get("roi"),
+              self_ctr=s.get("ctr"), self_cvr=s.get("cvs"), self_cpc=s.get("cpc"),
+              self_bid=s.get("kwImpressionBid"),
+              imp_exponent=i.get("impressionExponent"), click_exponent=i.get("clickExponent"))
+    return out
+
+
+def _keyword_actions(data: dict, account: str, ds: dict, be: float) -> list[dict]:
+    """把「行业词信号」和「本店该词真实 ROI/转化/出价」拼成可执行的出价动作。"""
+    own = _own_word_map(data, account)
+    imap = _industry_word_map(ds)
+    total_cost = sum(v["cost"] for v in own.values())
+    total_clk = sum(v["clk"] for v in own.values())
+    avg_cpc = round(total_cost / total_clk, 2) if total_clk else 0.0
+    actions: list[dict] = []
+
+    def opt(v):
+        return None if v is None or v == "" else _r(v)
+
+    def add(word: str, status: str, iw: dict, ov: dict | None, action: str,
+            priority: str, target: float | None, reason: str) -> None:
+        ov = ov or {}
+        actions.append({
+            "word": word, "status": status, "sources": list(iw.get("sources") or []),
+            "priority": priority, "action": action,
+            "suggest_bid": round(target, 2) if target else None,
+            "current_bid": opt(iw.get("self_bid")) if iw.get("self_bid") is not None
+            else (opt(ov.get("cpc")) if ov else None),
+            "industry_bid": opt(iw.get("ref_bid")),
+            "own_roi": _r(ov.get("roi")), "own_ctr": _r(ov.get("ctr")),
+            "own_cvr": _r(ov.get("cvr")),
+            "industry_ctr": _r(iw.get("ctr")), "industry_cvr": _r(iw.get("cvr")),
+            "own_cost": round(_f(ov.get("cost")), 2) if ov else 0.0,
+            "plans": list(ov.get("plans") or [])[:3],
+            "search_exponent": opt(iw.get("search_exponent")),
+            "rise_rate": opt(iw.get("rise_rate")),
+            "competitiveness": opt(iw.get("competitiveness")),
+            "reason": reason,
+        })
+
+    # 1) 本店已投、且行业榜/对比里有同词：直接给加价/降价/先修转化
+    for word, ov in own.items():
+        iw = imap.get(word)
+        if not iw:
+            continue
+        own_roi, own_ctr, own_cvr = _f(ov.get("roi")), _f(ov.get("ctr")), _f(ov.get("cvr"))
+        own_be = _f(ov.get("be")) or be
+        own_bid = _f(iw.get("self_bid"))
+        ref_bid = _f(iw.get("ref_bid"))
+        ind_ctr, ind_cvr = _f(iw.get("ctr")), _f(iw.get("cvr"))
+        rise = _f(iw.get("rise_rate"))
+        src = "/".join(iw.get("sources") or [])
+        if own_roi >= own_be and own_cvr >= ind_cvr * 0.9:
+            if ref_bid > 0 and (own_bid <= 0 or own_bid < ref_bid * 0.9):
+                target = max(own_bid, ref_bid * 0.9, 0.1)
+                add(word, "已投", iw, ov,
+                    f"提价到 ¥{target:.2f}（行业参考 ¥{ref_bid:.2f} 的 90%）", "高", target,
+                    f"{word} 本店 ROI {own_roi:.2f} ≥ 保本 {own_be:.2f}、转化率 {own_cvr:.2f}% "
+                    f"不输行业 {ind_cvr:.2f}%；当前出价 ¥{own_bid:.2f} 低于行业参考 ¥{ref_bid:.2f}，"
+                    f"可先小幅提价抢量（信号：{src}）。")
+            elif rise > 30:
+                base = own_bid or _f(ov.get("cpc")) or ref_bid or 0.1
+                target = base * 1.05
+                add(word, "已投", iw, ov,
+                    f"先 +5% 到 ¥{target:.2f} 测 2~3 天", "高", target,
+                    f"{word} 行业搜索涨幅 {rise:+.1f}%，本店 ROI {own_roi:.2f} 达标；"
+                    "先小幅加价测试，若转化率回落就退回原价。")
+            else:
+                add(word, "已投", iw, ov,
+                    "维持出价，优先放量/复制到相近词", "低", None,
+                    f"{word} 本店 ROI {own_roi:.2f} 达标，行业没有明显涨价信号；"
+                    "先保持出价，把预算放到同词的高效计划或相近长尾词。")
+        elif own_roi < own_be and own_cvr < ind_cvr:
+            base = own_bid or _f(ov.get("cpc")) or 0.1
+            target = max(0.1, base * 0.9)
+            add(word, "已投", iw, ov,
+                f"先降价 10% 到 ¥{target:.2f}，并修商详/价格，暂不跟价", "高", target,
+                f"{word} 本店 ROI {own_roi:.2f} < 保本 {own_be:.2f}，转化率 {own_cvr:.2f}% "
+                f"低于行业 {ind_cvr:.2f}%；加价只会放大亏损，先把转化和内功补上。")
+        elif own_roi < own_be and ref_bid > 0 and own_bid > ref_bid * 1.1:
+            target = ref_bid
+            add(word, "已投", iw, ov,
+                f"降价到 ¥{target:.2f} 附近（当前出价高于行业参考）", "中", target,
+                f"{word} 本店 ROI {own_roi:.2f} 低于保本 {own_be:.2f}，当前出价 ¥{own_bid:.2f} "
+                f"高于行业参考 ¥{ref_bid:.2f}；先降价到参考价附近再观察 2~3 天。")
+        elif ind_ctr > 0 and own_ctr < ind_ctr - 1:
+            add(word, "已投", iw, ov,
+                "先改主图/标题相关性，出价暂不动", "中", None,
+                f"{word} 本店 CTR {own_ctr:.2f}% 低于行业 {ind_ctr:.2f}%；"
+                "先修创意与词-品匹配，别用加价掩盖点击率问题。")
+        else:
+            add(word, "已投", iw, ov,
+                "观察 2~3 天，暂不调价", "低", None,
+                f"{word} 本店 ROI {own_roi:.2f}、转化率 {own_cvr:.2f}%，与行业差异不大；"
+                "先保持出价，等下一期趋势再动。")
+
+    # 2) 行业热词/飙升词/新词/品牌词里本店没投的：给一个可执行的起测价
+    cand = []
+    for word, iw in imap.items():
+        if word in own:
+            continue
+        sources = iw.get("sources") or []
+        if not any(s in sources for s in ("热词", "飙升词", "新词", "品牌词", "品牌飙升词", "品牌新词")):
+            continue
+        rank = _f(iw.get("rank"))
+        rise = _f(iw.get("rise_rate"))
+        if rank > 30 and rise <= 0:
+            continue
+        score = (100 if rise > 50 or 0 < rank <= 10 else 0) + min(rise, 200) / 100
+        cand.append((score, word, iw, sources, rise))
+    cand.sort(key=lambda x: -x[0])
+    for _score, word, iw, sources, rise in cand[:6]:
+        ref_bid = _f(iw.get("ref_bid"))
+        base = ref_bid or avg_cpc or 0.5
+        factor = 0.8 if "飙升词" in sources else 0.6
+        target = max(0.1, base * factor)
+        comp = _f(iw.get("competitiveness"))
+        rank = _f(iw.get("rank"))
+        if comp > 500000:
+            priority, action = "低", f"只做低价长尾，起测 ¥{target:.2f}；竞争度 {comp:,.0f}，不抢头部"
+        elif rise > 50 or 0 < rank <= 10:
+            priority, action = "高", f"加词测试：精确匹配，起测 ¥{target:.2f}，跑 3 天看 ROI"
+        else:
+            priority, action = "中", f"可加词测试：起测 ¥{target:.2f}，先小预算跑 3 天"
+        add(word, "未投", iw, None, action, priority, target,
+            f"{word} 出现在行业{'/'.join(sources)}，本店未投；"
+            + (f"搜索指数 {_f(iw.get('search_exponent')):,.0f}" if iw.get("search_exponent") else "")
+            + (f"、涨幅 {rise:+.1f}%" if rise else "")
+            + (f"、排名 {int(rank)}" if rank else "")
+            + f"；行业参考出价 ¥{ref_bid:.2f}，建议先按参考价 {factor * 100:.0f}% 起测，"
+              "有成交再逐步提价，别直接抢大词首位。")
+
+    prio = {"高": 0, "中": 1, "低": 2}
+    invested = [x for x in actions if x.get("status") == "已投"]
+    uncovered = [x for x in actions if x.get("status") == "未投"]
+    invested.sort(key=lambda x: (prio.get(x.get("priority"), 9), -_f(x.get("own_cost"))))
+    uncovered.sort(key=lambda x: (prio.get(x.get("priority"), 9),
+                                  -_f(x.get("search_exponent")), -_f(x.get("rise_rate"))))
+    # 已投词是主菜，但必须给未投热词留位置；否则页面会只剩降价建议，看不到加词机会
+    picked = invested[:8] + uncovered[:4]
+    if len(picked) < 12:
+        picked += (invested[8:] + uncovered[4:])[:12 - len(picked)]
+    return picked
+
+
 def _own_regions(data: dict, account: str) -> list[str]:
     rows = ((data.get("targeting") or {}).get("area", {}).get(account, {}).get("w2") or [])
     return [str(r.get("name") or "") for r in rows if r.get("name")]
@@ -717,6 +934,8 @@ def observe(blocks: dict, data: dict) -> dict:
                     "ctr_gap": dg_ctr, "cvr_gap": dg_cvr,
                 })
 
+        kw_actions = _keyword_actions(data, key, ds, be)
+
         ind_cust = sums.get("industryCustomer") or {}
         self_cust = sums.get("selfCustomer") or {}
         new_gap = round(_f(self_cust.get("newCustomerCntPercentage"))
@@ -753,6 +972,11 @@ def observe(blocks: dict, data: dict) -> dict:
             + "、".join(f"{r.get('date')}点" for r in peaks)
             + "，低谷 " + "、".join(f"{r.get('date')}点" for r in valleys) + "。",
         ]
+        if kw_actions:
+            n_inv = sum(1 for x in kw_actions if x.get("status") == "已投")
+            n_new = sum(1 for x in kw_actions if x.get("status") == "未投")
+            obs.append(f"关键词出价：已投词中 {n_inv} 个有明确调价动作，行业未覆盖词 {n_new} 个已给起测出价；"
+                       "详见下方「关键词出价建议」，按当前 ROI 与行业基准逐词给，不是只看行业热度。")
         observations.extend(obs)
 
         def add(topic: str, priority: str, text: str, finding: str = "") -> None:
@@ -813,6 +1037,11 @@ def observe(blocks: dict, data: dict) -> dict:
                 " 可配合分时折扣做小幅度提价；低谷 " + "、".join(f"{r.get('date')}点" for r in valleys) +
                 " 先降价验证，注意分时数据按点击小时归因，别只凭一天下结论。",
                 "行业时段点击指数分布")
+        top_acts = ([x for x in kw_actions if x.get("status") == "已投"][:2]
+                    + [x for x in kw_actions if x.get("status") == "未投"][:1])
+        for act in top_acts:
+            add("关键词出价", act["priority"], act["reason"],
+                f"{act['word']}：{act['action']}")
 
         fact = {
             "account": key, "label": label, "category": cat_name, "cid3": cat.get("id"),
@@ -844,6 +1073,12 @@ def observe(blocks: dict, data: dict) -> dict:
             "new_words": [str(w.get("keyWord") or "") for w in new[:6]],
             "brand_words": [str(w.get("keyWord") or "") for w in brand_hot[:6]],
             "word_gaps": word_gaps[:6],
+            "keyword_actions": kw_actions,
+            "keyword_summary": {
+                "invested": sum(1 for x in kw_actions if x.get("status") == "已投"),
+                "uncovered": sum(1 for x in kw_actions if x.get("status") == "未投"),
+                "high": sum(1 for x in kw_actions if x.get("priority") == "高"),
+            },
             "customer": {"self_new_pct": _r(self_cust.get("newCustomerCntPercentage")),
                          "industry_new_pct": _r(ind_cust.get("newCustomerCntPercentage")),
                          "gap_pp": new_gap,
@@ -866,6 +1101,7 @@ def observe(blocks: dict, data: dict) -> dict:
             "hotWords": hot[:12], "soaringWords": soaring[:12], "newWords": new[:12],
             "brandWords": brand_hot[:12], "brands": brands[:10],
             "customer": {"industry": ind_cust, "self": self_cust},
+            "keywordActions": kw_actions,
             "trend": whole, "hourly": hourly,
             "industrySummary": ind, "selfDetail": own_rows,
         }
@@ -910,6 +1146,8 @@ def compact_for_ai(ind: dict | None) -> dict:
             "new_words": a.get("new_words", [])[:4],
             "brand_words": a.get("brand_words", [])[:4],
             "word_gaps": a.get("word_gaps", [])[:4],
+            "keyword_actions": a.get("keyword_actions", [])[:8],
+            "keyword_summary": a.get("keyword_summary"),
             "customer": a.get("customer"),
             "brands": a.get("brands", [])[:3],
             "self_brand_rank": a.get("self_brand_rank"),

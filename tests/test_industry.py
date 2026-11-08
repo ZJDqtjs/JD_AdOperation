@@ -63,7 +63,9 @@ def payload() -> dict:
                            "clickExponent": "20784", "ctr": "7.79", "cvs": "17.22",
                            "kwImpressionBid": "0.80"}],
             "hotWords": [{"keyWord": "红薯", "keyWordRank": "1",
-                          "searchExponent": "73126", "kwCompetitiveness": "74966"}],
+                          "searchExponent": "73126", "kwCompetitiveness": "74966"},
+                         {"keyWord": "木薯", "keyWordRank": "2",
+                          "searchExponent": "8000", "kwCompetitiveness": "1000"}],
             "soaringWords": [{"keyWord": "红薯新鲜", "keyWordRank": "1",
                               "riseRate": "191.60", "searchExponent": "3690",
                               "kwCompetitiveness": "0"}],
@@ -99,7 +101,10 @@ def fake_data(ind: dict) -> dict:
         "accounts": [{"key": KEY, "label": "主账号", "totals": {}}],
         "plans": [], "skus": [], "noAd": [], "typeSplit": {},
         "words": {KEY: {"w2": {"测试计划": {"sw": [], "kw": [
-            {"word": "玉米", "cost": 10, "roi": 5, "kind": "good"}]}}}},
+            {"word": "玉米", "cost": 10, "amt": 50, "ord": 1, "clk": 10, "imp": 200,
+             "roi": 5, "kind": "good", "be": 4.0},
+            {"word": "红薯", "cost": 100, "amt": 200, "ord": 10, "clk": 100, "imp": 1000,
+             "roi": 2, "kind": "low", "be": 4.0}]}}}},
         "targeting": {"area": {KEY: {"w2": [{"name": "广东", "cost": 100}]}},
                       "crowd": {KEY: {"w2": []}}},
         "targetingGaps": [], "hourly": {}, "hourlyGaps": [],
@@ -140,8 +145,15 @@ def main() -> int:
                   f"ctr_gap={a['self_vs_industry']['ctr_gap_pp']} "
                   f"cvr_gap={a['self_vs_industry']['cvr_gap_pp']}")
             check("地域/热词缺口进入建议", bool(ind["suggestions"]) and bool(ind["gaps"]) and
-                  any("红薯" in x for x in a["uncovered_words"]),
+                  any("木薯" in x for x in a["uncovered_words"]),
                   f"uncovered={a['uncovered_words']}")
+            acts = a.get("keyword_actions") or []
+            check("关键词出价建议结合本店表现",
+                  any(x["word"] == "红薯" and x["status"] == "已投" and
+                      x.get("suggest_bid") for x in acts) and
+                  any(x["word"] == "木薯" and x["status"] == "未投" and
+                      x.get("suggest_bid") for x in acts),
+                  f"actions={[(x['word'], x['status'], x.get('suggest_bid')) for x in acts[:5]]}")
             check("趋势与时段图数据齐全",
                   len(ind["charts"]["accounts"][0]["trend"]) == 7 and
                   len(ind["charts"]["accounts"][0]["hourly"]) == 24)
@@ -163,7 +175,10 @@ def main() -> int:
             html = report2.page_industry(d, ai=None)
             check("报表页签渲染地域/关键词/建议",
                   "行业大盘观察" in html and "广东省" in html and "红薯" in html and
-                  "规则层建议" in html and "AI 行业总结与建议" in html)
+                  "关键词出价建议" in html and "规则层建议" in html and
+                  "AI 行业总结与建议" in html)
+            check("行业页使用账号切换而不是纵向罗列",
+                  "indtabs" in html and "indacct" in html and "indwrap" in html)
             check("页签列表包含 p-ind", any(cid == "p-ind" for cid, _ in report2.TABS))
 
             res = industry.delete_cache(KEY, START, END)

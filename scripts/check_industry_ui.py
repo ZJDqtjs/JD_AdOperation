@@ -25,7 +25,7 @@ def main() -> int:
         print("charts:", charts)
         print("__CH:", page.evaluate("Object.keys(window.__CH||{})"))
         print("industry_chart_dom:", page.evaluate(
-            "!!document.getElementById('chIndustryTrend') && !!document.getElementById('chIndustryHour')"))
+            "!!document.getElementById('chIndTrend0') && !!document.getElementById('chIndHour0')"))
         print("__CHARTS type:", page.evaluate("typeof window.__CHARTS"))
         page.get_by_text("⑧ 行业大盘", exact=True).click()
         page.wait_for_timeout(600)
@@ -33,14 +33,24 @@ def main() -> int:
             "document.querySelector('section.page.active') && document.querySelector('section.page.active').id")
         print("active tab:", active)
         ind = page.eval_on_selector("#p-ind", "e=>e.innerText")
-        for key in ("本店 vs 行业", "地域分析", "行业关键词榜", "规则层建议", "AI 行业总结与建议"):
+        for key in ("关键词出价建议", "本店 vs 行业", "地域分析", "行业关键词榜",
+                    "规则层建议", "AI 行业总结与建议"):
             print(f"contains {key}:", key in ind)
+        tabs = page.eval_on_selector_all("#p-ind .indtab", "els=>els.map(e=>e.dataset.ind)")
+        print("ind tabs:", tabs)
+        switched = True
+        if len(tabs) > 1:
+            page.eval_on_selector_all("#p-ind .indtab", "els=>els[1].click()")
+            page.wait_for_timeout(300)
+            switched = page.evaluate(
+                "document.querySelector('#p-ind .indacct.active').dataset.ind") == tabs[1]
+            print("ind switch:", switched)
         print("meta refresh:", page.evaluate(
             "!!document.querySelector('meta[http-equiv=refresh]')"))
         print("pageerror:", ERRS)
         browser.close()
-    ok = (not ERRS and "chIndustryTrend" in charts and
-          "chIndustryHour" in charts and active == "p-ind")
+    ok = (not ERRS and "chIndTrend0" in charts and "chIndHour0" in charts and
+          active == "p-ind" and switched and bool(tabs))
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
