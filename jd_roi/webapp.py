@@ -10,6 +10,7 @@
     /ai          独立 AI 分析台：每日 AI 报告 + 可追问对话框（含思考过程流式展示）
     /paycomm     CPS 花费：按 SKU 看付款佣金金额，可导出 Excel
     /paycomm/spend  京准通花费：按 SKU 看广告花费（智能投放 + 全站智能推广），可导出 Excel
+    /cashflow    广告费流水：账户余额、充值/消费柱状图、每日消耗（财务记录口径）
     /login       扫码登录
 
 API：
@@ -53,8 +54,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse, Response, StreamingResponse)
 
-from . import (aijobs, ai_page, analyze2, analyze_ai, config, dailystore as ds,
-               industry, paycomm, profit, report2, scrape_day, settings)
+from . import (aijobs, ai_page, analyze2, analyze_ai, cashflow, config,
+               dailystore as ds, industry, paycomm, profit, report2, scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -1954,6 +1955,249 @@ def cache_page(request: Request):
 </body></html>""")
 
 
+# ================================================================ 广告费流水
+# 数据在 jd_roi/cashflow.py：逐账号抓「账户中心 → 财务记录」的充值/消费/分配/冻结，
+# 这里只做页面与接口。页面直接读本地缓存（不发请求），要新数据点「重新抓取」。
+CASHFLOW_CSS = """
+.cfkpi{margin:14px 0 4px}
+.cfchart{background:var(--canvas);border:1px solid var(--hair);border-radius:var(--r-md);
+  padding:10px 14px 4px;margin-bottom:14px}
+.cfchd{display:flex;justify-content:space-between;align-items:center;font-size:13px;
+  color:var(--body);margin-bottom:2px}
+.cfchd b{font-weight:600}
+.cfchd span{color:var(--muted2);font-size:12px}
+.cfchd i{display:inline-block;width:10px;height:10px;border-radius:2px;
+  margin:0 3px 0 10px;vertical-align:-1px}
+.cfchd i.g{background:#2E9E5B}.cfchd i.r{background:#D64545}
+.cfchart text.ax{font-size:11px;fill:#9d968b}
+.cfchart text.v{font-size:9.5px}
+.cfchart text.gv{fill:#2E9E5B}.cfchart text.rv{fill:#D64545}
+.cfchart text.empty{fill:#bdb6aa;font-size:12px}
+table.cftable{width:100%;border-collapse:collapse;font-size:12.5px}
+table.cftable th{background:var(--soft);color:var(--muted);font-weight:600;text-align:right;
+  padding:7px 10px;border-bottom:1px solid var(--hair);white-space:nowrap}
+table.cftable th:first-child,table.cftable td:first-child{text-align:left}
+table.cftable td{padding:6px 10px;border-bottom:1px solid var(--hair2);text-align:right;
+  font-variant-numeric:tabular-nums}
+table.cftable tbody tr:hover td{background:#fbf8f3}
+table.cftable td.dim{color:var(--muted2)}
+table.cftable tfoot td{font-weight:600;background:var(--soft);border-top:1px solid var(--hair)}
+.cfscroll{max-height:620px;overflow:auto;border:1px solid var(--hair);border-radius:var(--r-md)}
+.cfscroll thead th{position:sticky;top:0;z-index:2}
+.cfwarn{color:var(--amberink);background:var(--amberbg);border-radius:8px;padding:8px 12px;
+  font-size:12.5px;margin:10px 0}
+"""
+
+CASHFLOW_JS = r"""
+(function(){
+function $(id){ return document.getElementById(id); }
+function msg(s, bad){ var el=$('cfMsg'); if(!el) return; el.textContent=s||'';
+  el.style.color = bad ? 'var(--redink)' : 'var(--muted)'; }
+function poll(){
+  fetch('/api/cashflow/status').then(function(r){return r.json();}).then(function(j){
+    if(j.running){
+      msg('抓取中 ' + (j.done||0) + '/' + (j.total||0) + '　' + (j.account||'') +
+          '　' + (j.message||''));
+      setTimeout(poll, 2500);
+    } else if(j.error){
+      msg('失败：' + j.error, true);
+      var b=$('cfRun'); if(b) b.disabled=false;
+    } else if(j.finishedAt){
+      msg((j.message||'完成') + '，正在刷新页面…');
+      setTimeout(function(){ location.reload(); }, 900);
+    }
+  }).catch(function(){ setTimeout(poll, 4000); });
+}
+window.CFRUN = function(){
+  var el = $('cfDays');
+  var d = parseInt((el && el.value) || '30', 10);
+  var btn = $('cfRun');
+  if(btn) btn.disabled = true;
+  msg('已提交，等待浏览器登录态…');
+  fetch('/api/cashflow/run?days=' + d, {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ msg(j.error || '启动失败', true); if(btn) btn.disabled=false; return; }
+      poll();
+    })
+    .catch(function(e){ msg('启动失败：' + e, true); if(btn) btn.disabled=false; });
+};
+if(window.CF_RUNNING) poll();
+})();
+"""
+
+
+def _cf_money(v) -> str:
+    try:
+        return f"{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+@app.get("/cashflow", response_class=HTMLResponse)
+def cashflow_page():
+    """广告费流水：余额、充值/消费柱状图、每日流水（读本地缓存，不触发抓取）。"""
+    snap = cashflow.snapshot()
+    st = _cashflow.status()
+    running = bool(st.get("running"))
+    days = st.get("days") or 30
+
+    if snap.get("empty"):
+        meta = "<span>还没有数据</span>"
+        kpis = ""
+        body = ('<div class="card"><p class="hint">还没有流水数据。点右上角「重新抓取」，'
+                '会依次登录各账号拉一遍财务记录（5 个账号约 2~4 分钟）。</p></div>')
+    else:
+        accs = snap["accounts"]
+        begin, end = snap["begin"], snap["end"]
+        totals = snap["totals"]
+        day_avg = round(sum(a["day_avg"] for a in accs), 2)
+        cover = round(totals["cash"] / day_avg, 1) if day_avg else None
+        meta = (f"<span>{begin} ~ {end}</span><span class='dot'></span>"
+                f"<span>抓取于 {snap['fetched_at'][:16].replace('T', ' ')}</span>"
+                f"<span class='dot'></span><span>来源：京准通 → 账户中心 → 财务记录</span>")
+        kpis = (
+            '<div class="grid g4 cfkpi">'
+            f'<div class="kpi"><div class="lbl">可用余额合计</div>'
+            f'<div class="val">¥ {_cf_money(totals["cash"])}</div>'
+            f'<div class="sub">期初 {_cf_money(totals["begin"])}</div></div>'
+            f'<div class="kpi"><div class="lbl">区间充值</div>'
+            f'<div class="val">¥ {_cf_money(totals["recharge"])}</div>'
+            f'<div class="sub">{len([a for a in accs if a["recharge_sum"]])} 个账号有充值</div></div>'
+            f'<div class="kpi"><div class="lbl">区间消费</div>'
+            f'<div class="val">¥ {_cf_money(totals["consume"])}</div>'
+            f'<div class="sub">日均 {_cf_money(day_avg)}</div></div>'
+            f'<div class="kpi"><div class="lbl">余额可撑</div>'
+            f'<div class="val">{cover if cover is not None else "—"} 天</div>'
+            f'<div class="sub">按近 {len(accs)} 个账号合计日均消耗估算</div></div>'
+            '</div>')
+
+        # 账号汇总表
+        rows = []
+        for a in accs:
+            cover_a = a["cover_days"]
+            rows.append(
+                f'<tr><td><b>{_e(a["label"])}</b></td>'
+                f'<td class="dim">{a["account_id"]}</td>'
+                f'<td>{_cf_money(a["cash_balance"])}</td>'
+                f'<td>{_cf_money(a["begin_balance"])}</td>'
+                f'<td>{_cf_money(a["recharge_sum"])}</td>'
+                f'<td>{_cf_money(a["consume_sum"])}</td>'
+                f'<td>{_cf_money(a["day_avg"])}</td>'
+                f'<td>{"—" if cover_a is None else f"{cover_a:g} 天"}</td>'
+                f'<td class="dim">{_e(a["begin_from"])}</td></tr>')
+        rows.append(
+            f'<tr><td><b>合计</b></td><td class="dim"></td>'
+            f'<td><b>{_cf_money(totals["cash"])}</b></td>'
+            f'<td><b>{_cf_money(totals["begin"])}</b></td>'
+            f'<td><b>{_cf_money(totals["recharge"])}</b></td>'
+            f'<td><b>{_cf_money(totals["consume"])}</b></td>'
+            f'<td><b>{_cf_money(day_avg)}</b></td>'
+            f'<td><b>{"—" if cover is None else f"{cover:g} 天"}</b></td><td></td></tr>')
+        table = (
+            '<div class="card"><h2>账号汇总 <span class="tagline">按账号看资金</span></h2>'
+            '<div style="overflow:auto"><table class="cftable"><thead><tr>'
+            '<th>账号</th><th>账户ID</th><th>当前可用余额</th><th>区间期初</th>'
+            '<th>区间充值</th><th>区间消费</th><th>日均消费</th><th>可撑</th>'
+            '<th>期初口径</th></tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>'
+            '<p class="hint">消费 = 财务记录的「消费记录」合计（现金 + 红包）；'
+            '可撑 = 当前余额 ÷ 日均消费，<b>不足 2 天要补钱</b>。</p></div>')
+
+        # 柱状图
+        charts = ('<div class="card"><h2>充值 vs 消费 <span class="tagline">绿上红下 · 上下各自独立刻度</span></h2>'
+                  '<p class="hint">绿色向上是当日充值到账，红色向下是当日广告消耗。'
+                  '上下两块刻度独立，所以两向柱高不能直接比（左侧数字是各自的满格值）。'
+                  '鼠标悬停柱子可看精确金额。</p>'
+                  + cashflow.charts_html(snap) + '</div>')
+
+        # 每日流水（日期 × 账号 的消费）
+        dates = cashflow.date_list(begin, end)
+        mat = {(r["date"], r["account"]): r for r in snap["daily"]}
+        head = "".join(f"<th>{_e(a['label'])}</th>" for a in accs)
+        drows = []
+        for d in reversed(dates):
+            vals = [(mat.get((d, a["account"])) or {}).get("consume") or 0 for a in accs]
+            tot = round(sum(vals), 2)
+            if not tot:
+                continue
+            cells = "".join(
+                (f"<td>{_cf_money(v)}</td>" if v else '<td class="dim">—</td>') for v in vals)
+            drows.append(f"<tr><td>{d}</td>{cells}<td><b>{_cf_money(tot)}</b></td></tr>")
+        daily_table = (
+            '<div class="card"><h2>每日消费 <span class="tagline">按消耗日归属</span></h2>'
+            '<div class="cfscroll"><table class="cftable"><thead><tr>'
+            f'<th>日期</th>{head}<th>合计</th></tr></thead><tbody>'
+            + "".join(drows) + '</tbody></table></div>'
+            '<p class="hint">次日 08:45 左右批量扣款，所以「今天的消耗」要到明早才从余额里扣掉。'
+            '逐笔明细（充值/分配/冻结）在导出的 Excel 里。</p></div>')
+
+        body = kpis + table + charts + daily_table
+        if snap.get("ranges_mixed"):
+            body = ('<div class="cfwarn">各账号的缓存区间不一致（可能只抓了部分账号），'
+                    '点「重新抓取」可统一。</div>' + body)
+
+    run_hint = f'<span id="cfMsg" style="font-size:12px;color:var(--muted)">{"抓取中…" if running else ""}</span>'
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>广告费流水 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{CASHFLOW_CSS}</style>
+</head><body>
+{report2.navtop("/cashflow")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}财务</div>
+  <h1>广告费流水</h1>
+  <div class="metaline">{meta}</div>
+  <div class="actions">
+    <input id="cfDays" type="number" min="1" max="120" value="{days}"
+           style="width:74px;padding:7px 9px;border-radius:8px;border:1px solid var(--line)">
+    <span style="font-size:12px;color:var(--muted)">天</span>
+    <button class="btn" id="cfRun" onclick="CFRUN()" {"disabled" if running else ""}>重新抓取</button>
+    <a class="btn ghost mini" href="/api/cashflow/export">导出 Excel</a>
+    <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
+    {run_hint}
+  </div>
+</div></header>
+<div class="wrap">
+{body}
+<div class="note" style="margin-top:18px">
+  <p><b>口径</b>：交易日期 = 广告实际消耗日；记账时间 = 次日 08:45 左右批量扣款；
+  结余取接口原值，接口不返回结余的账号按「期初 + 充值 − 消费」逐日滚动推算。</p>
+  <p><b>分配</b>是同一资金户内「商家账户 ↔ 投放子账户」的划转，不改变账户现金总额，不计入余额滚动。</p>
+  <p>数据每次点「重新抓取」覆盖保存，不自动过期；要换区间改上面的天数即可。</p>
+</div>
+</div>
+<script>window.CF_RUNNING = {"true" if running else "false"};</script>
+<script>{CASHFLOW_JS}</script>
+</body></html>""")
+
+
+@app.post("/api/cashflow/run")
+def api_cashflow_run(days: int = 30):
+    """起后台任务抓财务流水（逐账号，约 2~4 分钟）。"""
+    return _cashflow.start(days)
+
+
+@app.get("/api/cashflow/status")
+def api_cashflow_status():
+    return _cashflow.status()
+
+
+@app.get("/api/cashflow/export")
+def api_cashflow_export():
+    """导出与页面同口径的 Excel（4 个 sheet：汇总/每日/明细/口径）。"""
+    snap = cashflow.snapshot()
+    if not snap.get("ok"):
+        return JSONResponse({"ok": False, "error": "还没有数据，请先抓取一次"}, status_code=404)
+    data = cashflow.xlsx_bytes(snap["accounts"], snap["daily"], snap["begin"], snap["end"])
+    from urllib.parse import quote
+    fname = f"账号广告费流水表_{snap['begin']}_{snap['end']}.xlsx"
+    disp = f"attachment; filename=\"cashflow.xlsx\"; filename*=UTF-8''{quote(fname)}"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
+
+
 # ================================================================ 月度利润分析
 # 商智成交件数 × ERP 到手结算价 / 毛利每件，再扣 CPS 与京准通花费 → 净利。
 # 取数与计算在 jd_roi/profit.py，这里只做页面与接口。
@@ -3469,6 +3713,8 @@ _paycomm = paycomm.PayCommRunner("cps", profile_lock=_login._profile_lock)
 _paycomm_spend = paycomm.PayCommRunner("spend", profile_lock=_login._profile_lock)
 # 月度利润分析：商智销量 + ERP 成本 + 上面两套花费缓存
 _profit = profit.ProfitRunner(profile_lock=_login._profile_lock)
+# 广告费流水（账户中心-财务记录）：与登录 / 保活 / 其它抓取共用同一把 Profile 锁
+_cashflow = cashflow.runner(_login._profile_lock)
 
 
 class AiRunner:
