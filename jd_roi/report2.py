@@ -244,6 +244,7 @@ input[type=checkbox]{accent-color:var(--primary)}
   border-radius:0 var(--r-sm) var(--r-sm) 0;font-size:12.5px;color:var(--redink);margin:12px 0;line-height:1.75}
 .covbox{background:var(--amberbg);border-left:3px solid var(--amber);padding:12px 16px;
   border-radius:0 var(--r-sm) var(--r-sm) 0;font-size:12.5px;color:var(--amberink);margin-bottom:16px;line-height:1.75}
+.gapmark{color:var(--red);font-weight:700;margin-left:2px;cursor:help}
 ul.sum{margin:8px 0 0;padding-left:20px}
 ul.sum li{margin:7px 0;line-height:1.7}
 .opDetail{font-size:11.5px;color:var(--muted);max-width:560px;word-break:break-word}
@@ -1235,6 +1236,11 @@ def page_sku(d) -> str:
             kw_note = (f'<br>花费口径 = 智能投放 ＋ 全站智能推广 ＋ 关键词计划；本期关键词计划 '
                        f'¥{_money(kw.get("total"))} 已全部按创意 SKU 归到商品；'
                        f'全站智能推广按 SPU 下未拉黑的 SKU 平分。')
+    # 商智有缺口时，商品表这一列会偏低 —— 表头打星 + 悬停说清楚是哪几个账号缺哪几天
+    sz_gap = _coverage_gap_text(d)
+    sz_tip = ("商智全店全渠道成交额，下方为成交件数" +
+              (f"｜数据不全：{sz_gap}（该列偏低）" if sz_gap else ""))
+    sz_mark = '<span class="gapmark" title="该列有账号数据不全">*</span>' if sz_gap else ""
     return f"""
 <div class="card">
   <h2>商品 ROI 交叉表 <span class="tagline">按 SKU 合并两个账号的广告，商智成交分店展示</span></h2>
@@ -1277,7 +1283,7 @@ def page_sku(d) -> str:
       <th data-num="1">到手结算价(到手率)</th>
       <th data-num="1" title="每卖一件真正赚到的钱（未扣广告费）">毛利/件</th>
       <th data-num="1">广告占比</th>
-      <th data-num="1" title="商智全店全渠道成交额，下方为成交件数">商智总成交</th>
+      <th data-num="1" title="{_e(sz_tip)}">商智总成交{sz_mark}</th>
       <th data-num="1" title="商智总成交 − 广告成交；下方为自然成交件数（近似）">自然成交</th>
       <th data-num="1">预估净利</th>
       <th data-num="1">近3周ROI</th><th class="l">档位</th>
@@ -2128,18 +2134,64 @@ def _cost_block(d) -> str:
     return '<div class="warnbox">' + '<br>'.join(parts) + '</div>'
 
 
-def _coverage_notice(d) -> str:
+def _coverage_gaps(d, only_label: str = "") -> list[str]:
+    """所选区间里每个账号缺了哪些天（按数据源分开说）。
+
+    广告＝jzt_campaign（花费/成交），商智＝sz_product（店铺成交/净利）。
+    两者缺一个都会让页面数字偏低，必须分开报 —— 以前只看广告，
+    商智缺半个月也不报警（「雪莲果商智成交偏低」就是这么漏掉的）。
+    """
     cov = (d.get("meta") or {}).get("coverage") or {}
-    bad = []
+    out = []
     for a in d.get("accounts", []):
-        per = cov.get(a["key"]) or {}
-        wk = per.get("w2") or {}
-        if wk and not wk.get("complete"):
-            bad.append(f'{a["label"]} 所选区间仅 {wk.get("got")}/{wk.get("want")} 天有数据')
-    if not bad:
+        if only_label and a["label"] != only_label:
+            continue
+        if not a.get("hasData", True):
+            out.append(f'<b>{_e(a["label"])}</b>：该区间无任何数据（未抓取）')
+            continue
+        t = (a.get("totals") or {}).get("w2") or {}
+        if not _n(t.get("cost")) and not _n(t.get("szAmt")):
+            continue                     # 这号本区间没花费也没商智成交，缺天不影响任何数字
+        wk = (cov.get(a["key"]) or {}).get("w2") or {}
+        srcs = wk.get("sources") or {}
+        bad = []
+        for name in ("广告", "商智"):
+            info = srcs.get(name) or {}
+            if info and not info.get("complete"):
+                bad.append(f'{name}缺 {_e(info.get("missing") or "全部")}')
+        if bad:
+            out.append(f'<b>{_e(a["label"])}</b>：' + "、".join(bad))
+    return out
+
+
+def _coverage_gap_text(d) -> str:
+    """纯文本缺口，给表头 title 用（HTML 标签放不进 tooltip）。"""
+    cov = (d.get("meta") or {}).get("coverage") or {}
+    parts = []
+    for a in d.get("accounts", []):
+        if not a.get("hasData", True):
+            parts.append(f'{a["label"]}该区间无任何数据')
+            continue
+        t = (a.get("totals") or {}).get("w2") or {}
+        if not _n(t.get("cost")) and not _n(t.get("szAmt")):
+            continue
+        srcs = ((cov.get(a["key"]) or {}).get("w2") or {}).get("sources") or {}
+        for name in ("广告", "商智"):
+            info = srcs.get(name) or {}
+            if info and not info.get("complete"):
+                parts.append(f'{a["label"]}{name}缺 {info.get("missing") or "全部"}')
+    return "；".join(parts)
+
+
+def _coverage_notice(d) -> str:
+    gaps = _coverage_gaps(d)
+    if not gaps:
         return ""
-    return ('<div class="covbox"><b>数据不完整</b>：' + "；".join(_e(x) for x in bad) +
-            '。未覆盖的日期按 0 计入，可能低估区间表现 —— 可在控制台补抓这些日期。</div>')
+    return ('<div class="covbox"><b>数据不完整 —— 未覆盖的日期按 0 计入，本页花费/成交会偏低</b><br>'
+            + "；".join(gaps) +
+            '<br><span style="color:var(--muted)">补抓：在控制台「立即抓取」选对应区间，或执行 '
+            '<code>docker exec jd-roi python -m jd_roi.scrape_day 起 止 --account=账号 '
+            '--kinds=sz_product,sz_flow,jzt_campaign</code></span></div>')
 
 
 # ---------------------------------------------------------------- 组装

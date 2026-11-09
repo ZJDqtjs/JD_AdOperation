@@ -1236,17 +1236,55 @@ def _judge(op, before, after, plan):
     return "待观察", f"调整后 ROI {before['roi']} → {after['roi']}"
 
 
+# 覆盖检查要看的数据源：广告（京准通概览）决定花费/成交，商智决定店铺成交与净利。
+# 以前只看 jzt_campaign，商智缺了半个月却不报警（雪莲果那类"商智总成交偏低"就是这么漏掉的）。
+COV_SOURCES = [("广告", "jzt_campaign"), ("商智", "sz_product")]
+
+
+def _compress_days(days: list[str]) -> str:
+    """['2026-10-01'…'2026-10-16'] → '10-01~10-16'；零散天用顿号连。"""
+    if not days:
+        return ""
+    ds = sorted(days)
+    spans: list[list[str]] = []
+    for d in ds:
+        if spans and (_plus_day(spans[-1][1]) == d):
+            spans[-1][1] = d
+        else:
+            spans.append([d, d])
+    parts = []
+    for a, b in spans:
+        parts.append(f"{a[5:]}~{b[5:]}" if a != b else a[5:])
+    return "、".join(parts)
+
+
+def _plus_day(day: str) -> str:
+    try:
+        return (_dt.date.fromisoformat(day) + _dt.timedelta(days=1)).isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
 def _coverage_block(active, wins):
-    """每个窗口实际有几天数据 —— 用于提示「区间里有空洞」。"""
+    """每个窗口、每个数据源实际有几天数据 —— 用于提示「区间里有空洞」。"""
     from . import dailystore as dstore
     out = {}
     for a in active:
         per = {}
         for wk, s, e, _lab in wins:
-            want = len(dstore.day_span(s, e))
-            jzt = dstore.load_window(a["key"], "jzt_campaign", s, e)
-            got = len(jzt.get("days", [])) if jzt else 0
-            per[wk] = {"want": want, "got": got, "complete": got >= want}
+            span = dstore.day_span(s, e)
+            want = len(span)
+            src = {}
+            for name, kind in COV_SOURCES:
+                w = dstore.load_window(a["key"], kind, s, e)
+                days = set((w or {}).get("days") or [])
+                miss = [d for d in span if d not in days]
+                src[name] = {"want": want, "got": len(span) - len(miss),
+                             "complete": not miss,
+                             "missing": _compress_days(miss)}
+            got = src["广告"]["got"]
+            per[wk] = {"want": want, "got": got, "complete": got >= want,
+                       "sources": src}
         out[a["key"]] = per
     return out
 
