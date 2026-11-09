@@ -435,9 +435,33 @@ def type_split(accts):
 
 
 # ---------------- 按 SKU 交叉（跨账号合并广告 + 分店铺商智）----------------
+_SPU_MAP_CACHE: dict = {}
+
+
+def spu_sku_maps(accts) -> dict:
+    """{账号: {spuId: {"skus": [...], "names": {...}}}}：全站智能推广 SPU 下的**生效 SKU**。
+
+    153 计划按 SPU 投放，计划行上的 spuId 不是 skuId；SPU 下没被拉黑的 SKU 都在投，
+    所以 SPU 级花费要在这些 SKU 之间平分。映射由按天抓取时调
+    /dspad/smartmax/forbidden/list 落盘（data/<账号>/spu_skus.json）。
+    """
+    out = {}
+    for a in accts:
+        k = a["key"]
+        if k not in _SPU_MAP_CACHE:
+            blob = _load("spu_skus", k) or {}
+            _SPU_MAP_CACHE[k] = {
+                str(spu): {"skus": [str(x) for x in (v.get("skus") or [])],
+                           "names": {str(x): nm for x, nm in (v.get("names") or {}).items()}}
+                for spu, v in (blob.get("map") or {}).items()}
+        out[k] = _SPU_MAP_CACHE[k]
+    return out
+
+
 def sku_rows(accts, model, costs=None):
     costs = costs or {}
     units = settings.costs_unit_map()
+    spumap = spu_sku_maps(accts)
     kwCost = {wk: defaultdict(float) for wk in WKEYS}   # 已归因的关键词花费（按 SKU）
     aggAd = {wk: defaultdict(lambda: {"cost": 0.0, "amt": 0.0, "ord": 0, "imp": 0,
                                       "clk": 0, "cart": 0, "byAcct": {}, "plans": set()})
@@ -468,30 +492,42 @@ def sku_rows(accts, model, costs=None):
                     ac["plans"].add(r["campaignName"])
                     t["plans"].add(r["campaignName"])
                     t["fromJst"] = True
-            # 全站智能推广（campaignType=153）不在智能投放报表里，但它自带 spuId=商智SKU，
-            # 用「一计划=一商品」的方式补进来，避免漏掉这部分花费
+            # 全站智能推广（campaignType=153）是按 **SPU** 投的：计划行上的 spuId 不是 skuId。
+            # 以前直接把它当 skuId 记账，等于把整个 SPU 的钱都算到「id 恰好等于 spuId」的那一个
+            # SKU 上（葫芦 SPU 只算了中果）。正确做法：SPU 下没被拉黑的 SKU 都在投，
+            # 花费在这些生效 SKU 之间平分（尾差给最后一个），黑名单里的不参与。
             for r in (w["jzt"] or {}).get("rows", []):
                 if _i(r.get("campaignType")) != 153:
                     continue
-                sid = str(r.get("spuId") or r.get("childProNo") or "").strip()
-                if not sid or sid == "0":
+                spu = str(r.get("spuId") or r.get("childProNo") or "").strip()
+                if not spu or spu == "0":
                     continue
-                t = aggAd[wk][sid]
+                info = (spumap.get(k) or {}).get(spu) or {}
+                skus = [str(x) for x in (info.get("skus") or [])] or [spu]
                 c, am, o = _f(r.get("cost")), _f(r.get("totalOrderSum")), _i(r.get("totalOrderCnt"))
-                t["cost"] += c
-                t["amt"] += am
-                t["ord"] += o
-                t["imp"] += _i(r.get("impressions"))
-                t["clk"] += _i(r.get("clicks"))
-                t["cart"] += _i(r.get("totalCartCnt"))
-                t["fromPlan"] = True
-                ac = t["byAcct"].setdefault(k, {"cost": 0.0, "amt": 0.0, "ord": 0, "plans": set()})
-                ac["cost"] += c
-                ac["amt"] += am
-                ac["ord"] += o
-                if r.get("campaignName"):
-                    ac["plans"].add(r["campaignName"])
-                    t["plans"].add(r["campaignName"])
+                imp, clk, cart = (_i(r.get("impressions")), _i(r.get("clicks")),
+                                  _i(r.get("totalCartCnt")))
+                n = len(skus)
+                for i, sid in enumerate(skus):
+                    last = (i == n - 1)
+                    cc = round(c - round(c / n, 2) * (n - 1), 2) if last else round(c / n, 2)
+                    aa = round(am - round(am / n, 2) * (n - 1), 2) if last else round(am / n, 2)
+                    oo = o - int(o / n) * (n - 1) if last else int(o / n)
+                    t = aggAd[wk][sid]
+                    t["cost"] += cc
+                    t["amt"] += aa
+                    t["ord"] += oo
+                    t["imp"] += int(imp / n)
+                    t["clk"] += int(clk / n)
+                    t["cart"] += int(cart / n)
+                    t["fromPlan"] = True
+                    ac = t["byAcct"].setdefault(k, {"cost": 0.0, "amt": 0.0, "ord": 0, "plans": set()})
+                    ac["cost"] += cc
+                    ac["amt"] += aa
+                    ac["ord"] += oo
+                    if r.get("campaignName"):
+                        ac["plans"].add(r["campaignName"])
+                        t["plans"].add(r["campaignName"])
             # 关键词计划：kw 报表只有「计划 + 词」，行里没有 skuId；创意报表（kw_ad）按创意
             # 带落地页 SKU 和花费，这里直接按 SKU 加总。一个计划推多个 SKU 也能分开算；
             # 解析不到 SKU 的创意不摊分，留在 meta.kwSpend「未归因」。
@@ -784,6 +820,7 @@ def plan_rows(accts, model, skus=None):
     而不是全店一条线；SKU 里查不到的部分才落回全店毛利率。返回 (out, beOfPlan)。"""
     marginOf = {s["skuId"]: _f(s.get("margin")) for s in (skus or [])}
     srcOf = {s["skuId"]: (s.get("costSource") or "store") for s in (skus or [])}
+    spumap = spu_sku_maps(accts)
     skuAmt = defaultdict(dict)        # (account, campaignId) -> {skuId: 成交额}
     planBe = {}
     out = []
@@ -801,10 +838,17 @@ def plan_rows(accts, model, skus=None):
                 if _i(r.get("campaignType")) != 153:
                     continue
                 cid = str(r.get("campaignId"))
-                sid = str(r.get("spuId") or r.get("childProNo") or "").strip()
-                if sid and sid != "0":
+                spu = str(r.get("spuId") or r.get("childProNo") or "").strip()
+                if not spu or spu == "0":
+                    continue
+                # 与 sku_rows 一致：SPU 级成交按生效 SKU 平分，否则计划保本线会只按 spuId
+                # 那一个 SKU 的毛利率算
+                info = (spumap.get(k) or {}).get(spu) or {}
+                members = [str(x) for x in (info.get("skus") or [])] or [spu]
+                amt = _f(r.get("totalOrderSum")) / len(members)
+                for sid in members:
                     e = skuAmt[(k, cid)].setdefault(sid, 0.0)
-                    skuAmt[(k, cid)][sid] = e + _f(r.get("totalOrderSum"))
+                    skuAmt[(k, cid)][sid] = e + amt
             for r in (w["jzt"] or {}).get("rows", []):
                 cid = str(r.get("campaignId"))
                 e = ids.setdefault(cid, {"campaignId": cid, "name": r.get("campaignName"),

@@ -23,7 +23,7 @@ import time
 import traceback
 
 from . import dailystore as ds
-from . import settings
+from . import settings, store
 from .browser import has_login, launch_profile, session_ok
 from .scrape_jst_report import API as JST_API, COLS_ACCOUNT, COLS_SW
 from .scrape_jzt import CAMPAIGN_API, CUSTOM_COLUMNS
@@ -874,6 +874,39 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                 for f in sz.values():
                     f.close()
                 sz = {}
+
+                # --- 全站智能推广（campaignType=153）是按 SPU 投的：SPU 下没拉黑的 SKU 都在投，
+                #     SPU 级的花费必须在这几个 SKU 之间平分（拉黑的不参与）。
+                #     接口一次能拿全部 SPU 的生效 SKU，映射与日期无关，落一份缓存给报表用。
+                if "jzt_campaign" in kinds:
+                    try:
+                        from .paycomm import fetch_msa_spu_skus
+                        spus = set()
+                        for d0 in days:
+                            for r in (ds.load_day(key, d0, "jzt_campaign") or {}).get("rows") or []:
+                                try:
+                                    if int(r.get("campaignType") or 0) != 153:
+                                        continue
+                                    spu = int(r.get("spuId") or r.get("childProNo") or 0)
+                                except (TypeError, ValueError):
+                                    continue
+                                if spu > 0:
+                                    spus.add(spu)
+                        if spus:
+                            info = fetch_msa_spu_skus(p_jzt, sorted(spus))
+                            store.save("spu_skus",
+                                       {"fetchedAt": settings.now_str("%Y-%m-%d %H:%M:%S"),
+                                        "map": {str(k): {"skus": v.get("skus") or [],
+                                                         "names": v.get("names") or {},
+                                                         "black": v.get("black") or 0}
+                                                for k, v in info.items()}},
+                                       key)
+                            split = sum(1 for v in info.values() if len(v.get("skus") or []) > 1)
+                            log(f"[{label}] 全站智能推广 SPU 生效 SKU：{len(info)}/{len(spus)} 个 SPU"
+                                f"（{split} 个要平分）")
+                    except Exception as exc:  # noqa: BLE001
+                        acc_sum["errors"].append(f"spu_skus: {exc}")
+                        log(f"[{label}] 全站智能推广 SPU 映射失败：{exc}")
 
                 if "oplog" in kinds:
                     try:
