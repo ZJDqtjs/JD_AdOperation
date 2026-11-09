@@ -44,6 +44,9 @@ tmp/
 *.log
 # 本地 UI 预览工具（起服务 + Playwright 截图），不入库
 .preview/
+# 一次性排查脚本与 agent 上下文文档（含真实 SKU / 经营数字，不入库）
+docs/AI_CONTEXT.md
+scripts/probe_sz_range_vs_day.py
 
 # ---- 测试残留的临时目录（tempfile.mkdtemp 应自行清理；此处兜底防误入库）----
 jdlock_*/
