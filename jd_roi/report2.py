@@ -638,6 +638,10 @@ def _sku_advice(s) -> str:
     cur = _latest(s)
     roi, cost = _n(cur["roi"]), _n(cur["cost"])
     tier = s["verdict"]["tier"]
+    if be <= 0:
+        return (f"每件到手结算价扣完成本后为负（毛利/件 ¥{_n(s.get('grossPerOrder')):.1f}）："
+                f"卖一件亏一件，不存在保本 ROI；ROI {roi:.2f} 只是换算好看，实际投得越多亏得越多，"
+                f"优先停投或先谈下成本")
     if tier == "放大":
         return f"ROI {roi:.2f} 明显高于保本 {be:.2f}：日预算 +20~30%，核心词出价 +10~20%，当作增量池"
     if tier == "优化":
@@ -656,6 +660,9 @@ def _plan_advice(p) -> str:
     roi, cost = _n(cur["roi"]), _n(cur["cost"])
     t = p["tier"]
     grow = _n(p.get("growLine")) or round(be * 1.25, 2)
+    if be <= 0:
+        return (f"计划内的商品扣完成本后为负（无保本 ROI）：ROI {roi:.2f} 再怎么提也补不回单件亏损，"
+                f"优先降预算 / 换高毛利商品")
     if t == "放大":
         return f"ROI {roi:.2f} ≥ 放量线 {grow:.2f}（保本 {be:.2f}）：加预算 20~30%，可复制到同款 SKU"
     if t == "优化":
@@ -1048,14 +1055,16 @@ def _cost_tip(s) -> str:
     if s.get("costSource") != "erp":
         return (f"未接入该 SKU 真实成本：保本线按全店 Excel 口径 {_n(s.get('breakeven')):.2f}；"
                 f"毛利/件 = 前台件单价 × 全店毛利率")
+    be_txt = ("、<b>每件亏本 ⇒ 不存在保本 ROI（投得越多亏得越多）</b>"
+              if _n(s.get("breakeven")) <= 0
+              else f" ⇒ 保本 {_n(s.get('breakeven')):.2f}、放量 {_n(s.get('growLine')):.2f}")
     tip = (f"每件（ERP 真实口径）：到手结算价 ¥{_n(cp.get('supply'))}"
            f" ＝ 前台件单价 ¥{_n(cp.get('aov'))} × 到手率 {_n(cp.get('settleRate')) * 100:.0f}%"
            f"（扣点与京东差价已扣）"
            f"；− 货款 ¥{_n(cp.get('productCost'))} − 运费 ¥{_n(cp.get('shipping'))}"
            f" − 包材 ¥{_n(cp.get('package'))} − 人工 ¥{_n(cp.get('labor'))}"
            f" = 贡献 ¥{_n(cp.get('grossPerOrder'))}"
-           f" → 占前台成交额 {_n(cp.get('margin')) * 100:.1f}% ⇒ 保本 {_n(s.get('breakeven')):.2f}"
-           f"、放量 {_n(s.get('growLine')):.2f}"
+           f" → 占前台成交额 {_n(cp.get('margin')) * 100:.1f}%{be_txt}"
            f"；占到手结算价 {_n(cp.get('marginSettle')) * 100:.1f}%（ERP 毛利率口径）"
            f" ⇒ 到手结算口径保本 {_n(cp.get('breakevenSettle')):.2f}"
            f"。判定用前者：京准通报的 ROI 分子是<b>前台成交额</b>（实测广告客单价≈商智客单价）")
@@ -1092,6 +1101,9 @@ def _roi_tip(s, roi, be) -> str:
     """ROI 悬停：平台报的是前台成交额，顺手折算成「每花 1 元真正回到我们账户多少钱」。"""
     cp = s.get("costParams") or {}
     rate = _n(cp.get("settleRate"))
+    if _n(be) <= 0:
+        return ("每件到手结算价扣完成本后为负（卖一件亏一件），不存在保本 ROI；"
+                "这里的 ROI 只是平台口径换算，不能当成「回本」")
     if s.get("costSource") != "erp" or rate <= 0:
         return "广告 ROI = 前台成交额 ÷ 花费（平台口径）"
     return (f"前台口径：ROI {roi:.2f}（分子是消费者实付）vs 保本 {be:.2f} ⇒ 判定用这一对\n"
@@ -1108,6 +1120,27 @@ def _natural_qty(m) -> float:
     return max(q - _n(m.get("ord")), 0.0)
 
 
+def _natural_ok(m) -> bool:
+    """商智成交 ≥ 广告成交 时，「相减」才有意义。
+
+    商智的成交 T+1 只结算约一半，最近几天的商智成交常常小于广告成交；
+    这时 szAmt − amt 会被夹成 0，看起来像「完全没有自然成交」，所以改判为不可算。
+    阈值与 analyze2 的 adShare 一致（≤110%）。
+    """
+    sz, ad = _n(m.get("szAmt")), _n(m.get("amt"))
+    return sz > 0 and ad <= sz * 1.1
+
+
+def _be_txt(be, starred=False) -> str:
+    """保本 ROI 显示：≤0 表示每件毛利为负，保本线不存在 —— 显示「亏本」而不是 0.00。"""
+    b = _n(be)
+    if b <= 0:
+        return ('<span class="mini" style="color:var(--redink)" '
+                'title="每件到手结算价 − 货款 − 运费 − 包材 − 人工 ≤ 0：卖一件亏一件，'
+                '不存在保本 ROI（投得越多亏得越多）">亏本</span>')
+    return f'{b:.2f}{"*" if starred else ""}'
+
+
 def _sku_row(i, s, labels) -> str:
     cur = _latest(s)
     wk = _latest_key(s)
@@ -1120,6 +1153,23 @@ def _sku_row(i, s, labels) -> str:
     shops = "／".join(f'{_e(k)} ¥{_money(v)}' for k, v in (s.get("shops") or {}).items())
     spark = _spark([s["wins"][k]["roi"] for k in ("w0", "w1", "w2")], be)
     tier = s["verdict"]["tier"]
+    nat_ok = _natural_ok(cur)
+    if nat_ok:
+        nat_html = (f'{_money(cur.get("naturalAmt"))}'
+                    f'<span class="qtysub"> {_num(_natural_qty(cur), 0)}件</span>')
+        nat_tip = "自然成交＝商智总成交 − 广告成交（金额口径）；件数为商智件数 − 广告订单数（近似）"
+        sz_attr = net_attr = ""
+        mark = ""
+    else:
+        # 商智 T+1 只出约一半，这时「商智 − 广告」会被夹成 0，看着像没有自然成交；
+        # 与其显示一个假的 0，不如标成未定稿（—/*），等商智回补后再看。
+        nat_html = '<span class="mini">—</span>'
+        nat_tip = ("商智成交 < 广告成交：商智 T+1 只结算约一半（T+2~T+3 才定稿），"
+                   "两个口径对不上，相减没有意义，故不给自然成交")
+        sz_attr = (' title="商智成交还没出全（T+1 约一半），件数同理；'
+                   '最近 1~2 天属正常滞后，2~3 天后自动补齐"')
+        net_attr = ' title="商智成交未出全，净利按广告成交兜底估算，会偏低；等商智回补后再看"'
+        mark = "*"
     return (
         f'<tr data-tier="{_e(tier)}" data-acct="{_e(accts)}">'
         f'<td class="mono">{i}</td>'
@@ -1131,7 +1181,7 @@ def _sku_row(i, s, labels) -> str:
         f'<td class="mono" data-v="{_n(cur["amt"])}">{_money(cur["amt"])}</td>'
         f'<td class="mono {_roi_cls(roi, be)}" data-v="{roi}" title="{_e(_roi_tip(s, roi, be))}">{roi:.2f}</td>'
         f'<td class="mono" data-v="{be}" title="{_e(_cost_tip(s))}">'
-        f'{be:.2f}{"*" if s.get("costSource") != "erp" else ""}</td>'
+        f'{_be_txt(be, starred=(s.get("costSource") != "erp"))}</td>'
         f'<td class="mono" data-v="{_n(cur["ord"])}">{int(_n(cur["ord"]))}</td>'
         f'<td class="mono" data-v="{_n(cur["cpa"])}">{_num(cur["cpa"], 2)}</td>'
         f'<td class="mono" data-v="{_n(s.get("unitPrice"))}" '
@@ -1141,14 +1191,13 @@ def _sku_row(i, s, labels) -> str:
         f'{_supply_cell(s)}'
         f'<td class="mono" data-v="{_n(s["grossPerOrder"])}" title="{_e(_cost_tip(s))}">{_num(s["grossPerOrder"], 1)}</td>'
         f'<td class="mono" data-v="{_n(cur.get("adShare"))}">{_pct(cur.get("adShare"))}</td>'
-        f'<td class="mono" data-v="{_n(cur.get("szAmt"))}">{_money(cur.get("szAmt"))}'
-        f'<span class="qtysub"> {_num(_n(cur.get("szQty")), 0)}件</span></td>'
-        f'<td class="mono" data-v="{_n(cur.get("naturalAmt"))}" '
-        f'title="自然成交＝商智总成交 − 广告成交（金额口径）；件数为商智件数 − 广告订单数（近似）">'
-        f'{_money(cur.get("naturalAmt"))}'
-        f'<span class="qtysub"> {_num(_natural_qty(cur), 0)}件</span></td>'
+        f'<td class="mono" data-v="{_n(cur.get("szAmt"))}"{sz_attr}>{_money(cur.get("szAmt"))}'
+        f'<span class="qtysub"> {_num(_n(cur.get("szQty")), 0)}件{mark}</span></td>'
+        f'<td class="mono" data-v="{_n(cur.get("naturalAmt")) if nat_ok else 0}" title="{_e(nat_tip)}">'
+        f'{nat_html}</td>'
         f'<td class="mono {"up" if _n(s["est"][wk]["netProfit"]) > 0 else "down"}" '
-        f'data-v="{_n(s["est"][wk]["netProfit"])}">{_money(s["est"][wk]["netProfit"])}</td>'
+        f'data-v="{_n(s["est"][wk]["netProfit"])}"{net_attr}>'
+        f'{_money(s["est"][wk]["netProfit"])}{mark}</td>'
         f'<td data-v="{roi}">{spark}</td>'
         f'<td class="l" title="{_e(_sku_advice(s))}">{_badge(tier)}</td>'
         f'</tr>')
@@ -1200,6 +1249,8 @@ def page_sku(d) -> str:
     ROI 高于它才值得继续投（两者同一前台口径，可直接比大小）。标 <b>*</b> 表示 ERP 无此 SKU，按全店口径线判。
     「商智总成交」下方为该商品<b>全店全渠道成交件数</b>，「自然成交」下方为
     <b>自然成交件数</b>（商智件数 − 广告订单数，近似）。
+    <b>商智成交 &lt; 广告成交</b>时（商智 T+1 只结算约一半）两个口径对不上，
+    自然成交显示 <b>—</b>、预估净利标 <b>*</b>（按广告成交兜底、会偏低），2~3 天后自动恢复正常。
     「毛利/件」= 每卖一件真正赚到的钱（未扣广告费），算法是
     到手结算价 − 货款 − 运费 − 包材 − 人工，其中到手结算价 ≈ 前台件单价 × 到手率（7~9 成）。
     「商智成交」会补：商智的成交额/件数在 T+1 只结算约一半，T+2~T+3 才定稿
@@ -1743,7 +1794,7 @@ def page_playbook(d) -> str:
             f'<td class="l">{_e(p["typeLabel"])}</td>'
             f'<td class="mono">¥{_money(w["cost"])}</td>'
             f'<td class="mono {_roi_cls(w["roi"], p["breakeven"])}">{_n(w["roi"]):.2f}</td>'
-            f'<td class="mono">{_n(p["breakeven"]):.2f}</td>'
+            f'<td class="mono">{_be_txt(p["breakeven"])}</td>'
             f'<td class="mono">¥{c["cpc"]:.2f}<div class="mini">保本 {be_cpc}</div></td>'
             f'<td class="mono">{c["clicks_day"]:.0f}</td>'
             f'<td class="l">{words_cell}</td>'
@@ -1783,7 +1834,7 @@ def page_playbook(d) -> str:
   </div>
   <div class="sopmetrics">
     <span>花费 <b>¥{_money(m["cost"])}</b></span>
-    <span>ROI <b class="{_roi_cls(m["roi"], p["breakeven"])}">{_n(m["roi"]):.2f}</b> / 保本 {_n(p["breakeven"]):.2f}</span>
+    <span>ROI <b class="{_roi_cls(m["roi"], p["breakeven"])}">{_n(m["roi"]):.2f}</b> / 保本 {_be_txt(p["breakeven"])}</span>
     <span>CTR <b>{_n(m["ctr"]):.2f}%</b></span>
     <span>CVR <b>{_n(m["cvr"]):.2f}%</b></span>
     <span>CPC <b>¥{c["cpc"]:.2f}</b></span>
@@ -1850,16 +1901,16 @@ def page_action(d) -> str:
     stop_rows = "".join(
         f'<tr><td class="l"><b>{_e(s["name"])}</b></td><td class="mono" data-v="{_n(s["cost"])}">¥{_money(s["cost"])}</td>'
         f'<td class="mono down" data-v="{_n(s["roi"])}">{_n(s["roi"]):.2f}</td>'
-        f'<td class="mono" data-v="{_n(s["breakeven"])}">{_n(s["breakeven"]):.2f}'
-        f'{"*" if s.get("costSource") != "erp" else ""}</td>'
+        f'<td class="mono" data-v="{_n(s["breakeven"])}">'
+        f'{_be_txt(s["breakeven"], starred=(s.get("costSource") != "erp"))}</td>'
         f'<td class="mono" data-v="{_n(s["netProfit"])}">¥{_money(s["netProfit"])}</td>'
         f'<td class="l">{_e(_sku_advice(next(x for x in d["skus"] if x["skuId"] == s["skuId"])))}</td></tr>'
         for s in stop)
     grow_rows = "".join(
         f'<tr><td class="l"><b>{_e(s["name"])}</b></td><td class="mono" data-v="{_n(s["cost"])}">¥{_money(s["cost"])}</td>'
         f'<td class="mono up" data-v="{_n(s["roi"])}">{_n(s["roi"]):.2f}</td>'
-        f'<td class="mono" data-v="{_n(s["breakeven"])}">{_n(s["breakeven"]):.2f}'
-        f'{"*" if s.get("costSource") != "erp" else ""}</td>'
+        f'<td class="mono" data-v="{_n(s["breakeven"])}">'
+        f'{_be_txt(s["breakeven"], starred=(s.get("costSource") != "erp"))}</td>'
         f'<td class="mono" data-v="{_n(s.get("growLine"))}">{_n(s.get("growLine")):.2f}</td>'
         f'<td class="mono" data-v="{_n(s.get("grossPerOrder"))}">{_num(s.get("grossPerOrder"), 1)}</td>'
         f'<td class="mono" data-v="{_n(s["cost"]) * 0.3}">¥{_money(_n(s["cost"]) * 0.3)}</td>'
