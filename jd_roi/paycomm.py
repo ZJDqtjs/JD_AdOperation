@@ -295,6 +295,78 @@ def fetch_creative_rows(page, start: str, end: str, account_id: int,
     return rows
 
 
+def fetch_kw_creative_sku_by_ad(page, page_size: int = 200) -> dict:
+    """推广管理创意列表 → {adId: skuId}。
+
+    创意报表（base/ad/list）部分创意的落地页是店铺页/活动页，解析不出 SKU；
+    推广管理这边每条创意直接带 skuId，用 adId 对回去就能补齐（已删计划补不了）。
+    """
+    out: dict[int, int] = {}
+    pno = 1
+    while pno <= 10:
+        payload = {"page": pno, "pageSize": page_size, "status": "", "filters": [],
+                   "creativeType": [], "obys": "",
+                   "startDay": settings.today().isoformat(),
+                   "endDay": settings.today().isoformat(), "clickOrOrderCaliber": 0,
+                   "clickOrOrderDay": 15, "giftFlag": 0, "orderStatusCategory": 1,
+                   "customColumns": ["campaignName", "skuId", "url"],
+                   "campaignId": "", "groupId": "", "putType": "", "requestFrom": 0}
+        try:
+            d = _post_atoms(page, MSA_AD_API, payload)
+        except Exception:  # noqa: BLE001
+            break
+        data = d.get("data") or {}
+        rows: list[dict] = []
+        for key in ("msaNormalAdReport", "msaSmartAdReport"):
+            rows.extend(((data.get(key) or {}).get("data") or []))
+        for r in rows:
+            try:
+                ad, sku = int(r.get("adId") or 0), int(r.get("skuId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ad and sku > 0:
+                out[ad] = sku
+        if len(rows) < page_size:
+            break
+        pno += 1
+        _sleep(DELAY_PAGE)
+    return out
+
+
+def fetch_creative_daily(page, start: str, end: str, account_id: int,
+                         page_size: int = 200) -> list[dict]:
+    """快车创意报表**按天**取：一次请求覆盖整个区间，每行带 date + cost + 落地页 SKU。
+
+    关键词计划的花费只有创意维度才分得开（一个计划推多个 SKU）；isDaily=True 时
+    响应行里带 `date`（如 20261105），可以本地按天拆开存进按天库。
+    行上的 `skuId` 由 sku_from_creative 从落地页补（报表本身没有 skuId 字段）。
+    """
+    rows: list[dict] = []
+    pno = 1
+    while pno <= 30:
+        payload = {
+            "isDaily": True, "startDay": start, "endDay": end,
+            "clickOrOrderCaliber": 0, "clickOrOrderDay": 30, "giftFlag": 0,
+            "orderStatusCategory": 1, "filters": [], "pinIds": [int(account_id)],
+            "creativeTypes": [], "deliveryType": 0,
+            "columns": ["cost", "clicks", "impressions", "totalOrderCnt", "totalOrderSum"],
+            "obys": "cost|desc", "page": pno, "pageSize": page_size,
+        }
+        d = _post_report(page, AD_LIST_API, payload)
+        batch = ((d.get("data") or {}).get("datas") or [])
+        for r in batch:
+            # 关键词创意（campaignType=2）和同一批计划里的「商品定向」创意（如 28）都要解析：
+            # 后者的花费在账号总额里、却不在关键词报表里，不解析就只能永远算未归因
+            if not r.get("skuId"):
+                r["skuId"] = sku_from_creative(r)
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        pno += 1
+        _sleep(DELAY_PAGE)
+    return rows
+
+
 def list_goods(page, start: str, end: str, page_size: int = 100) -> list[dict]:
     rows: list[dict] = []
     idx = 1

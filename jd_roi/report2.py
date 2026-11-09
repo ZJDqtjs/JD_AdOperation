@@ -372,6 +372,115 @@ function applySearch(input){
   card.dataset.q=input.value||'';
   cardFilter(card);
 }
+/* ---- SKU 图（ROI vs 保本线 / 广告渗透率）的卡片内筛选 ----
+   明细由 window.__SKUCHART 下发（账号 × 窗口），这里按「全部账号/单账号 + 前N + 关键词」
+   重算并 setOption，而不是整页跳转（跳页会把日期、滚动位置一起刷掉）。
+   「全部账号」= 各账号近周花费/成交/商智成交分别相加，ROI 与渗透率再按合计重算，
+   不能把各账号比率直接平均。 */
+function _skLatest(win){
+  var ks=(window.__SKUCHART||{}).wkeys||[], i, v;
+  for(i=ks.length-1;i>=0;i--){v=(win||{})[ks[i]]; if(v&&v.cost>0) return v;}
+  for(i=ks.length-1;i>=0;i--){v=(win||{})[ks[i]]; if(v) return v;}
+  return null;
+}
+function _skCalc(sk, ak){
+  var all=sk.a||{};
+  var use=(ak==='all')?Object.keys(all):(all[ak]?[ak]:[]);
+  var cost=0, amt=0, sz=0;
+  use.forEach(function(k){
+    var v=_skLatest(all[k]); if(!v) return;
+    cost+=v.cost||0; amt+=v.amt||0; sz+=v.szAmt||0;
+  });
+  var share=(sz>0)?Math.round(amt/sz*1000)/10:null;
+  if(share!==null && share>110) share=null;   /* 广告成交>店铺成交：口径不可比，不给值 */
+  return {cost:cost, roi:cost?Math.round(amt/cost*100)/100:0, share:share};
+}
+function skuChartRender(card){
+  if(!card.dataset.skc){
+    var bar=card.querySelector('.toolbar[data-skc]');
+    if(bar) card.dataset.skc=bar.dataset.skc;
+  }
+  var cid=card.dataset.skc, el=document.getElementById(cid);
+  var ch=window.__CH&&window.__CH[cid], p=window.__SKUCHART;
+  if(!el||!ch||!p) return;
+  var ak=card.dataset.ak||'all', q=(card.dataset.q||'').trim();
+  var n=parseInt(card.dataset.n||'15',10);
+  var rows=[];
+  (p.rows||[]).forEach(function(sk){
+    if(q && !matchQuery(sk.name+' '+sk.id, q)) return;
+    var m=_skCalc(sk, ak);
+    if(cid==='chSkuRoi'){ if(!(m.cost>0)) return; rows.push({n:sk.name, v:m.roi, be:sk.be, c:m.cost}); }
+    else { if(m.share===null) return; rows.push({n:sk.name, v:m.share, be:sk.be, c:m.cost}); }
+  });
+  var total=rows.length;
+  rows.sort(function(a,b){return b.c-a.c;});          /* 按花费排序，切账号后仍然「花费前 N」 */
+  if(n>0) rows=rows.slice(0,n);
+  rows.reverse();                                      /* ECharts 类目轴自下而上，倒过来才是花费高的在上 */
+  var names=rows.map(function(r){return (r.n||'').slice(0,16);});
+  var opt;
+  if(cid==='chSkuRoi'){
+    opt={tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},
+      legend:{data:['实际ROI','保本ROI'],top:0},
+      grid:{left:130,right:50,top:40,bottom:30},
+      xAxis:{type:'value',name:'ROI'},
+      yAxis:{type:'category',data:names,axisLabel:{fontSize:11}},
+      series:[
+        {name:'实际ROI',type:'bar',barMaxWidth:16,
+         label:{show:true,position:'right',fontSize:11},
+         data:rows.map(function(r){
+           return {value:Math.round(r.v*100)/100,
+                   itemStyle:{color:(r.be>0&&r.v>=r.be)?'#5db872':'#c64545'}};})},
+        {name:'保本ROI',type:'bar',barMaxWidth:16,
+         itemStyle:{color:'#d9d2c7'},label:{show:true,position:'right',fontSize:11},
+         data:rows.map(function(r){return Math.round(r.be*100)/100;})}]};
+  }else{
+    opt={tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},
+      grid:{left:130,right:60,top:24,bottom:30},
+      xAxis:{type:'value',name:'广告成交/店铺成交 %',max:100},
+      yAxis:{type:'category',data:names,axisLabel:{fontSize:11}},
+      series:[{type:'bar',barMaxWidth:16,
+        itemStyle:{color:'#5db8a6',borderRadius:[0,4,4,0]},
+        label:{show:true,position:'right',fontSize:11,formatter:'{c}%'},
+        data:rows.map(function(r){return Math.round(r.v*10)/10;}),
+        markLine:{silent:true,symbol:'none',lineStyle:{color:'#c64545',type:'dashed'},
+                  data:[{xAxis:100,label:{formatter:'广告=自然'}}]}}]};
+  }
+  /* 条数变了要跟着改画布高度，否则「全部」会把 100 条压成糊 */
+  el.style.height=Math.max(430, rows.length*26+80)+'px';
+  opt.textStyle={fontFamily:'-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif',color:'#3d3d3a'};
+  ch.setOption(opt,true);
+  ch.resize();
+  var lab=card.querySelector('.srchcount');
+  if(lab) lab.textContent='显示 '+rows.length+' / '+total+' 个';
+}
+function skuChartAcct(btn){
+  var card=btn.closest('.card');
+  card.querySelectorAll('.chip[data-ak]').forEach(function(c){c.classList.remove('on');});
+  btn.classList.add('on');
+  card.dataset.ak=btn.dataset.ak||'all';
+  skuChartRender(card);
+}
+function skuChartN(sel){
+  var card=sel.closest('.card');
+  card.dataset.n=sel.value||'15';
+  skuChartRender(card);
+}
+function skuChartSearch(input){
+  var card=input.closest('.card');
+  card.dataset.q=input.value||'';
+  skuChartRender(card);
+}
+function skuChartInit(){
+  if(!window.__SKUCHART) return;
+  document.querySelectorAll('.toolbar[data-skc]').forEach(function(bar){
+    var card=bar.closest('.card');
+    if(!card) return;
+    card.dataset.skc=bar.dataset.skc;   /* 卡片本身要知道画哪张图（data-skc 在工具条上） */
+    card.dataset.ak='all';
+    card.dataset.n='15';
+    skuChartRender(card);
+  });
+}
 function applyWordType(btn){
   var val=btn.dataset.w; var card=btn.closest('.card');
   card.querySelectorAll('.toolbar .chip').forEach(function(c){c.classList.remove('on');});
@@ -422,6 +531,7 @@ function initCharts(){
     var opt=c.option||{}; opt.textStyle={fontFamily:'-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif',color:'#3d3d3a'};
     var ch=echarts.init(el); ch.setOption(opt); window.__CH[c.id]=ch;
   });
+  if(typeof skuChartInit==='function') skuChartInit();
   if(typeof indInit==='function') indInit();
   window.addEventListener('resize',function(){
     Object.keys(window.__CH).forEach(function(k){try{window.__CH[k].resize();}catch(e){}});});
@@ -613,12 +723,16 @@ def build_charts(d):
                   {"type": "value", "name": "ROI", "splitLine": {"show": False}}],
         "series": series}})
 
-    # 3) SKU：实际 ROI vs 保本 ROI（花费前 15）
-    skus = [s for s in d["skus"] if _n(_latest(s)["cost"]) > 0][:15]
+    # 3) SKU：实际 ROI vs 保本 ROI（默认花费前 15，卡片内可切账号 / 前 N / 搜索）
+    #    排序按「近周花费」而不是 d["skus"] 的原始顺序，切账号后口径才一致；
+    #    保本线为 0（卖一件亏一件）也涂红，与页面 _roi_cls 的判定保持一致。
+    skus = sorted([s for s in d["skus"] if _n(_latest(s)["cost"]) > 0],
+                  key=lambda s: -_n(_latest(s)["cost"]))[:15]
     names = [(s["name"] or s["skuId"])[:16] for s in skus][::-1]
     roi = [round(_n(_latest(s)["roi"]), 2) for s in skus][::-1]
     be = [round(_n(s["breakeven"]), 2) for s in skus][::-1]
-    colors = ["#5db872" if _n(_latest(s)["roi"]) >= _n(s["breakeven"]) else "#c64545" for s in skus][::-1]
+    colors = ["#5db872" if (_n(s["breakeven"]) > 0 and _n(_latest(s)["roi"]) >= _n(s["breakeven"]))
+              else "#c64545" for s in skus][::-1]
     charts.append({"id": "chSkuRoi", "option": {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
         "legend": {"data": ["实际ROI", "保本ROI"], "top": 0},
@@ -633,8 +747,9 @@ def build_charts(d):
              "itemStyle": {"color": "#d9d2c7"},
              "label": {"show": True, "position": "right", "fontSize": 11}}]}})
 
-    # 4) 广告渗透率
-    pen = [s for s in d["skus"] if s["wins"]["w2"].get("adShare") or s["wins"]["w1"].get("adShare")][:15]
+    # 4) 广告渗透率（同样默认花费前 15；没商智成交的商品渗透率不可算，不进图）
+    pen = sorted([s for s in d["skus"] if _latest(s).get("adShare") is not None],
+                 key=lambda s: -_n(_latest(s)["cost"]))[:15]
     pnames = [(s["name"] or s["skuId"])[:16] for s in pen][::-1]
     pval = [round(_n(_latest(s).get("adShare")), 1) for s in pen][::-1]
     charts.append({"id": "chShare", "option": {
@@ -739,6 +854,54 @@ def build_charts(d):
 
 def _chart_html(cid, tall=False):
     return f'<div class="chart{" tall" if tall else ""}" id="{cid}"></div>'
+
+
+def sku_chart_payload(d) -> dict:
+    """两张 SKU 图的下发数据：按「账号 × 窗口」保存明细，供卡片内切账号 / 搜索 / 前 N。
+
+    原来 build_charts 里直接 `[:15]` 切死，页面因此只有固定几个商品、也没有账号筛选。
+    这里把同一个 SKU 在各账号的近周花费、ROI、渗透率一起给前端，图表自己重算。
+    """
+    rows = []
+    for s in d["skus"]:
+        ba = s.get("byAcctWins") or {}
+        if not ba:
+            continue
+        rows.append({
+            "id": s["skuId"], "name": s["name"] or s["skuId"],
+            "be": round(_n(s.get("breakeven")), 2),
+            "a": {ak: {wk: {"cost": round(_n(v.get("cost")), 2),
+                            "amt": round(_n(v.get("amt")), 2),
+                            "szAmt": round(_n(v.get("szAmt")), 2),
+                            "roi": round(_n(v.get("roi")), 2),
+                            "share": (round(_n(v.get("adShare")), 1)
+                                      if v.get("adShare") is not None else None)}
+                   for wk, v in (wins or {}).items()}
+                  for ak, wins in ba.items()},
+        })
+    return {"rows": rows,
+            "wkeys": [w["key"] for w in d["meta"]["windows"]],
+            "accounts": [{"key": a["key"], "label": a["label"]} for a in _data_accs(d)]}
+
+
+def _sku_chart_bar(cid, d) -> str:
+    """SKU 图卡片内的筛选条：账号 chips + 前 N + 关键词（与交叉表那套 chips 视觉一致）。"""
+    chips = "".join(
+        f'<div class="chip{" on" if i == 0 else ""}" data-ak="{_e(k)}" '
+        f'onclick="skuChartAcct(this)">{_e(v)}</div>'
+        for i, (k, v) in enumerate([("all", "全部账号")] +
+                                   [(a["key"], a["label"]) for a in _data_accs(d)]))
+    return f"""<div class="toolbar" data-skc="{cid}">
+  {chips}<span style="width:12px"></span>
+  <label class="mini">显示
+    <select onchange="skuChartN(this)">
+      <option value="15">前 15</option><option value="30">前 30</option>
+      <option value="50">前 50</option><option value="0">全部</option>
+    </select></label>
+  <input type="text" class="srch" placeholder="🔍 搜商品名 / SKU（「；」任一命中）"
+         oninput="skuChartSearch(this)">
+  <span class="mini srchcount"></span>
+</div>"""
 
 
 def _kpi(label, main, sub="", cls="") -> str:
@@ -846,7 +1009,11 @@ def page_overview(d) -> str:
 <div class="card">
   <h2>口径与成本假设 <span class="tagline">重要：这些是推算值</span></h2>
   <div class="note">
-    <b>数据口径</b>：广告=京准通概览（点击15天/成交订单）；智能投放=智能投放报表；商智=各店铺成交口径。
+    <b>数据口径</b>：广告=京准通概览（点击15天/成交订单）；智能投放=智能投放报表；
+    <b>SKU 花费 = 智能投放 ＋ 全站智能推广 ＋ 关键词计划</b>（关键词/商品定向按快车创意报表的
+    落地页 SKU 归因，推广管理创意接口兜底；归不到的单独列未归因，不摊到商品上）；商智=各店铺成交口径，
+    且成交额/件数<b>次日只结算约一半、T+2~T+3 才定稿</b>（流量指标 T+1 就是终值），
+    最近 15 天每晚重抓，更早的天不再变动。
     搜索词报表按「花费」降序取前 2000 行，覆盖约 99.9% 花费。
   </div>
   {_source_note(d)}
@@ -899,6 +1066,16 @@ def _cost_tip(s) -> str:
     return tip
 
 
+def _cost_split_tip(s, cur) -> str:
+    """花费的来源拆分：智能投放 / 全站智能推广 / 关键词计划（按创意 SKU 归因）。"""
+    kw = _n((s.get("kwCost") or {}).get(_latest_key(s)))
+    if kw <= 0:
+        return "花费＝智能投放商品报表 ＋ 全站智能推广（本商品本期没有归到关键词计划）"
+    return (f"花费＝智能投放 ＋ 全站智能推广 ＋ 关键词计划；"
+            f"其中关键词/商品定向 ¥{_money(kw)}"
+            f"（按快车创意报表的落地页 SKU 归因，推广管理创意接口兜底）")
+
+
 def _supply_cell(s) -> str:
     cp = s.get("costParams") or {}
     if s.get("costSource") != "erp":
@@ -947,7 +1124,8 @@ def _sku_row(i, s, labels) -> str:
         f'<td class="l"><div class="prod">{img}<div><div class="nm" title="{_e(s["name"])}｜{_e(shops)}">'
         f'{_e(s["name"])}</div><div class="sid">{_e(s["skuId"])}</div></div></div></td>'
         f'<td class="l">{pills or "—"}</td>'
-        f'<td class="mono" data-v="{_n(cur["cost"])}">{_money(cur["cost"])}</td>'
+        f'<td class="mono" data-v="{_n(cur["cost"])}" title="{_e(_cost_split_tip(s, cur))}">'
+        f'{_money(cur["cost"])}</td>'
         f'<td class="mono" data-v="{_n(cur["amt"])}">{_money(cur["amt"])}</td>'
         f'<td class="mono {_roi_cls(roi, be)}" data-v="{roi}" title="{_e(_roi_tip(s, roi, be))}">{roi:.2f}</td>'
         f'<td class="mono" data-v="{be}" title="{_e(_cost_tip(s))}">'
@@ -992,6 +1170,19 @@ def page_sku(d) -> str:
     achips = "".join(
         f'<div class="chip{" on" if k == "all" else ""}" data-a="{k}" onclick="applyAcct(this)">{v}</div>'
         for k, v in [("all", "全部账号")] + [(a["key"], a["label"]) for a in _data_accs(d)])
+    kwk = "w2" if any(_n(s["wins"]["w2"]["cost"]) > 0 for s in skus) else "w1"
+    kw = (d["meta"].get("kwSpend") or {}).get(kwk) or {}
+    kw_note = ""
+    if _n(kw.get("total")) > 0:
+        if _n(kw.get("unattr")) > 0.5:
+            kw_note = (f'<br>花费口径 = 智能投放 ＋ 全站智能推广 ＋ 关键词计划。本期关键词计划共 '
+                       f'¥{_money(kw.get("total"))}，其中 ¥{_money(kw.get("attributed"))} 已按创意 '
+                       f'SKU 归到商品，<b>¥{_money(kw.get("unattr"))} 归不到商品</b>'
+                       f'（一个计划推多个 SKU / 计划已删或已下线），未计入上表 —— '
+                       f'这几笔钱在账号总额里，但拆不到具体商品。')
+        else:
+            kw_note = (f'<br>花费口径 = 智能投放 ＋ 全站智能推广 ＋ 关键词计划；本期关键词计划 '
+                       f'¥{_money(kw.get("total"))} 已全部按创意 SKU 归到商品。')
     return f"""
 <div class="card">
   <h2>商品 ROI 交叉表 <span class="tagline">按 SKU 合并两个账号的广告，商智成交分店展示</span></h2>
@@ -1008,6 +1199,9 @@ def page_sku(d) -> str:
     <b>自然成交件数</b>（商智件数 − 广告订单数，近似）。
     「毛利/件」= 每卖一件真正赚到的钱（未扣广告费），算法是
     到手结算价 − 货款 − 运费 − 包材 − 人工，其中到手结算价 ≈ 前台件单价 × 到手率（7~9 成）。
+    「商智成交」会补：商智的成交额/件数在 T+1 只结算约一半，T+2~T+3 才定稿
+    （流量指标不受影响），所以最近 15 天每晚重抓，更早的天不再变动；
+    最近 1~2 天的成交会低于商智当前值，属正常滞后。{kw_note}
   </p>
   <div class="toolbar" id="skuChips">{chips}<span style="width:14px"></span>{achips}
     <span style="width:10px"></span>
@@ -1038,14 +1232,18 @@ def page_sku(d) -> str:
 </div>
 
 <div class="card">
-  <h2>ROI vs 保本线 <span class="tagline">花费前 15 的 SKU</span></h2>
-  <p class="hint">绿色=实际 ROI 达到该商品自己的保本线；红色=低于保本线，广告纯亏。</p>
+  <h2>ROI vs 保本线 <span class="tagline">按近周花费排序，默认前 15 的 SKU</span></h2>
+  <p class="hint">绿色=实际 ROI 达到该商品自己的保本线；红色=低于保本线（或保本线为 0），广告纯亏。
+    默认统计所选账号合并后的结果，卡片内可切单个账号、改显示条数、搜商品。</p>
+  {_sku_chart_bar("chSkuRoi", d)}
   {_chart_html("chSkuRoi", tall=True)}
 </div>
 
 <div class="card">
   <h2>广告渗透率 <span class="tagline">广告成交 ÷ 该商品店铺总成交</span></h2>
-  <p class="hint">越低说明越靠自然流量；接近 100% 说明这个商品的成交基本靠广告买来，一旦停投会掉量。</p>
+  <p class="hint">越低说明越靠自然流量；接近 100% 说明这个商品的成交基本靠广告买来，一旦停投会掉量。
+    没投广告或该区间无商智成交的商品不会出现在图里（渗透率不可算），可用搜索定位具体商品。</p>
+  {_sku_chart_bar("chShare", d)}
   {_chart_html("chShare", tall=True)}
 </div>
 """
@@ -2758,6 +2956,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
            ai=None) -> str:
     charts = build_charts(d)
     chart_json = json.dumps(charts, ensure_ascii=False).replace("</", "<\\/")
+    sku_chart_json = json.dumps(sku_chart_payload(d), ensure_ascii=False).replace("</", "<\\/")
     echarts_src = _echarts_src()
     ind = d.get("industry") or {}
     # 行业大盘补齐时**不能**再用 <meta http-equiv="refresh">：那是整页定时刷新，
@@ -2817,6 +3016,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
 <script>{JS}</script>
 <script>{AI_JS}</script>
 <script>window.__CHARTS={chart_json};</script>
+<script>window.__SKUCHART={sku_chart_json};</script>
 <script>window.__IND_PENDING = {'true' if ind_pending else 'false'};</script>
 <script>{IND_JS}</script>
 </body></html>"""

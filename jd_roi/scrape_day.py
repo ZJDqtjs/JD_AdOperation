@@ -39,6 +39,14 @@ _JST_KEY = {"jst_campaign": "campaign", "jst_sku": "sku", "jst_searchword": "sea
 SZ_KINDS = {"sz_product", "sz_flow"}
 # 与夜间补数窗口一致（JD_REFRESH_DAYS，默认 15）：窗口内的 0 行天会被反复重试，直到拿到数据
 EMPTY_RETRY_DAYS = max(int(getattr(settings, "REFRESH_DAYS", 15) or 15), 7)
+# 商智的「成交」不是当天定稿（实测 2026-11-09，同一账号同一请求）：
+#   T+1 早上抓  → 成交 ≈ 终值的 52%~55%（10-23 31,253→58,147；10-24 28,571→56,118）
+#   T+3 抓      → 已与现在逐分一致（10-25 55,084 = 55,084）
+#   T+6/T+8 抓  → 同样一致（10-20、10-22）
+#   流量指标（访客/浏览量）在 T+1 就已是终值，所以不是「抓了白天半截」，而是成交结算滞后。
+# 以前「文件非空就跳过」会把每一天永久冻结在 T+1 那半个数上（长期偏低 45%+）。
+# 所以最近 SZ_REFETCH_DAYS 天必须每晚重抓。
+SZ_REFETCH_DAYS = max(int(getattr(settings, "REFRESH_DAYS", 15) or 15), 7)
 # 允许直接传接口短名（campaign/sku/searchword），避免调用方传错 key 时静默失败
 _JST_KEY.update({v: v for v in ("campaign", "sku", "searchword")})
 
@@ -703,6 +711,18 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
             acc_sum = {"label": label, "days": {}, "errors": []}
             summary["accounts"][key] = acc_sum
             todo = [d for d in days if force or not _day_complete(key, d, kinds)]
+            # 商智成交会回补：最近 SZ_REFETCH_DAYS 天即使「齐全」也要重抓，否则数永远停在旧快照
+            sz_since = (ds.today() - dt.timedelta(days=SZ_REFETCH_DAYS - 1)).isoformat()
+            sz_recent = set()
+            if SZ_KINDS & set(kinds):
+                sz_recent = {d for d in days if d >= sz_since}
+                if sz_recent:
+                    todo = sorted(set(todo) | sz_recent)
+            # kw_ad（关键词创意按天）是可选源，不参与 _day_complete 判定；但关键词创意报表
+            # 一次区间请求就覆盖全部天数、还能补上「已删计划」和之前解析不出 SKU 的创意，
+            # 所以只要请求里带了 kw/kw_ad，就把这些天都放进待办（其余数据源会各自跳过）。
+            if "kw" in kinds or "kw_ad" in kinds:
+                todo = sorted(set(todo) | set(days))
             # 分时(hourly)是「可选」数据源，_day_complete 刻意不看它（否则历史天永远算不完整）。
             # 这里单独把需要抓分时的天补进待办，否则「只抓分时」或「历史天齐全但缺昨天分时」会被整体跳过。
             if h_days:
@@ -728,7 +748,8 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                 p_jzt.goto("https://jzt.jd.com/jst/#/report/account",
                            wait_until="domcontentloaded", timeout=90000)
                 p_jzt.wait_for_timeout(9000)
-                need_kw = [k for k in ("kw",) if k in kinds]
+                # kw 报表和 kw_ad（关键词创意）都从关键词报表页取，kw_ad 还要用推广管理接口兜 SKU
+                need_kw = bool({"kw", "kw_ad"} & set(kinds))
                 if need_kw:
                     p_kw.goto("https://jzt.jd.com/report/index.html/#/overview/page", wait_until="domcontentloaded", timeout=90000)
                     p_kw.wait_for_timeout(7000)
@@ -754,6 +775,48 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                             acc_sum["errors"].append(f"{kind}: {exc}")
                             log(f"[{label}] {kind} 失败：{exc}")
 
+                # --- 关键词创意（按天）：关键词报表只有「计划+词」，创意报表才带落地页 SKU。
+                #     一次 isDaily 请求覆盖整个区间，按 date 拆成按天落盘，SKU 表用它把关键词花费
+                #     归到具体商品（含已删计划；解析不到 SKU 的创意算「未归因」）。
+                if "kw" in kinds or "kw_ad" in kinds:
+                    try:
+                        from .paycomm import fetch_creative_daily, fetch_kw_creative_sku_by_ad
+                        # 有些创意的落地页是店铺页/活动页，报表行解析不出 SKU；
+                        # 用推广管理创意列表的 adId→skuId 兜一下（已删计划补不了，算未归因）
+                        try:
+                            admap = fetch_kw_creative_sku_by_ad(p_kw)
+                        except Exception as exc:  # noqa: BLE001
+                            admap = {}
+                            log(f"[{label}] 创意→SKU 兜底映射失败：{exc}")
+                        kw_rows = fetch_creative_daily(p_jzt, start, end,
+                                                       acct.get("account_id") or 0)
+                        for r in kw_rows:
+                            if str(r.get("skuId") or "") in ("", "0", "None"):
+                                try:
+                                    r["skuId"] = admap.get(int(r.get("adId") or 0), 0)
+                                except (TypeError, ValueError):
+                                    r["skuId"] = 0
+                        by_day = {}
+                        for r in kw_rows:
+                            d0 = str(r.get("date") or r.get("clickDate") or "")
+                            if len(d0) == 8 and d0.isdigit():
+                                d0 = f"{d0[:4]}-{d0[4:6]}-{d0[6:]}"
+                            by_day.setdefault(d0[:10], []).append(r)
+                        n = 0
+                        for day in days:
+                            if day not in by_day:
+                                continue
+                            ds.save_day(key, day, "kw_ad", {"rows": by_day[day],
+                                                           "dateStart": day, "dateEnd": day})
+                            acc_sum["days"].setdefault(day, []).append("kw_ad")
+                            n += 1
+                        log(f"[{label}] 关键词创意按天拆分：{n} 天 / {len(kw_rows)} 行")
+                    except Exception as exc:  # noqa: BLE001
+                        acc_sum["errors"].append(f"kw_ad: {exc}")
+                        log(f"[{label}] 关键词创意报表失败：{exc}")
+
+                # 商智的会话（动态签名头）复用到整个账号：以前每天新建一次 SzFetcher，
+                # 等于每天白等两次 14 秒的 capture；回刷 80 天时这一项就多花半小时。
                 sz = {}
                 for day in todo:
                     if _stopped():
@@ -790,20 +853,27 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                     for kind in ("sz_product", "sz_flow"):
                         if kind not in kinds:
                             continue
-                        if not force and _has_good_day(key, day, kind):
+                        # 最近 N 天的商智一律重抓（成交在回补），老天才按「有数据就跳过」
+                        if not force and day not in sz_recent and _has_good_day(key, day, kind):
                             continue
                         if kind not in sz:
                             sz[kind] = SzFetcher(context, "flow" if kind == "sz_flow" else "product")
                         try:
-                            ds.save_day(key, day, kind, sz[kind].fetch(day))
+                            payload = sz[kind].fetch(day)
+                            # 三次都失败时 fetch() 会返回空 rows/core；此时绝不能覆盖已有的好数据
+                            # （否则回刷老区间会把原本能看的数洗成 0 行）
+                            if not (payload.get("rows") or payload.get("core")) \
+                                    and _has_good_day(key, day, kind):
+                                raise RuntimeError("接口返回空，保留原数据")
+                            ds.save_day(key, day, kind, payload)
                             got.append(kind)
                         except Exception as exc:  # noqa: BLE001
                             acc_sum["errors"].append(f"{kind}@{day}: {exc}")
-                    for f in sz.values():
-                        f.close()
-                    sz = {}
                     acc_sum["days"][day] = acc_sum["days"].get(day, []) + got
                     log(f"[{label}] {day} 完成：{','.join(got) if got else '全部已存在'}")
+                for f in sz.values():
+                    f.close()
+                sz = {}
 
                 if "oplog" in kinds:
                     try:

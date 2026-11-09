@@ -239,8 +239,12 @@ def main() -> int:
 
     res = scrape_day.scrape(settings.ACCOUNTS, DAYS[0], DAYS[-1], log=lambda m: None)
     check("两个账号都跑了", len(res["accounts"]), 2)
+    # 只断言本测试打了桩、且不受环境开关影响的数据源：
+    #   crowd/area 依赖 config/report_templates 模板、hourly 依赖 HOURLY_ENABLED、
+    #   kw_ad 是「可选」源（一次区间请求拆天，缺失不影响当天是否算抓全）
     for acct in ("main", "b"):
-        for kind in ds.KINDS:
+        for kind in ("jzt_campaign", "jst_campaign", "jst_sku", "kw",
+                     "sz_product", "sz_flow", "oplog"):
             check(acct + "/" + kind + " 入库天数", len(ds.days_for(acct, kind)), 3)
 
     calls = {"n": 0}

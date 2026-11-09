@@ -99,7 +99,7 @@ async def _prefix_urls(request: Request, call_next):
 
 KINDS_UI = [("jzt_campaign", "概览计划"), ("jst_campaign", "投放计划"),
             ("jst_sku", "投放商品"), ("jst_searchword", "搜索词"),
-            ("kw", "关键词"), ("sz_product", "商智商品"),
+            ("kw", "关键词"), ("kw_ad", "关键词创意(按品)"), ("sz_product", "商智商品"),
             ("sz_flow", "商智流量"), ("oplog", "操作日志"),
             ("hourly", "分时")]
 
