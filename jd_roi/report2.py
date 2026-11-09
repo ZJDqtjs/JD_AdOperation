@@ -2229,6 +2229,50 @@ function genAi(btn, start, end, keys){
 }
 """
 
+# 行业大盘补齐的「补完自动刷新」：只轮询、且仅在⑧行业大盘页签且用户没在输入时才刷新。
+# 以前用 <meta http-equiv="refresh" content="20"> 无条件整页刷新，用户正在搜索框里打字、
+# 或者正在看别的页签，20 秒一到页面就被刷掉（输入和滚动位置全丢）。
+IND_JS = """
+(function(){
+  var TIMER=null, TRIES=0, MAX=60, SAW=false;   // 8s x 60 ≈ 8 分钟还没补完就不再等它
+  function typing(){
+    var a=document.activeElement;
+    return !!(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+  }
+  function onIndTab(){
+    var p=document.getElementById('p-ind');
+    return !!(p && p.classList.contains('active'));
+  }
+  function stop(){ if(TIMER){ clearInterval(TIMER); TIMER=null; } }
+  function tick(){
+    fetch('/api/industry/status').then(function(r){ return r.json(); }).then(function(j){
+      TRIES++;
+      if(j && j.running){ SAW=true; }
+      else{
+        stop();
+        // 只刷新「亲眼看到它在跑、然后跑完了」的情况：如果切过来时任务早就结束，
+        // 就不该把用户从行业大盘页刷回默认页签。
+        if(SAW && window.__IND_PENDING && onIndTab() && !typing()) location.reload();
+        return;
+      }
+      if(TRIES>=MAX) stop();               // 补不上（比如该账号接口一直报错）就别死等
+    }).catch(function(){ if(++TRIES>=8) stop(); });
+  }
+  function start(){
+    if(!window.__IND_PENDING || TIMER) return;
+    TIMER=setInterval(tick, 8000); tick();
+  }
+  var prev=window.showTab;
+  if(typeof prev==='function'){
+    window.showTab=function(id, el){
+      prev.apply(this, arguments);
+      if(id==='p-ind') start();            // 只有真的切到行业大盘才开始轮询
+    };
+  }
+  if(onIndTab()) start();
+})();
+"""
+
 
 # ---------------------------------------------------------------- 页面：行业大盘
 def _ind_cell(v, num: bool = False) -> str:
@@ -2716,8 +2760,11 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
     chart_json = json.dumps(charts, ensure_ascii=False).replace("</", "<\\/")
     echarts_src = _echarts_src()
     ind = d.get("industry") or {}
-    # 只有「本页还缺的账号」正在补齐时才自动刷新；其它账号/区间的后台任务不打扰当前报表
-    refresh_meta = '<meta http-equiv="refresh" content="20">' if _industry_pending(ind) else ""
+    # 行业大盘补齐时**不能**再用 <meta http-equiv="refresh">：那是整页定时刷新，
+    # 会把用户正在输入的搜索框、滚动位置一起刷掉（表现为「打字几秒后页面自己刷新」）。
+    # 改成 JS 轮询 + 三重条件：正在看⑧行业大盘、没在输入框里、补齐任务真的结束了才刷新。
+    ind_pending = _industry_pending(ind)
+    refresh_meta = ""
     tabs = "".join(
         f'<div class="tab{" active" if i == 0 else ""}" onclick="showTab(\'{cid}\',this)">{_e(label)}</div>'
         for i, (cid, label) in enumerate(TABS))
@@ -2770,6 +2817,8 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
 <script>{JS}</script>
 <script>{AI_JS}</script>
 <script>window.__CHARTS={chart_json};</script>
+<script>window.__IND_PENDING = {'true' if ind_pending else 'false'};</script>
+<script>{IND_JS}</script>
 </body></html>"""
 
 
