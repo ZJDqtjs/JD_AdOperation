@@ -229,8 +229,10 @@ tbody tr:hover{background:var(--soft)}
 input,select,textarea{font-family:inherit}
 input[type=date],input[type=text],select{background:var(--canvas);border:1px solid var(--hair);
   border-radius:var(--r-sm);padding:7px 10px;font-size:13px;color:var(--ink)}
-input[type=date]:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary);
-  box-shadow:0 0 0 3px rgba(204,120,92,.15)}
+input[type=date]:focus,input[type=text]:focus,select:focus,textarea:focus{outline:none;
+  border-color:var(--primary);box-shadow:0 0 0 3px rgba(204,120,92,.15)}
+.srch{flex:1 1 220px;min-width:220px}
+.srchcount{color:var(--muted2);font-size:12px;min-width:66px;white-space:nowrap}
 input[type=checkbox]{accent-color:var(--primary)}
 
 /* ---------------------------------------------------------------- 提示块 */
@@ -316,23 +318,59 @@ function initSort(){
     th.addEventListener('click',function(){sortTable(th);});
   });
 }
+/* 档位 / 账号 / 关键词三个筛选条件叠加：状态记在卡片的 dataset 上，
+   任何一项变化都重算一遍，避免互相覆盖（以前点完档位再点账号会把档位冲掉）。 */
+/* 关键词匹配：「；」= 任一命中（或），「：」= 同时命中（且），全角半角都认。
+   例：玉米；雪莲果 → 两个词命中一个就显示；玉米：梓云茶 → 两个都得有。 */
+function matchQuery(text, q){
+  if(!q) return true;
+  var t=(text||'').toLowerCase();
+  var groups=q.split(/[：:]/);
+  for(var g=0; g<groups.length; g++){
+    var part=groups[g].trim();
+    if(!part) continue;
+    var words=part.split(/[；;]/).map(function(x){return x.trim().toLowerCase();})
+                  .filter(function(x){return x;});
+    if(!words.length) continue;
+    var hit=false;
+    for(var w=0; w<words.length; w++){ if(t.indexOf(words[w])>=0){hit=true;break;} }
+    if(!hit) return false;
+  }
+  return true;
+}
+function cardFilter(card){
+  var tier=card.dataset.tier||'all', acct=card.dataset.acct||'all';
+  var q=(card.dataset.q||'').trim().toLowerCase();
+  var rows=card.querySelectorAll('table tbody tr'), shown=0;
+  for(var i=0;i<rows.length;i++){
+    var tr=rows[i], ok=true;
+    if(tier!=='all' && (tr.dataset.tier||'')!==tier) ok=false;
+    if(ok && acct!=='all' && (tr.dataset.acct||'').split(',').indexOf(acct)<0) ok=false;
+    if(ok && q && !matchQuery(tr.textContent, q)) ok=false;
+    tr.style.display=ok?'':'none';
+    if(ok) shown++;
+  }
+  var lab=card.querySelector('.srchcount');
+  if(lab) lab.textContent=(q||tier!=='all'||acct!=='all')?('显示 '+shown+' / '+rows.length):'';
+}
 function applyTier(btn){
-  var val=btn.dataset.f; var card=btn.closest('.card');
-  card.querySelectorAll('.chip').forEach(function(c){c.classList.remove('on');});
+  var card=btn.closest('.card');
+  card.querySelectorAll('.chip[data-f]').forEach(function(c){c.classList.remove('on');});
   btn.classList.add('on');
-  card.querySelectorAll('table tbody tr').forEach(function(tr){
-    var t=tr.dataset.tier||'';
-    tr.style.display=(val==='all'||t===val)?'':'none';
-  });
+  card.dataset.tier=btn.dataset.f||'all';
+  cardFilter(card);
 }
 function applyAcct(btn){
-  var val=btn.dataset.a; var card=btn.closest('.card');
-  card.querySelectorAll('.chip').forEach(function(c){c.classList.remove('on');});
+  var card=btn.closest('.card');
+  card.querySelectorAll('.chip[data-a]').forEach(function(c){c.classList.remove('on');});
   btn.classList.add('on');
-  card.querySelectorAll('table tbody tr').forEach(function(tr){
-    var t=(tr.dataset.acct||'').split(',');
-    tr.style.display=(val==='all'||t.indexOf(val)>=0)?'':'none';
-  });
+  card.dataset.acct=btn.dataset.a||'all';
+  cardFilter(card);
+}
+function applySearch(input){
+  var card=input.closest('.card');
+  card.dataset.q=input.value||'';
+  cardFilter(card);
 }
 function applyWordType(btn){
   var val=btn.dataset.w; var card=btn.closest('.card');
@@ -972,6 +1010,9 @@ def page_sku(d) -> str:
     到手结算价 − 货款 − 运费 − 包材 − 人工，其中到手结算价 ≈ 前台件单价 × 到手率（7~9 成）。
   </p>
   <div class="toolbar" id="skuChips">{chips}<span style="width:14px"></span>{achips}
+    <span style="width:10px"></span>
+    <input type="text" class="srch" placeholder="🔍 筛选 商品 / SKU / 账号…（「；」任一命中，「：」同时命中）" oninput="applySearch(this)">
+    <span class="mini srchcount"></span>
     <span class="mini" style="margin-left:8px">点表头排序 · 悬停商品名看分店成交 · 悬停 ROI / 到手结算价看「前台口径 vs 到手口径」换算</span>
   </div>
   <div class="tblwrap">
@@ -1136,7 +1177,12 @@ def page_plan(d) -> str:
     放大 {tier_count.get("放大", 0)} 个 · 优化 {tier_count.get("优化", 0)} 个 ·
     止损 {tier_count.get("止损", 0)} 个 · 未投放 {tier_count.get("未投放", 0)} 个。
   </p>
-  <div class="toolbar" id="planChips">{achips}<span class="mini" style="margin-left:8px">悬停档位看具体建议</span></div>
+  <div class="toolbar" id="planChips">{achips}
+    <span style="width:10px"></span>
+    <input type="text" class="srch" placeholder="🔍 筛选 计划 / 账号 / 类型…（「；」任一命中，「：」同时命中）" oninput="applySearch(this)">
+    <span class="mini srchcount"></span>
+    <span class="mini" style="margin-left:8px">悬停档位看具体建议</span>
+  </div>
   <div class="tblwrap">
     <table><thead><tr><th class="noSort">#</th><th class="l noSort">计划</th><th class="l noSort">账号</th>
       <th class="l noSort">类型</th>
