@@ -442,32 +442,47 @@ def _fmt_money(v: float) -> str:
 
 def chart_svg(label: str, dates: list[str], rec: list[float], con: list[float],
               w: int = 1400, half: int = 120, top: int = 26, bottom: int = 34) -> str:
-    """一张「上绿=充值、下红=消费、上下各自独立刻度」的图。"""
+    """一张「上绿=充值、下红=消费、上下各自独立刻度」的图。
+
+    上下高度按「有充值的天数 : 有消费的天数」分配（限制在 1:2 ~ 1:1）：
+    充值通常一个月只发生几天，固定对半分会让上半区大片留白、绿柱被压扁，
+    所以默认给下方消费留 2/3 的高度；充值频繁的账号自动回到 1:1。
+    """
     pad_l, pad_r = 78, 22
-    h = top + half * 2 + bottom
+    span = half * 2                              # 0 线上下合计高度
+    h = top + span + bottom
     plot_w = w - pad_l - pad_r
     n = max(len(dates), 1)
     step = plot_w / n
     bar_w = max(6.0, min(24.0, step * 0.55))
-    y0 = top + half
     mr = max(rec) or 1.0
     mc = max(con) or 1.0
     has_rec = max(rec) > 0
+
+    n_rec = sum(1 for v in rec if v)
+    n_con = sum(1 for v in con if v)
+    if not has_rec:
+        ratio = 0.24                             # 无充值：上面只留一行提示文字的位置
+    else:
+        ratio = min(max(n_rec / max(n_rec + n_con, 1), 1 / 3), 0.5)
+    h_up = round(span * ratio)
+    h_dn = span - h_up
+    y0 = top + h_up
 
     p = [f'<div class="cfchart"><div class="cfchd"><b>{label}</b><span>'
          f'<i class="g"></i>充值（上）<i class="r"></i>消费（下）　单位：元</span></div>',
          f'<svg viewBox="0 0 {w} {h}" width="100%" height="{h}" preserveAspectRatio="none">']
     if has_rec:
         for frac in (0.0, 0.5, 1.0):
-            y = y0 - half * frac
+            y = y0 - h_up * frac
             p.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{w - pad_r}" y2="{y:.1f}" stroke="#eeeae4"/>')
             p.append(f'<text x="{pad_l - 8}" y="{y + 3.5:.1f}" text-anchor="end" class="ax">'
                      f'{_fmt_money(mr * frac)}</text>')
     else:
-        p.append(f'<text x="{pad_l + plot_w / 2:.1f}" y="{top + half / 2:.1f}" '
+        p.append(f'<text x="{pad_l + plot_w / 2:.1f}" y="{top + h_up / 2 + 4:.1f}" '
                  f'text-anchor="middle" class="empty">本期无充值记录（余额由内部划转补入）</text>')
     for frac in (0.0, 0.5, 1.0):
-        y = y0 + half * frac
+        y = y0 + h_dn * frac
         p.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{w - pad_r}" y2="{y:.1f}" stroke="#eeeae4"/>')
         if frac:
             p.append(f'<text x="{pad_l - 8}" y="{y + 3.5:.1f}" text-anchor="end" class="ax">'
@@ -477,25 +492,25 @@ def chart_svg(label: str, dates: list[str], rec: list[float], con: list[float],
         x = pad_l + step * i + (step - bar_w) / 2
         if i < len(rec) and rec[i]:
             v = rec[i]
-            bh = max(1.5, v / mr * (half - 10))
+            bh = max(1.5, v / mr * (h_up - 10))
             p.append(f'<rect x="{x:.1f}" y="{y0 - bh:.1f}" width="{bar_w:.1f}" height="{bh:.1f}" '
                      f'fill="#{GREEN}" rx="1.5"><title>{d} 充值 {v:,.2f}</title></rect>')
-            if bh >= 34:
+            if bh >= h_up * 0.3:
                 p.append(f'<text x="{x + bar_w / 2:.1f}" y="{y0 - bh - 4:.1f}" text-anchor="middle" '
                          f'class="v gv">{_fmt_money(v)}</text>')
         if i < len(con) and con[i]:
             v = con[i]
-            bh = max(1.5, v / mc * (half - 10))
+            bh = max(1.5, v / mc * (h_dn - 10))
             p.append(f'<rect x="{x:.1f}" y="{y0:.1f}" width="{bar_w:.1f}" height="{bh:.1f}" '
                      f'fill="#{RED}" rx="1.5"><title>{d} 消费 {v:,.2f}</title></rect>')
-            if bh >= 34:
+            if bh >= h_dn * 0.3:
                 p.append(f'<text x="{x + bar_w / 2:.1f}" y="{y0 + bh + 11:.1f}" text-anchor="middle" '
                          f'class="v rv">{_fmt_money(v)}</text>')
     for i, d in enumerate(dates):
         if i % 2:
             continue
         x = pad_l + step * i + step / 2
-        p.append(f'<text x="{x:.1f}" y="{y0 + half + 18:.1f}" text-anchor="middle" '
+        p.append(f'<text x="{x:.1f}" y="{y0 + h_dn + 18:.1f}" text-anchor="middle" '
                  f'class="ax">{d[5:]}</text>')
     p.append("</svg></div>")
     return "".join(p)
@@ -679,8 +694,10 @@ def xlsx_bytes(accs: list[dict], daily: list[dict], begin: str, end: str) -> byt
         for r in range(top + 1, top + 16):
             ws5.row_dimensions[r].height = 14
         if col_max(col_rec) > 0:
-            add_half("充值（绿，向上）", col_rec, f"A{top + 1}", False, False)
-            add_half("消费（红，向下）", col_con, f"A{top + 8}", True, True)
+            # 上下按 5:9 行分配（≈2.45cm : 4.43cm）：充值一个月只发生几天，
+            # 对半分会让上半区大片留白；行高 14pt≈0.494cm，5 行+9 行=14 行正好拼合
+            add_half("充值（绿，向上）", col_rec, f"A{top + 1}", False, False, 2.45)
+            add_half("消费（红，向下）", col_con, f"A{top + 6}", True, True, 4.43)
         else:
             ws5.cell(row=top + 1, column=1,
                      value="（本期无充值记录）").font = Font(size=9, color="888888")
