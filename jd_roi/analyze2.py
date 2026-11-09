@@ -1539,11 +1539,15 @@ def build(start=None, end=None, windows=None, accounts=None):
             "costUpdatedAt": costs.get("updatedAt") or "",
             "caliber": ("广告=京准通概览(点击15天/成交订单口径)；智能投放=智能投放报表；"
                         "商智=各店铺成交口径；商智客单价为真实值，产品成本按 Excel 成本率等比推算"),
-            "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"]} for a in active],
+            "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"]} for a in accts],
             "generatedAt": settings.now_str("%Y-%m-%d %H:%M"),
         },
+        # 账号列表按「配置里的全部账号」给，不再只给有数据的：新增/新登录的账号在
+        # 抓数之前不该从报表里整行消失（原来会，看着就像"只有两个号"）。
+        # 无数据账号的 totals 用空结构，页面照常出一行 0，可一眼看出是没抓数。
         "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"],
-                      "totals": totals[a["key"]]} for a in active],
+                      "hasData": a["hasData"],
+                      "totals": totals.get(a["key"]) or account_totals(a)} for a in accts],
         "plans": plans,
         "skus": skus,
         "noAd": no_ad,

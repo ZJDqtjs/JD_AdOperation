@@ -554,8 +554,8 @@ def build_charts(d):
              "itemStyle": {"color": "#5db872"}, "lineStyle": {"width": 3},
              "label": {"show": True, "fontSize": 12, "fontWeight": "bold"}}]}})
 
-    # 2) 分账号 花费 & ROI
-    accts = d["accounts"]
+    # 2) 分账号 花费 & ROI（无数据的账号不画，否则图上多几条贴 0 的线）
+    accts = _data_accs(d)
     series = []
     for i, a in enumerate(accts):
         series.append({"name": a["label"] + " 花费", "type": "bar", "barMaxWidth": 34,
@@ -752,7 +752,10 @@ def page_overview(d) -> str:
     acct_rows = []
     for a in d["accounts"]:
         t = a["totals"]
-        cells = f'<td class="l"><b>{_e(a["label"])}</b><div class="mini">ID {_e(a["accountId"])}</div></td>'
+        tag = ("" if a.get("hasData", True) else
+               '<div class="mini" style="color:var(--muted2)">该区间无数据（未抓取）</div>')
+        cells = (f'<td class="l"><b>{_e(a["label"])}</b>'
+                 f'<div class="mini">ID {_e(a["accountId"])}</div>{tag}</td>')
         for k in wkeys:
             m = t[k]
             cls = _roi_cls(m["roi"], _be_all(d))
@@ -950,7 +953,7 @@ def page_sku(d) -> str:
         [(t, f"{t} {tier_count.get(t, 0)}") for t in ["放大", "优化", "止损", "严重亏损"] if tier_count.get(t)])
     achips = "".join(
         f'<div class="chip{" on" if k == "all" else ""}" data-a="{k}" onclick="applyAcct(this)">{v}</div>'
-        for k, v in [("all", "全部账号")] + [(a["key"], a["label"]) for a in d["accounts"]])
+        for k, v in [("all", "全部账号")] + [(a["key"], a["label"]) for a in _data_accs(d)])
     return f"""
 <div class="card">
   <h2>商品 ROI 交叉表 <span class="tagline">按 SKU 合并两个账号的广告，商智成交分店展示</span></h2>
@@ -1124,7 +1127,7 @@ def page_plan(d) -> str:
         rows.append(f'<tr data-acct="{_e(p["account"])}" data-tier="{_e(p["tier"])}">' + cells)
 
     achips = "".join(f'<div class="chip{" on" if k == "all" else ""}" data-a="{k}" onclick="applyAcct(this)">{v}</div>'
-                     for k, v in [("all", f"全部 {len(plans)}")] + [(a["key"], a["label"]) for a in d["accounts"]])
+                     for k, v in [("all", f"全部 {len(plans)}")] + [(a["key"], a["label"]) for a in _data_accs(d)])
     return f"""
 <div class="card">
   <h2>计划明细 <span class="tagline">概览口径，按账号区分</span></h2>
@@ -1197,7 +1200,7 @@ def page_word(d) -> str:
         return (v.get("kw") or []), "关键词"
 
     out = []
-    for a in d["accounts"]:
+    for a in _data_accs(d):
         k = a["key"]
         wins = d["words"].get(k) or {}
         wk = "w2" if wins.get("w2") else ("w1" if wins.get("w1") else "w0")
@@ -1738,19 +1741,28 @@ UI_CSS = """
 """
 
 
+def _data_accs(d) -> list:
+    """只含有数据的账号。
+
+    d["accounts"] 现在按「配置里的全部账号」给（没抓数的也占一行，避免看着像丢账号），
+    但图表系列、筛选项、口径文案只该算有数据的那些 —— 否则会多出几条 0 线。
+    """
+    return [a for a in d.get("accounts", []) if a.get("hasData", True)]
+
+
 def _acct_scope(d) -> str:
-    labels = [a["label"] for a in d.get("accounts", [])]
+    labels = [a["label"] for a in _data_accs(d)]
     if len(labels) == 2:
         return "两账号"
     if len(labels) == 1:
         return labels[0]
-    return "、".join(labels)
+    return "、".join(labels) or "全部账号"
 
 
 def _source_note(d) -> str:
     """当某些窗口的账号总额退化为智能投放口径时提醒一下。"""
     bad = []
-    for a in d.get("accounts", []):
+    for a in _data_accs(d):
         srcs = {a["totals"][k].get("source") for k in a["totals"] if a["totals"][k].get("source")}
         if srcs and srcs != {"概览"}:
             bad.append(f'{a["label"]}：{"/".join(sorted(srcs))}')
