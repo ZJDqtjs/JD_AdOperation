@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import json
 import random
+import re
 import threading
 import time
 from collections import defaultdict
@@ -194,19 +195,31 @@ def fetch_account(key: str, begin: str, end: str) -> dict:
             pw.stop()
 
 
+# 缓存文件名：<账号key>__<begin>_<end>.json
+# 按区间分开存是必须的：补抓某段历史不该把另一段的表覆盖掉。
+CACHE_RE = re.compile(r"^(?P<key>.+?)__(?P<begin>\d{4}-\d{2}-\d{2})_"
+                      r"(?P<end>\d{4}-\d{2}-\d{2})\.json$")
+
+
+def cache_path(key: str, begin: str, end: str) -> Path:
+    return CACHE_DIR / f"{key}__{begin}_{end}.json"
+
+
 def save(data: dict) -> Path:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    p = CACHE_DIR / f"{data.get('account')}.json"
+    r = data.get("range") or {}
+    p = cache_path(data.get("account"), r.get("begin") or "na", r.get("end") or "na")
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(p)
     return p
 
 
-def load_all() -> list[dict]:
+def load_range(begin: str, end: str) -> list[dict]:
+    """读某区间的全部账号缓存（没有的账号跳过）。"""
     items = []
     for a in settings.ACCOUNTS:
-        p = CACHE_DIR / f"{a['key']}.json"
+        p = cache_path(a["key"], begin, end)
         if not p.exists():
             continue
         try:
@@ -214,6 +227,26 @@ def load_all() -> list[dict]:
         except Exception:  # noqa: BLE001
             continue
     return items
+
+
+def cached_ranges() -> list[dict]:
+    """已抓过的区间，按结束日倒序：[{begin, end, accounts:[key], fetchedAt}]。"""
+    out: dict[tuple, dict] = {}
+    if not CACHE_DIR.exists():
+        return []
+    for p in CACHE_DIR.glob("*.json"):
+        m = CACHE_RE.match(p.name)
+        if not m:
+            continue
+        k = (m.group("begin"), m.group("end"))
+        rec = out.setdefault(k, {"begin": k[0], "end": k[1], "accounts": [], "fetchedAt": ""})
+        rec["accounts"].append(m.group("key"))
+        try:
+            got = json.loads(p.read_text(encoding="utf-8")).get("fetched_at") or ""
+            rec["fetchedAt"] = max(rec["fetchedAt"], got)
+        except Exception:  # noqa: BLE001
+            pass
+    return sorted(out.values(), key=lambda x: (x["end"], x["begin"]), reverse=True)
 
 
 # ============================================================ 汇总
@@ -410,29 +443,48 @@ def daily_rows(accs: list[dict], begin: str, end: str) -> list[dict]:
     return out
 
 
-def snapshot() -> dict:
-    """页面用的数据快照：读本地缓存文件，不触发任何请求。"""
-    raw = load_all()
+def default_range(days: int = 30) -> tuple[str, str]:
+    """默认区间：含今天在内往前 N 天。"""
+    end = settings.today()
+    return (end - timedelta(days=max(1, days) - 1)).isoformat(), end.isoformat()
+
+
+def snapshot(begin: str = "", end: str = "") -> dict:
+    """页面用的数据快照：读**指定区间**的本地缓存，不触发任何请求。
+
+    没给区间就退回「最近一次抓过的区间」，方便直接打开页面看上次的结果。
+    """
+    ranges = cached_ranges()
+    if not (begin and end):
+        if ranges:
+            begin, end = ranges[0]["begin"], ranges[0]["end"]
+        else:
+            begin, end = default_range(30)
+    raw = load_range(begin, end)
     accs = [build(d) for d in raw]
+    base = {"ok": True, "empty": not accs, "accounts": [], "daily": [],
+            "begin": begin, "end": end, "ranges": ranges,
+            "labels": [], "totals": {"cash": 0, "begin": 0, "recharge": 0, "consume": 0}}
     if not accs:
-        return {"ok": False, "empty": True, "accounts": [], "daily": [], "labels": []}
-    ranges = {(a["range"].get("begin"), a["range"].get("end")) for a in accs if a["range"]}
-    begin = min((r[0] for r in ranges if r[0]), default="")
-    end = max((r[1] for r in ranges if r[1]), default="")
+        base["empty"] = True
+        return base
     daily = daily_rows(accs, begin, end)
-    return {
-        "ok": True, "empty": False, "accounts": accs, "daily": daily,
-        "begin": begin, "end": end,
+    got = {a["range"].get("end") for a in accs if a["range"]}
+    base.update({
+        "empty": False, "accounts": accs, "daily": daily,
         "fetched_at": max((a["fetched_at"] for a in accs), default=""),
-        "ranges_mixed": len(ranges) > 1,
+        "ranges_mixed": len(got) > 1,
         "labels": [a["label"] for a in accs],
+        "missing": [a["label"] for a in settings.ACCOUNTS
+                    if a["key"] not in {x["account"] for x in accs}],
         "totals": {
             "cash": round(sum(a["cash_balance"] for a in accs), 2),
             "begin": round(sum(a["begin_balance"] for a in accs), 2),
             "recharge": round(sum(a["recharge_sum"] for a in accs), 2),
             "consume": round(sum(a["consume_sum"] for a in accs), 2),
         },
-    }
+    })
+    return base
 
 
 # ============================================================ 柱状图
@@ -721,35 +773,45 @@ class Runner:
         self._profile_lock = profile_lock or threading.Lock()
         self._thread: threading.Thread | None = None
         self._cancel = threading.Event()
+        b, e = default_range(30)
         self._state = {
-            "running": False, "days": 30, "account": None, "total": 0, "done": 0,
+            "running": False, "account": None, "total": 0, "done": 0,
             "message": "", "error": None, "startedAt": None, "finishedAt": None,
-            "range": None, "failed": [],
+            "range": [b, e], "failed": [],
         }
 
     def status(self) -> dict:
         with self._lock:
             return dict(self._state)
 
-    def start(self, days: int = 30) -> dict:
+    def start(self, begin: str = "", end: str = "") -> dict:
+        """按任意区间抓取（begin/end 为 YYYY-MM-DD，跨度上限 370 天）。"""
+        if not (begin and end):
+            begin, end = default_range(30)
+        try:
+            d0 = datetime.strptime(begin, "%Y-%m-%d").date()
+            d1 = datetime.strptime(end, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "日期格式不对，要 YYYY-MM-DD"}
+        if d1 < d0:
+            return {"ok": False, "error": "结束日不能早于开始日"}
+        if (d1 - d0).days + 1 > 370:
+            return {"ok": False, "error": "一次最多抓 370 天，请分段"}
         with self._lock:
             if self._state["running"]:
                 return {"ok": False, "error": "已经在抓了，等这一轮结束"}
-            days = max(1, min(int(days or 30), 120))
-            self._state.update({"running": True, "days": days, "done": 0,
+            self._state.update({"running": True, "done": 0,
                                 "total": len(settings.ACCOUNTS), "account": None,
                                 "message": "排队等待浏览器登录态…", "error": None,
                                 "startedAt": settings.now_iso(), "finishedAt": None,
-                                "failed": []})
+                                "range": [begin, end], "failed": []})
         self._cancel.clear()
-        self._thread = threading.Thread(target=self._run, args=(days,),
+        self._thread = threading.Thread(target=self._run, args=(begin, end),
                                         name="cashflow-run", daemon=True)
         self._thread.start()
-        return {"ok": True, "days": days}
+        return {"ok": True, "range": [begin, end]}
 
-    def _run(self, days: int) -> None:
-        begin = (settings.today() - timedelta(days=days - 1)).isoformat()
-        end = settings.today().isoformat()
+    def _run(self, begin: str, end: str) -> None:
         keys = [a["key"] for a in settings.ACCOUNTS]
         try:
             if not self._profile_lock.acquire(timeout=300):

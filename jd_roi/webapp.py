@@ -2009,18 +2009,31 @@ function poll(){
   }).catch(function(){ setTimeout(poll, 4000); });
 }
 window.CFRUN = function(){
-  var el = $('cfDays');
-  var d = parseInt((el && el.value) || '30', 10);
-  var btn = $('cfRun');
+  var bEl = $('cfStart'), eEl = $('cfEnd'), btn = $('cfRun');
+  var b = (bEl && bEl.value) || '', e = (eEl && eEl.value) || '';
+  if(!b || !e){ msg('请先选好起止日期', true); return; }
+  if(b > e){ msg('结束日不能早于开始日', true); return; }
   if(btn) btn.disabled = true;
-  msg('已提交，等待浏览器登录态…');
-  fetch('/api/cashflow/run?days=' + d, {method:'POST'})
+  msg('已提交（' + b + ' ~ ' + e + '），等待浏览器登录态…');
+  fetch('/api/cashflow/run?start=' + encodeURIComponent(b) + '&end=' + encodeURIComponent(e),
+        {method:'POST'})
     .then(function(r){ return r.json(); })
     .then(function(j){
       if(!j.ok){ msg(j.error || '启动失败', true); if(btn) btn.disabled=false; return; }
       poll();
     })
-    .catch(function(e){ msg('启动失败：' + e, true); if(btn) btn.disabled=false; });
+    .catch(function(e2){ msg('启动失败：' + e2, true); if(btn) btn.disabled=false; });
+};
+/* 快捷区间：改完日期直接把页面带到该区间（有缓存就秒开） */
+window.CFSET = function(days){
+  var e = new Date(), s = new Date();
+  s.setDate(e.getDate() - (days - 1));
+  function iso(d){ return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0')
+    + '-' + String(d.getDate()).padStart(2,'0'); }
+  location.href = '/cashflow?start=' + iso(s) + '&end=' + iso(e);
+};
+window.CFSPAN = function(b, e){
+  location.href = '/cashflow?start=' + b + '&end=' + e;
 };
 if(window.CF_RUNNING) poll();
 })();
@@ -2035,18 +2048,41 @@ def _cf_money(v) -> str:
 
 
 @app.get("/cashflow", response_class=HTMLResponse)
-def cashflow_page():
-    """广告费流水：余额、充值/消费柱状图、每日流水（读本地缓存，不触发抓取）。"""
-    snap = cashflow.snapshot()
+def cashflow_page(request: Request):
+    """广告费流水：余额、充值/消费柱状图、每日流水（读本地缓存，不触发抓取）。
+
+    区间由 URL 的 start/end 决定，默认近 30 天；缓存按区间分开存，补抓历史不会覆盖别的区间。
+    """
+    q = request.query_params
+    d_begin, d_end = cashflow.default_range(30)
+    begin = q.get("start") or d_begin
+    end = q.get("end") or d_end
+    snap = cashflow.snapshot(begin, end)
+    begin, end = snap.get("begin") or begin, snap.get("end") or end
     st = _cashflow.status()
     running = bool(st.get("running"))
-    days = st.get("days") or 30
+    # 「上月」快捷区间（与其它页的日历口径一致）
+    first = _today().replace(day=1)
+    lm_end_d = first - dt.timedelta(days=1)
+    lm_start, lm_end = lm_end_d.replace(day=1).isoformat(), lm_end_d.isoformat()
+
+    # 已抓过的区间：点一下切过去看（补过的历史不用每次重抓）
+    rg = snap.get("ranges") or []
+    range_chips = "".join(
+        f'<a class="chip{" on" if r["begin"] == begin and r["end"] == end else ""}" '
+        f'href="/cashflow?start={_e(r["begin"])}&end={_e(r["end"])}">'
+        f'{_e(r["begin"][5:])} ~ {_e(r["end"][5:])}'
+        f'<span style="color:var(--muted2)"> · {len(r["accounts"])} 个账号</span></a>'
+        for r in rg[:12])
 
     if snap.get("empty"):
-        meta = "<span>还没有数据</span>"
+        meta = (f"<span>{begin} ~ {end}</span><span class='dot'></span>"
+                "<span>这个区间还没抓过</span>")
         kpis = ""
-        body = ('<div class="card"><p class="hint">还没有流水数据。点右上角「重新抓取」，'
-                '会依次登录各账号拉一遍财务记录（5 个账号约 2~4 分钟）。</p></div>')
+        body = ('<div class="card"><p class="hint">该区间还没有流水数据。点右上角「抓取」，'
+                f'会依次登录各账号拉一遍财务记录（{begin} ~ {end}）。</p>'
+                '<p class="hint">已抓过的区间可以直接点下方标签切换，不用重抓：</p>'
+                f'<div class="toolbar" style="margin-top:8px">{range_chips or "<span class=hint>暂无</span>"}</div></div>')
     else:
         accs = snap["accounts"]
         begin, end = snap["begin"], snap["end"]
@@ -2131,7 +2167,10 @@ def cashflow_page():
             '<p class="hint">次日 08:45 左右批量扣款，所以「今天的消耗」要到明早才从余额里扣掉。'
             '逐笔明细（充值/分配/冻结）在导出的 Excel 里。</p></div>')
 
-        body = kpis + table + charts + daily_table
+        range_bar = (f'<div class="toolbar" style="margin-top:4px">'
+                     f'<span class="mini" style="color:var(--muted)">已抓区间</span>{range_chips}</div>'
+                     ) if len(rg) > 1 else ""
+        body = range_bar + kpis + table + charts + daily_table
         if snap.get("ranges_mixed"):
             body = ('<div class="cfwarn">各账号的缓存区间不一致（可能只抓了部分账号），'
                     '点「重新抓取」可统一。</div>' + body)
@@ -2148,11 +2187,17 @@ def cashflow_page():
   <h1>广告费流水</h1>
   <div class="metaline">{meta}</div>
   <div class="actions">
-    <input id="cfDays" type="number" min="1" max="120" value="{days}"
-           style="width:74px;padding:7px 9px;border-radius:8px;border:1px solid var(--line)">
-    <span style="font-size:12px;color:var(--muted)">天</span>
-    <button class="btn" id="cfRun" onclick="CFRUN()" {"disabled" if running else ""}>重新抓取</button>
-    <a class="btn ghost mini" href="/api/cashflow/export">导出 Excel</a>
+    <label style="font-size:12px;color:var(--muted)">起
+      <input id="cfStart" type="date" value="{begin}"
+             style="padding:6px 9px;border-radius:8px;border:1px solid var(--line)"></label>
+    <label style="font-size:12px;color:var(--muted)">止
+      <input id="cfEnd" type="date" value="{end}"
+             style="padding:6px 9px;border-radius:8px;border:1px solid var(--line)"></label>
+    <button class="btn ghost mini" onclick="CFSET(7)">近7天</button>
+    <button class="btn ghost mini" onclick="CFSET(30)">近30天</button>
+    <button class="btn ghost mini" onclick="CFSPAN('{lm_start}','{lm_end}')">上月</button>
+    <button class="btn" id="cfRun" onclick="CFRUN()" {"disabled" if running else ""}>抓取</button>
+    <a class="btn ghost mini" href="/api/cashflow/export?start={begin}&end={end}">导出 Excel</a>
     <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
     {run_hint}
   </div>
@@ -2163,7 +2208,7 @@ def cashflow_page():
   <p><b>口径</b>：交易日期 = 广告实际消耗日；记账时间 = 次日 08:45 左右批量扣款；
   结余取接口原值，接口不返回结余的账号按「期初 + 充值 − 消费」逐日滚动推算。</p>
   <p><b>分配</b>是同一资金户内「商家账户 ↔ 投放子账户」的划转，不改变账户现金总额，不计入余额滚动。</p>
-  <p>数据每次点「重新抓取」覆盖保存，不自动过期；要换区间改上面的天数即可。</p>
+  <p>缓存<b>按区间分开存</b>：补抓某段历史不会覆盖别的区间，切换区间直接读本地文件，不会重新请求京东。要新数据点「抓取」。</p>
 </div>
 </div>
 <script>window.CF_RUNNING = {"true" if running else "false"};</script>
@@ -2172,9 +2217,14 @@ def cashflow_page():
 
 
 @app.post("/api/cashflow/run")
-def api_cashflow_run(days: int = 30):
-    """起后台任务抓财务流水（逐账号，约 2~4 分钟）。"""
-    return _cashflow.start(days)
+def api_cashflow_run(start: str = "", end: str = "", days: int = 0):
+    """起后台任务抓财务流水（逐账号，约 2~4 分钟）。
+
+    start/end 为 YYYY-MM-DD；只给 days 时按「含今天往前 N 天」换算（兼容老链接）。
+    """
+    if not (start and end):
+        start, end = cashflow.default_range(days or 30)
+    return _cashflow.start(start, end)
 
 
 @app.get("/api/cashflow/status")
@@ -2183,9 +2233,9 @@ def api_cashflow_status():
 
 
 @app.get("/api/cashflow/export")
-def api_cashflow_export():
-    """导出与页面同口径的 Excel（4 个 sheet：汇总/每日/明细/口径）。"""
-    snap = cashflow.snapshot()
+def api_cashflow_export(start: str = "", end: str = ""):
+    """导出与页面同口径的 Excel（汇总/每日/明细/口径/柱状图）。"""
+    snap = cashflow.snapshot(start, end)
     if not snap.get("ok"):
         return JSONResponse({"ok": False, "error": "还没有数据，请先抓取一次"}, status_code=404)
     data = cashflow.xlsx_bytes(snap["accounts"], snap["daily"], snap["begin"], snap["end"])
