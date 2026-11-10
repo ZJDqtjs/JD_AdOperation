@@ -9,9 +9,10 @@ from __future__ import annotations
 import html as _html
 import json
 import sys
+from datetime import date as _date, timedelta as _timedelta
 from pathlib import Path
 
-from . import config
+from . import config, settings
 
 ASSETS = Path(__file__).resolve().parent / "assets" / "echarts.min.js"
 
@@ -376,7 +377,7 @@ function applySearch(input){
 /* ---- SKU 图（ROI vs 保本线 / 广告渗透率）的卡片内筛选 ----
    明细由 window.__SKUCHART 下发（账号 × 窗口），这里按「全部账号/单账号 + 前N + 关键词」
    重算并 setOption，而不是整页跳转（跳页会把日期、滚动位置一起刷掉）。
-   「全部账号」= 各账号近周花费/成交/商智成交分别相加，ROI 与渗透率再按合计重算，
+   「全部账号」= 各账号本期花费/成交/商智成交分别相加，ROI 与渗透率再按合计重算，
    不能把各账号比率直接平均。 */
 function _skLatest(win){
   var ks=(window.__SKUCHART||{}).wkeys||[], i, v;
@@ -578,6 +579,30 @@ def _pct(v, dec=1) -> str:
     return "—" if v is None else f"{_n(v):.{dec}f}%"
 
 
+def _cost_col(d) -> tuple:
+    """「花费」列的表头跟着所选区间走（原先写死「近周花费」，单选一天时会误导）。
+
+    返回 (表头文字, 悬停说明)。区间只有 1 天时叫「昨日花费 / 当日花费」，
+    多天叫「本期花费」；取数值一律用 w2（所选区间），不回退到上一期。
+    """
+    m = d.get("meta") or {}
+    w2 = (m.get("windows") or [{}])[-1] or {}
+    rng = m.get("range") or {}
+    start = rng.get("start") or w2.get("start") or ""
+    end = rng.get("end") or w2.get("end") or ""
+    n = 0
+    try:
+        n = (_date.fromisoformat(end) - _date.fromisoformat(start)).days + 1
+    except (TypeError, ValueError):
+        pass
+    if n == 1:
+        label = "昨日花费" if end == (settings.today() - _timedelta(days=1)).isoformat() else "当日花费"
+    else:
+        label = "本期花费"
+    span = f"{start} ~ {end}" + (f"（{n} 天）" if n else "")
+    return label, f"所选区间 {span} 的京准通花费，跟随页面顶部的起止日期，不是固定一周"
+
+
 def _delta(cur, pre, better_high=True, dec=1) -> tuple:
     cur, pre = _n(cur), _n(pre)
     if abs(pre) < 1e-9:
@@ -732,7 +757,7 @@ def build_charts(d):
         "series": series}})
 
     # 3) SKU：实际 ROI vs 保本 ROI（默认花费前 15，卡片内可切账号 / 前 N / 搜索）
-    #    排序按「近周花费」而不是 d["skus"] 的原始顺序，切账号后口径才一致；
+    #    排序按「本期花费」而不是 d["skus"] 的原始顺序，切账号后口径才一致；
     #    保本线为 0（卖一件亏一件）也涂红，与页面 _roi_cls 的判定保持一致。
     skus = sorted([s for s in d["skus"] if _n(_latest(s)["cost"]) > 0],
                   key=lambda s: -_n(_latest(s)["cost"]))[:15]
@@ -868,7 +893,7 @@ def sku_chart_payload(d) -> dict:
     """两张 SKU 图的下发数据：按「账号 × 窗口」保存明细，供卡片内切账号 / 搜索 / 前 N。
 
     原来 build_charts 里直接 `[:15]` 切死，页面因此只有固定几个商品、也没有账号筛选。
-    这里把同一个 SKU 在各账号的近周花费、ROI、渗透率一起给前端，图表自己重算。
+    这里把同一个 SKU 在各账号的本期花费、ROI、渗透率一起给前端，图表自己重算。
     """
     rows = []
     for s in d["skus"]:
@@ -1143,8 +1168,10 @@ def _be_txt(be, starred=False) -> str:
 
 
 def _sku_row(i, s, labels) -> str:
-    cur = _latest(s)
-    wk = _latest_key(s)
+    # 整行都只用 w2（所选区间），不再回退上一期：表头写「昨日/本期花费」时，
+    # 行里却出现前一期数字会自相矛盾（page_sku 已把本期无花费的 SKU 过滤掉）。
+    cur = s["wins"]["w2"]
+    wk = "w2"
     roi, be = _n(cur["roi"]), _n(s["breakeven"])
     gap = roi - be
     accts = ",".join(s.get("adAccounts") or [])
@@ -1206,12 +1233,15 @@ def _sku_row(i, s, labels) -> str:
 
 def page_sku(d) -> str:
     labels = {a["key"]: a["label"] for a in d["accounts"]}
-    skus = [s for s in d["skus"] if _n(s["wins"]["w0"]["cost"]) + _n(s["wins"]["w1"]["cost"]) + _n(s["wins"]["w2"]["cost"]) > 0]
+    cost_label, cost_tip = _cost_col(d)
+    # 只列「所选区间内真有投放」的 SKU：以前允许回退看上两期花费，
+    # 选一天时会把前一天的 SKU 混进来，和「昨日花费」表头对不上。
+    skus = [s for s in d["skus"] if _n(s["wins"]["w2"]["cost"]) > 0]
     rows = [_sku_row(i + 1, s, labels) for i, s in enumerate(skus)]
-    tot_cost = sum(_n(_latest(s)["cost"]) for s in skus)
-    tot_amt = sum(_n(_latest(s)["amt"]) for s in skus)
-    tot_sz = sum(_n(_latest(s).get("szAmt")) for s in skus)
-    tot_net = sum(_n(s["est"][_latest_key(s)]["netProfit"]) for s in skus)
+    tot_cost = sum(_n(s["wins"]["w2"]["cost"]) for s in skus)
+    tot_amt = sum(_n(s["wins"]["w2"]["amt"]) for s in skus)
+    tot_sz = sum(_n(s["wins"]["w2"].get("szAmt")) for s in skus)
+    tot_net = sum(_n(s["est"]["w2"]["netProfit"]) for s in skus)
     tier_count = {}
     for s in skus:
         tier_count[s["verdict"]["tier"]] = tier_count.get(s["verdict"]["tier"], 0) + 1
@@ -1241,13 +1271,15 @@ def page_sku(d) -> str:
     sz_tip = ("商智全店全渠道成交额，下方为成交件数" +
               (f"｜数据不全：{sz_gap}（该列偏低）" if sz_gap else ""))
     sz_mark = '<span class="gapmark" title="该列有账号数据不全">*</span>' if sz_gap else ""
+    empty_row = ('<tr><td colspan="18" class="l">所选区间没有任何广告花费（可换日期或账号）</td></tr>'
+                 if not rows else "")
     return f"""
 <div class="card">
   <h2>商品 ROI 交叉表 <span class="tagline">按 SKU 合并两个账号的广告，商智成交分店展示</span></h2>
   <p class="hint">
-    共 {len(skus)} 个有广告投放的 SKU，其中 {(d["meta"].get("costCoverage") or {}).get("skuErp", 0)} 个已接入
+    共 {len(skus)} 个在所选区间有广告投放的 SKU，其中 {(d["meta"].get("costCoverage") or {}).get("skuErp", 0)} 个已接入
     ERP 真实成本（覆盖本期花费 {((d["meta"].get("costCoverage") or {}).get("costShare") or 0):.0f}%）。
-    近周花费合计 <b>¥{_money(tot_cost)}</b>、广告成交 <b>¥{_money(tot_amt)}</b>
+    {cost_label}合计 <b>¥{_money(tot_cost)}</b>、广告成交 <b>¥{_money(tot_amt)}</b>
     （ROI {_n(tot_amt) / max(tot_cost, 1):.2f}），这些商品商智总成交 <b>¥{_money(tot_sz)}</b>，
     按成本假设估算净利 <b>¥{_money(tot_net)}</b>。
     「ROI」= 京准通平台报的广告 ROI（广告成交额 ÷ 花费，分子是消费者实付）；「保本ROI」= 该 SKU
@@ -1274,7 +1306,7 @@ def page_sku(d) -> str:
       <th class="noSort">#</th>
       <th class="l noSort">商品</th>
       <th class="l">投放账号</th>
-      <th data-num="1">近周花费</th><th data-num="1">成交额</th>
+      <th data-num="1" title="{_e(cost_tip)}">{_e(cost_label)}</th><th data-num="1">成交额</th>
       <th data-num="1" title="京准通平台报的广告ROI＝广告成交额÷花费">ROI</th>
       <th data-num="1" title="该 SKU 自己的保本 ROI 线，ROI 高于它才值得继续投">保本ROI</th>
       <th data-num="1" title="广告带来的成交订单数（京准通，点击后15天归因）">促成订单</th>
@@ -1287,12 +1319,12 @@ def page_sku(d) -> str:
       <th data-num="1" title="商智总成交 − 广告成交；下方为自然成交件数（近似）">自然成交</th>
       <th data-num="1">预估净利</th>
       <th data-num="1">近3周ROI</th><th class="l">档位</th>
-    </tr></thead><tbody>{''.join(rows)}</tbody></table>
+    </tr></thead><tbody>{''.join(rows) or empty_row}</tbody></table>
   </div>
 </div>
 
 <div class="card">
-  <h2>ROI vs 保本线 <span class="tagline">按近周花费排序，默认前 15 的 SKU</span></h2>
+  <h2>ROI vs 保本线 <span class="tagline">按{cost_label}排序，默认前 15 的 SKU</span></h2>
   <p class="hint">绿色=实际 ROI 达到该商品自己的保本线；红色=低于保本线（或保本线为 0），广告纯亏。
     默认统计所选账号合并后的结果，卡片内可切单个账号、改显示条数、搜商品。</p>
   {_sku_chart_bar("chSkuRoi", d)}
@@ -1939,7 +1971,7 @@ def page_action(d) -> str:
     {_pct(_n(up["stopCost"]) / max(_n(up["lastCost"]), 1) * 100)}。逐个处理，不要一刀切关闭。
   </p>
   <div class="tblwrap short"><table><thead><tr>
-    <th class="l noSort">商品</th><th data-num="1">近周花费</th><th data-num="1">ROI</th>
+    <th class="l noSort">商品</th><th data-num="1">本期花费</th><th data-num="1">ROI</th>
     <th data-num="1">保本ROI</th><th data-num="1">预估净利</th><th class="l noSort">动作</th>
   </tr></thead><tbody>{stop_rows or '<tr><td colspan="6" class="l">没有低于保本线的商品 👍</td></tr>'}</tbody></table></div>
 </div>
@@ -1948,7 +1980,7 @@ def page_action(d) -> str:
   <h2>第二步 · 加投 <span class="tagline">ROI 已到「各自放量线」（保本线 ×{_n(d['meta'].get('growFactor'), 1.25):.2f}）的 SKU，才是增量池</span></h2>
   <p class="hint">按 30% 加预算试探，加完盯 3 天 ROI 是否守住。保本线只是不亏钱，放量线以上加投才划算。</p>
   <div class="tblwrap short"><table><thead><tr>
-    <th class="l noSort">商品</th><th data-num="1">近周花费</th><th data-num="1">ROI</th>
+    <th class="l noSort">商品</th><th data-num="1">本期花费</th><th data-num="1">ROI</th>
     <th data-num="1">保本ROI</th><th data-num="1">放量线</th><th data-num="1">毛利/件</th>
     <th data-num="1">建议加投</th><th class="l noSort">动作</th>
   </tr></thead><tbody>{grow_rows or '<tr><td colspan="8" class="l">暂无明显高效商品</td></tr>'}</tbody></table></div>
