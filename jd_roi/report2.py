@@ -227,6 +227,13 @@ tbody tr:hover{background:var(--soft)}
   font-size:12.5px;font-weight:500;color:var(--muted);transition:all .15s;line-height:1.4}
 .chip:hover{border-color:var(--primary);color:var(--ink)}
 .chip.on{background:var(--surface-card);color:var(--ink);border-color:var(--cream);font-weight:600}
+/* 卡片标题右侧的视图切换（如计划明细：区间详细 / 三期趋势） */
+.vswitch{margin-left:auto;display:inline-flex;border:1px solid var(--hair);border-radius:9999px;
+  overflow:hidden;background:var(--canvas)}
+.vswitch button{border:0;background:transparent;color:var(--muted);font-size:12.5px;font-weight:500;
+  padding:5px 14px;cursor:pointer;transition:all .15s;line-height:1.4;font-family:var(--sans)}
+.vswitch button:hover{color:var(--ink)}
+.vswitch button.on{background:var(--surface-card);color:var(--ink);font-weight:600}
 input,select,textarea{font-family:inherit}
 input[type=date],input[type=text],select{background:var(--canvas);border:1px solid var(--hair);
   border-radius:var(--r-sm);padding:7px 10px;font-size:13px;color:var(--ink)}
@@ -293,6 +300,17 @@ function showTab(id, el){
   Object.keys(window.__CH||{}).forEach(function(k){try{window.__CH[k].resize();}catch(e){}});
   window.scrollTo({top:0,behavior:'smooth'});
 }
+function planView(btn, v){
+  /* 计划明细：区间详细 / 三期趋势。两张表都已在页面里，只切显示，不重新请求。 */
+  var card=btn.closest('.card');
+  card.querySelectorAll('.vswitch button').forEach(function(b){
+    b.classList.toggle('on', b.dataset.v===v);
+  });
+  card.querySelectorAll('[data-pview]').forEach(function(w){
+    w.style.display=(w.dataset.pview===v)?'':'none';
+  });
+  cardFilter(card);   /* 有筛选条件时，把「显示 x / y」同步成当前视图的行数 */
+}
 function sortTable(th){
   var tb=th.closest('table');
   var idx=Array.prototype.indexOf.call(th.parentNode.children,th);
@@ -343,17 +361,20 @@ function matchQuery(text, q){
 function cardFilter(card){
   var tier=card.dataset.tier||'all', acct=card.dataset.acct||'all';
   var q=(card.dataset.q||'').trim().toLowerCase();
-  var rows=card.querySelectorAll('table tbody tr'), shown=0;
+  var rows=card.querySelectorAll('table tbody tr'), shown=0, total=0;
   for(var i=0;i<rows.length;i++){
     var tr=rows[i], ok=true;
     if(tier!=='all' && (tr.dataset.tier||'')!==tier) ok=false;
     if(ok && acct!=='all' && (tr.dataset.acct||'').split(',').indexOf(acct)<0) ok=false;
     if(ok && q && !matchQuery(tr.textContent, q)) ok=false;
     tr.style.display=ok?'':'none';
-    if(ok) shown++;
+    /* 同一张卡片可能有两张表（如计划明细的区间详细 / 三期趋势），
+       计数只算当前显示的那张，否则「显示 x / y」会翻倍。 */
+    var pv=tr.closest('[data-pview]');
+    if(!pv || pv.style.display!=='none'){ total++; if(ok) shown++; }
   }
   var lab=card.querySelector('.srchcount');
-  if(lab) lab.textContent=(q||tier!=='all'||acct!=='all')?('显示 '+shown+' / '+rows.length):'';
+  if(lab) lab.textContent=(q||tier!=='all'||acct!=='all')?('显示 '+shown+' / '+total):'';
 }
 function applyTier(btn){
   var card=btn.closest('.card');
@@ -1436,36 +1457,67 @@ def page_adj(d) -> str:
 
 # ---------------------------------------------------------------- 页面：计划明细
 def page_plan(d) -> str:
-    plans = [p for p in d["plans"] if _n(p["wins"]["w0"]["cost"]) + _n(p["wins"]["w1"]["cost"]) + _n(p["wins"]["w2"]["cost"]) > 0]
-    plans.sort(key=lambda p: -(_n(p["wins"]["w1"]["cost"]) + _n(p["wins"]["w2"]["cost"])))
+    cost_label, _cost_tip = _cost_col(d)
+    # 两个视图共用同一批计划：只保留所选区间真有投放的，避免「区间详细」里
+    # 出现一堆本期 0 花费、只能靠回退上一期才有数的行。
+    plans = [p for p in d["plans"] if _n(p["wins"]["w2"]["cost"]) > 0]
+    plans.sort(key=lambda p: -_n(p["wins"]["w2"]["cost"]))
     tier_count = {}
     for p in plans:
         tier_count[p["tier"]] = tier_count.get(p["tier"], 0) + 1
-    rows = []
+
+    detail_rows, trend_rows = [], []
     for i, p in enumerate(plans):
-        cells = (f'<td class="mono">{i + 1}</td>'
-                 f'<td class="l"><b>{_e(p["name"])}</b><div class="sid">{_e(p["campaignId"])}</div></td>'
-                 f'<td class="l">{_e(p["accountLabel"])}</td>'
-                 f'<td class="l">{_e(p["typeLabel"])}</td>')
+        m = p["wins"]["w2"]
+        roi, be = _n(m["roi"]), _n(p["breakeven"])
+        head = (f'<td class="mono">{i + 1}</td>'
+                f'<td class="l"><b>{_e(p["name"])}</b><div class="sid">{_e(p["campaignId"])}</div></td>'
+                f'<td class="l">{_e(p["accountLabel"])}</td>'
+                f'<td class="l">{_e(p["typeLabel"])}</td>')
+        tail = f'<td class="l" title="{_e(_plan_advice(p))}">{_badge(p["tier"])}</td></tr>'
+        detail_rows.append(
+            f'<tr data-acct="{_e(p["account"])}" data-tier="{_e(p["tier"])}">' + head +
+            f'<td class="mono" data-v="{_n(m["cost"])}">{_money(m["cost"])}</td>'
+            f'<td class="mono" data-v="{_n(m["amt"])}">{_money(m["amt"])}</td>'
+            f'<td class="mono {_roi_cls(roi, be)}" data-v="{roi}">{roi:.2f}</td>'
+            f'<td class="mono" data-v="{be}">{_be_txt(be, starred=not p.get("costMapped"))}</td>'
+            f'<td class="mono" data-v="{_n(m["ord"])}">{int(_n(m["ord"]))}</td>'
+            f'<td class="mono" data-v="{_n(m["cpa"])}">{_num(m["cpa"], 2)}</td>'
+            f'<td class="mono" data-v="{_n(m["clk"])}">{int(_n(m["clk"]))}</td>'
+            f'<td class="mono" data-v="{_n(m["ctr"])}">{_num(m["ctr"], 2)}%</td>'
+            f'<td class="mono" data-v="{_n(m["cpc"])}">{_num(m["cpc"], 2)}</td>' + tail)
+
+        cells = head
         for k in ("w0", "w1", "w2"):
-            m = p["wins"][k]
-            cells += (f'<td class="mono" data-v="{_n(m["cost"])}">{_money(m["cost"])}</td>'
-                      f'<td class="mono {_roi_cls(m["roi"], p["breakeven"])}" data-v="{_n(m["roi"])}">{_n(m["roi"]):.2f}</td>')
+            w = p["wins"][k]
+            cells += (f'<td class="mono" data-v="{_n(w["cost"])}">{_money(w["cost"])}</td>'
+                      f'<td class="mono {_roi_cls(w["roi"], p["breakeven"])}" '
+                      f'data-v="{_n(w["roi"])}">{_n(w["roi"]):.2f}</td>')
         droi = _n(p["wins"]["w2"]["roi"]) - _n(p["wins"]["w0"]["roi"])
         cells += (f'<td class="mono {"up" if droi >= 0 else "down"}" data-v="{droi}">{droi:+.2f}</td>'
-                  f'<td data-v="{_n(p["wins"]["w2"]["roi"])}">{_spark([p["wins"][k]["roi"] for k in ("w0", "w1", "w2")], p["breakeven"])}</td>'
-                  f'<td class="l" title="{_e(_plan_advice(p))}">{_badge(p["tier"])}</td></tr>')
-        rows.append(f'<tr data-acct="{_e(p["account"])}" data-tier="{_e(p["tier"])}">' + cells)
+                  f'<td data-v="{_n(p["wins"]["w2"]["roi"])}">'
+                  f'{_spark([p["wins"][k]["roi"] for k in ("w0", "w1", "w2")], p["breakeven"])}</td>')
+        trend_rows.append(f'<tr data-acct="{_e(p["account"])}" data-tier="{_e(p["tier"])}">' + cells + tail)
 
     achips = "".join(f'<div class="chip{" on" if k == "all" else ""}" data-a="{k}" onclick="applyAcct(this)">{v}</div>'
                      for k, v in [("all", f"全部 {len(plans)}")] + [(a["key"], a["label"]) for a in _data_accs(d)])
+    empty_row = ('<tr><td colspan="14" class="l">所选区间没有任何广告投放的计划（可换日期或账号）</td></tr>'
+                 if not detail_rows else "")
+    empty_trend = ('<tr><td colspan="13" class="l">所选区间没有任何广告投放的计划（可换日期或账号）</td></tr>'
+                   if not trend_rows else "")
     return f"""
 <div class="card">
-  <h2>计划明细 <span class="tagline">概览口径，按账号区分</span></h2>
+  <h2>计划明细 <span class="tagline">概览口径，按账号区分</span>
+    <span class="vswitch">
+      <button type="button" class="on" data-v="detail" onclick="planView(this,'detail')">区间详细</button>
+      <button type="button" data-v="trend" onclick="planView(this,'trend')">三期趋势</button>
+    </span>
+  </h2>
   <p class="hint">
     「概览」里的计划包含智能化 / 关键词 / 全站智能推广三种类型，口径与智能投放报表略有差异（订单口径）。
     放大 {tier_count.get("放大", 0)} 个 · 优化 {tier_count.get("优化", 0)} 个 ·
     止损 {tier_count.get("止损", 0)} 个 · 未投放 {tier_count.get("未投放", 0)} 个。
+    默认「区间详细」只看所选区间的花费 / 成交 / ROI；切到「三期趋势」看 w0 / w1 / w2 的环比与走势。
   </p>
   <div class="toolbar" id="planChips">{achips}
     <span style="width:10px"></span>
@@ -1473,14 +1525,25 @@ def page_plan(d) -> str:
     <span class="mini srchcount"></span>
     <span class="mini" style="margin-left:8px">悬停档位看具体建议</span>
   </div>
-  <div class="tblwrap">
+  <div class="tblwrap" data-pview="detail">
+    <table><thead><tr><th class="noSort">#</th><th class="l noSort">计划</th><th class="l noSort">账号</th>
+      <th class="l noSort">类型</th>
+      <th data-num="1">{_e(cost_label)}</th><th data-num="1">成交额</th>
+      <th data-num="1" title="京准通平台报的广告ROI＝广告成交额÷花费">ROI</th>
+      <th data-num="1" title="计划内商品按成交额加权的保本 ROI">保本ROI</th>
+      <th data-num="1">促成订单</th><th data-num="1">CPA</th>
+      <th data-num="1">点击</th><th data-num="1">CTR</th><th data-num="1">CPC</th>
+      <th class="l noSort">档位</th>
+    </tr></thead><tbody>{''.join(detail_rows) or empty_row}</tbody></table>
+  </div>
+  <div class="tblwrap" data-pview="trend" style="display:none">
     <table><thead><tr><th class="noSort">#</th><th class="l noSort">计划</th><th class="l noSort">账号</th>
       <th class="l noSort">类型</th>
       <th class="mono noSort">w0花费</th><th class="mono noSort">w0ROI</th>
       <th class="mono noSort">w1花费</th><th class="mono noSort">w1ROI</th>
       <th class="mono noSort">w2花费</th><th class="mono noSort">w2ROI</th>
       <th data-num="1">ROI变化</th><th data-num="1">3周ROI</th><th class="l noSort">档位</th>
-    </tr></thead><tbody>{''.join(rows)}</tbody></table>
+    </tr></thead><tbody>{''.join(trend_rows) or empty_trend}</tbody></table>
   </div>
 </div>
 """
