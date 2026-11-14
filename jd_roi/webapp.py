@@ -4508,15 +4508,8 @@ def _ai_after_scrape(summary: dict) -> None:
     _ai.run_background(start, end, settings.ACCOUNTS)
 
 
-def _after_scrape(summary: dict) -> None:
-    """夜间抓取成功后的后置任务：先核算前台价，再生成 AI 解读。
-
-    前台价核算放在这里而不是页面里现算：抓完就有、第二天打开就能看到，
-    而且「算过哪一天」会作为文件留下来（页面顶部的「夜间自动核算」卡片读它）。
-    单独 try 住：核算失败不能连累 AI 解读。
-    """
-    if summary.get("cancelled"):
-        return
+def _price_snapshot() -> None:
+    """核算前台价并落盘。单独 try 住：算价格失败不能连累 AI 解读 / 抓取结果。"""
     try:
         done = pricewatch.run_nightly(settings.ACCOUNTS, log=_log_progress)
         if done:
@@ -4526,6 +4519,17 @@ def _after_scrape(summary: dict) -> None:
             _log_progress("前台价核算：没有可用的商智商品明细，跳过")
     except Exception as exc:  # noqa: BLE001
         _log_progress(f"前台价核算失败：{type(exc).__name__}: {exc}")
+
+
+def _after_scrape(summary: dict) -> None:
+    """夜间抓取成功后的后置任务：先核算前台价，再生成 AI 解读。
+
+    前台价核算放在这里而不是页面里现算：抓完就有、第二天打开就能看到，
+    而且「算过哪一天」会作为文件留下来（页面顶部的「夜间自动核算」卡片读它）。
+    """
+    if summary.get("cancelled"):
+        return
+    _price_snapshot()
     _ai_after_scrape(summary)
 
 
@@ -5023,6 +5027,8 @@ def _nightly_job():
     rng = scrape_day.catchup_range()
     if rng is None:
         _log_progress("数据已是最新，无需抓取")
+        # 没有抓取也要核算：可能是白天手动补过数，页面摘要不该停在更早的一天
+        _price_snapshot()
         return
     start, end = rng
     newest = scrape_day.newest_day()
