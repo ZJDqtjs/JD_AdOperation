@@ -3039,7 +3039,7 @@ function load(acc, s, e){
         + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e))
     .then(function(r){ return r.json(); })
     .then(function(j){
-      if(!j.ok){ msg(j.error || '读取失败', true); return; }
+      if(!j.ok){ msg(j.error || '读取失败', true); loadSnap(acc); return; }
       LAST = j; DAYS = j.days || []; ROWS = j.rows || []; TOT = j.totals || {};
       if(!ROWS.length){
         msg('该区间没有有成交的商品：可能还没抓这几天的商智明细（见下方覆盖提示）', true);
@@ -3047,10 +3047,58 @@ function load(acc, s, e){
         msg('已读取本地商智明细（未请求京东）。点任意商品看逐日价格曲线。');
       }
       render(); kpis(); cover();
+      loadSnap(acc);
       history.replaceState(null, '', location.pathname + '?account=' + encodeURIComponent(acc)
         + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e));
     })
-    .catch(function(err){ msg('读取失败：' + err, true); });
+    .catch(function(err){ msg('读取失败：' + err, true); loadSnap(acc); });
+}
+
+/* 夜间自动核算：每天凌晨抓完数据后由服务端算好落盘，这里只读结果做摘要 */
+function loadSnap(acc){
+  var m = $('pwAutoMsg'), box = $('pwAutoBody');
+  if(!m || !box) return;
+  m.textContent = '读取最近一次夜间核算…';
+  box.innerHTML = '';
+  fetch('/api/price/snapshot?account=' + encodeURIComponent(acc || $('pwAcc').value))
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){
+        m.textContent = j.error || '还没有核算记录';
+        return;
+      }
+      var at = String(j.generatedAt || '').replace('T', ' ').slice(0, 16);
+      m.innerHTML = '最近核算 <b>' + esc(j.day) + '</b>'
+        + (at ? '（' + esc(at) + '）' : '')
+        + '　当日有成交 <b>' + cnt(j.skuCount) + '</b> 个 SKU'
+        + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>'
+        + '　当日均价 <b>' + money(j.avgPrice) + '</b>（成交 ' + cnt(j.qty) + ' 件）';
+      var list = (j.rows || []).filter(function(r){
+        var n = num(r.changeDodPct);
+        return n !== null && Math.abs(n) >= 2 && num(r.qty) >= 5;
+      });
+      list.sort(function(a, b){ return Math.abs(num(b.changeDodPct)) - Math.abs(num(a.changeDodPct)); });
+      list = list.slice(0, 6);
+      if(!list.length){
+        box.innerHTML = '<div class="pwsub">当天没有「变动 ≥2% 且件数 ≥5」的 SKU。</div>';
+        return;
+      }
+      box.innerHTML = '<div class="tblwrap short" style="margin-top:10px"><table><thead><tr>'
+        + '<th class="l noSort">商品（变动最大的 6 个）</th>'
+        + '<th class="n noSort">当日前台价</th><th class="n noSort">上次价格</th>'
+        + '<th class="n noSort">变动</th><th class="n noSort">件数</th></tr></thead><tbody>'
+        + list.map(function(r){
+            return '<tr class="pwrow" data-sku="' + esc(r.skuId) + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
+              + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">' + esc(r.itemName || r.skuId) + '</div>'
+              + '<div class="id">' + esc(r.skuId) + '</div></td>'
+              + '<td>' + money(r.priceLatest) + '</td>'
+              + '<td>' + money(r.pricePrev) + '</td>'
+              + '<td>' + pctCell(r.changeDodPct, '') + '</td>'
+              + '<td>' + cnt(r.qty) + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    })
+    .catch(function(){ m.textContent = '读取夜间核算记录失败'; });
 }
 
 window.PW = {
@@ -3076,6 +3124,16 @@ window.PW = {
       all[i].className = 'pwrow' + (all[i].getAttribute('data-sku') === String(sid) ? ' on' : '');
     }
     detail(r);
+  },
+  /* 夜间核算摘要里点某个 SKU：滚到主表并打开它的曲线 */
+  pickSku: function(sid){
+    var tr = document.querySelector('#pwBody tr.pwrow[data-sku="' + String(sid) + '"]');
+    if(!tr){
+      msg('当前区间的表里没有这个 SKU，把区间调到包含核算日再看', true);
+      return;
+    }
+    tr.scrollIntoView({behavior:'smooth', block:'center'});
+    window.PW.pick(tr);
   },
   render: render,
   sync: function(){
@@ -3199,6 +3257,12 @@ def price_page(request: Request):
   <div class="pwcover" id="pwCover"></div>
 </div>
 
+<div class="card" id="pwAutoCard" style="margin-top:18px">
+  <h2>夜间自动核算 <span class="tagline">每天凌晨抓完昨天数据后自动生成</span></h2>
+  <div class="hint" id="pwAutoMsg" style="margin-bottom:0">读取最近一次夜间核算…</div>
+  <div id="pwAutoBody"></div>
+</div>
+
 <div class="grid g4" id="pwKpis" style="display:none;margin-top:18px"></div>
 
 <div class="card" id="pwTableCard" style="margin-top:18px">
@@ -3231,6 +3295,10 @@ def price_page(request: Request):
   <p><b>怎么用来调广告</b>：降价后同样的点击更容易成交，转化率上升是预期内的；
      若降价后转化没起来，多半是流量/竞价问题而不是价格。涨价期 CTR 与转化下滑同样属正常，
      可对照本页的访客数与成交件数判断是否要收预算。</p>
+  <p><b>夜间自动核算</b>：每天凌晨抓完昨天的商智数据后，服务端会把那一天的逐 SKU 前台价
+     （以及相对各自上一个有价日的变动）算好存一份，就是顶部「夜间自动核算」卡片；
+     因为商智 T+1 只出一半、T+2~T+3 才定稿，每次会把最近 3 个有数据的日子一起重算覆盖。
+     任务日志里能看到「前台价已核算 &lt;日期&gt;」。</p>
 </div>
 
 </div>
@@ -3257,6 +3325,21 @@ def api_price(account: str | None = None, start: str = "", end: str = ""):
     if len(span) > 400:
         return {"ok": False, "error": "区间最长 400 天，请缩小范围"}
     return pricewatch.build(acc, span[0], span[-1])
+
+
+@app.get("/api/price/snapshot")
+def api_price_snapshot(account: str | None = None):
+    """最近一次「夜间自动核算」结果（凌晨抓完数据后由 pricewatch.run_nightly 落盘）。"""
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = account or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    snap = pricewatch.latest_snapshot(acc)
+    if not snap:
+        return {"ok": False, "empty": True,
+                "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）；"
+                         "下面价格表本身是现算的，可以先直接看"}
+    return {"ok": True, **snap}
 
 
 @app.post("/api/price/backfill")
@@ -4425,6 +4508,27 @@ def _ai_after_scrape(summary: dict) -> None:
     _ai.run_background(start, end, settings.ACCOUNTS)
 
 
+def _after_scrape(summary: dict) -> None:
+    """夜间抓取成功后的后置任务：先核算前台价，再生成 AI 解读。
+
+    前台价核算放在这里而不是页面里现算：抓完就有、第二天打开就能看到，
+    而且「算过哪一天」会作为文件留下来（页面顶部的「夜间自动核算」卡片读它）。
+    单独 try 住：核算失败不能连累 AI 解读。
+    """
+    if summary.get("cancelled"):
+        return
+    try:
+        done = pricewatch.run_nightly(settings.ACCOUNTS, log=_log_progress)
+        if done:
+            _log_progress("前台价核算完成：" + "；".join(
+                f"{x['label']} {x['day']} {x['skuCount']} 个 SKU" for x in done))
+        else:
+            _log_progress("前台价核算：没有可用的商智商品明细，跳过")
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"前台价核算失败：{type(exc).__name__}: {exc}")
+    _ai_after_scrape(summary)
+
+
 LOGIN_CSS = DASH_CSS + """
 /* 登录页：按钮式页签（复用 .tabs 容器，但登录用 button） */
 .tabs{border-bottom:1px solid var(--hair);margin-bottom:18px;gap:2px;margin-top:0}
@@ -4926,7 +5030,7 @@ def _nightly_job():
     res = scrape_day.run_background(settings.ACCOUNTS, start, end, force=False,
                                      log=_log_progress, name="nightly",
                                      trigger="schedule",
-                                     after=_ai_after_scrape)
+                                     after=_after_scrape)
     if not res.get("ok"):
         _log_progress(f"定时任务未启动：{res.get('error')}")
 

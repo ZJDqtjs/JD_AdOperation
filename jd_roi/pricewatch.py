@@ -14,7 +14,11 @@
 """
 from __future__ import annotations
 
-from . import dailystore as ds
+import json
+from datetime import date as _date, timedelta as _timedelta
+from pathlib import Path
+
+from . import dailystore as ds, settings
 from .indicators import SZ_AMT, SZ_ORDN, SZ_QTY, SZ_UV
 
 
@@ -149,3 +153,114 @@ def build(account: str, start: str, end: str) -> dict:
             "avgPrice": round(tot_amt / tot_qty, 2) if tot_qty else None,
         },
     }
+
+
+# ---------------------------------------------------------------- 夜间自动核算
+# 凌晨抓完昨天数据后，把「这一天」的逐 SKU 前台价和相对上一个有价日的变动算好落盘，
+# 第二天打开价格页就能直接看到摘要，不用再自己挑区间、也不会因为商智回补而看不出来。
+# 为什么存文件而不是每次现算：抓取进程和 Web 进程是两个进程，页面需要能看到
+# 「夜间到底核算过没有、核的是哪一天」，文件本身就是这条记录（也方便回看）。
+SNAP_SUBDIR = "price"
+_SNAP_KEYS = ("skuId", "itemName", "priceLatest", "pricePrev", "changeDod",
+              "changeDodPct")
+
+
+def _snap_dir() -> Path:
+    d = settings.DATA_DIR / SNAP_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def snap_path(account: str, day: str) -> Path:
+    return _snap_dir() / f"{account}_{ds.norm_day(day)}.json"
+
+
+def snapshot(account: str, day: str, lookback: int = 30) -> dict:
+    """核算某一天：当日有成交的 SKU，以及每个 SKU 相对自己上一个有价日的变动。"""
+    day = ds.norm_day(day)
+    start = (_date.fromisoformat(day)
+             - _timedelta(days=max(int(lookback), 2) - 1)).isoformat()
+    data = build(account, start, day)
+    # build() 里的 amt/qty 是**整个区间**的合计，摘要要的是「那一天」的量，单独读一次当天文件
+    day_amt: dict = {}
+    day_qty: dict = {}
+    for r in (ds.load_day(account, day, "sz_product") or {}).get("rows") or []:
+        if r.get("$summary"):
+            continue
+        sid = str(r.get("sku_id") or "").strip()
+        if not sid or sid == "合计":
+            continue
+        day_amt[sid] = day_amt.get(sid, 0.0) + _f(r.get(SZ_AMT))
+        day_qty[sid] = day_qty.get(sid, 0.0) + _f(r.get(SZ_QTY))
+
+    rows = []
+    for r in data["rows"]:
+        if r["latestDay"] != day:
+            continue
+        item = {k: r[k] for k in _SNAP_KEYS}
+        item["amt"] = round(day_amt.get(r["skuId"], 0.0), 2)
+        item["qty"] = int(day_qty.get(r["skuId"], 0.0))
+        rows.append(item)
+    amt = sum(day_amt.values())
+    qty = sum(day_qty.values())
+    up = sum(1 for r in rows if (r["changeDodPct"] or 0) > 0.5)
+    down = sum(1 for r in rows if (r["changeDodPct"] or 0) < -0.5)
+    return {
+        "account": account,
+        "label": settings.get_account(account).get("label") or account,
+        "day": day,
+        "generatedAt": settings.now_iso(),
+        "skuCount": len(rows),
+        "up": up,
+        "down": down,
+        "amt": round(amt, 2),
+        "qty": int(qty),
+        "avgPrice": round(amt / qty, 2) if qty else None,
+        "rows": rows,
+    }
+
+
+def save_snapshot(snap: dict) -> Path:
+    p = snap_path(snap["account"], snap["day"])
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+    return p
+
+
+def latest_snapshot(account: str):
+    """该账号最近一次核算（按日期取最新，不按文件时间，避免历史重算抢镜）。"""
+    d = settings.DATA_DIR / SNAP_SUBDIR
+    if not d.exists():
+        return None
+    files = sorted(d.glob(f"{account}_*.json"))
+    if not files:
+        return None
+    try:
+        return json.loads(files[-1].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def run_nightly(accounts=None, days_back: int = 3, log=None) -> list:
+    """夜间抓取成功后调用：核算最近几个「有商智数据」的日前台价并落盘。
+
+    算的不只是最新一天：商智 T+1 只有一半、T+2~T+3 才定稿，夜里会回刷最近 15 天，
+    所以把最近 3 个有数据的天一起重算覆盖，历史那两天会逐步修正成定稿值。
+    """
+    out = []
+    for acc in (accounts or settings.ACCOUNTS):
+        key = acc.get("key") if isinstance(acc, dict) else str(acc)
+        # 只回看最近 10 天：再往前不会在本轮回刷，没必要每天读一遍
+        recent = ds.days_for(key, "sz_product")[-10:]
+        days = [d for d in recent
+                if ds.payload_rows(ds.load_day(key, d, "sz_product")) > 0][-max(days_back, 1):]
+        for day in days:
+            snap = snapshot(key, day)
+            save_snapshot(snap)
+            if log:
+                log(f"[{snap['label']}] 前台价已核算 {day}：{snap['skuCount']} 个 SKU"
+                    f"（涨 {snap['up']} / 跌 {snap['down']}）")
+            out.append({k: snap[k] for k in
+                        ("account", "label", "day", "skuCount", "up", "down", "avgPrice")})
+    return out
