@@ -1,0 +1,18 @@
+# 给「远程 WSL / 无桌面」场景用的登录镜像：在 jd-roi:latest 之上装一个虚拟显示 + 网页 VNC。
+#
+# 为什么需要：容器里没有 X 显示，WSLg 的窗口又只出现在 Windows 主机屏幕上，
+# 通过 SSH 连 WSL 的人看不到，滑块验证就永远做不完。
+# 这里用 Xvfb 开一块虚拟屏，x11vnc 把画面暴露出来，noVNC/websockify 再转成网页，
+# 用户在浏览器里就能看到并操作那个 Chromium。
+#
+# 用法见 scripts/login_remote.sh：
+#   docker build -f docker/Dockerfile.vnc -t jd-roi:vnc .
+FROM jd-roi:latest
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      xvfb x11vnc novnc websockify x11-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV DISPLAY=:99
+EXPOSE 6080

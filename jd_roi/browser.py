@@ -20,6 +20,9 @@ def _ensure_dirs() -> None:
 
 
 _HEADLESS_TOKEN = "HeadlessChrome"
+# 京东登录票据 cookie 名（任一存在即视为「有票据」；有效性另由 session_ok 确认）。
+# thor 是当前主票据，pin 是老账号名 cookie（2026-11 起已不再稳定下发）。
+_TICKET_COOKIES = ("pin", "pinId", "thor")
 # 无头时 Chromium 自报家门的字样会出现在三处，必须一起换掉，少一处都白改：
 #   1. navigator.userAgent                → 实测 …HeadlessChrome/153.0.8010.12…
 #   2. Sec-CH-UA 请求头                    → 实测 "HeadlessChrome";v="153"（服务端每个请求都能看到）
@@ -164,12 +167,20 @@ def launch_with_state(headless: bool | None = None, account: str | None = None):
 
 
 def has_login(context: BrowserContext) -> bool:
-    """判断是否已登录京东：以 .jd.com 域的 pin（账号名）cookie 为准。
+    """判断 Profile 里有没有京东登录票据（pin / pinId / thor 任一即可）。
 
-    注：京东现行登录票据为 pin/pinId/thor/sdtoken，不再使用 pt_key。
+    **不要只认 pin**：2026-11 起京东不再稳定下发 `pin`（账号名）这个 cookie，
+    实测线上主账号只有 `pinId` + `thor`，但京准通/商智都能正常访问。
+    以前这里只比对 `pin`，结果每次登录态检查、每次抓取都被判成「未登录」，
+    把人往「重新扫码 / 拖滑块」上带，实际会话是好的。
+
+    这里只回答「有没有票据」，**票据是否还有效必须再用 session_ok() 让服务端确认**：
+    cookie 还在但会话过期是很常见的，只看 cookie 会误判成已登录。
     """
     for c in context.cookies():
-        if c.get("name") == "pin" and c.get("domain", "").endswith("jd.com") and c.get("value"):
+        if (c.get("name") in _TICKET_COOKIES
+                and c.get("domain", "").endswith("jd.com")
+                and c.get("value")):
             return True
     return False
 
