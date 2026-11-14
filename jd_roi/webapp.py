@@ -10,6 +10,7 @@
     /ai          独立 AI 分析台：每日 AI 报告 + 可追问对话框（含思考过程流式展示）
     /paycomm     CPS 花费：按 SKU 看付款佣金金额，可导出 Excel
     /paycomm/spend  京准通花费：按 SKU 看广告花费（智能投放 + 全站智能推广），可导出 Excel
+    /price      SKU 前台价：逐日看每个 SKU 的成交均价怎么变（读本地按天入库的商智明细）
     /cashflow    广告费流水：账户余额、充值/消费柱状图、每日消耗（财务记录口径）
     /login       扫码登录
 
@@ -55,7 +56,8 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse, Response, StreamingResponse)
 
 from . import (aijobs, ai_page, analyze2, analyze_ai, cashflow, config,
-               dailystore as ds, industry, paycomm, profit, report2, scrape_day, settings)
+               dailystore as ds, industry, paycomm, pricewatch, profit, report2,
+               scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -2718,6 +2720,565 @@ def api_profit_export(job: str | None = None, account: str | None = None,
         headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
 
 
+# ================================================================ SKU 前台价
+# 数据只读本地按天入库的商智商品明细（jd_roi/pricewatch.py），不发任何请求。
+# 前台件单价 = 成交金额 ÷ 成交件数，所以「有成交才有价」：某天 0 件，这天就没有价。
+PRICE_CSS = """
+#pwTable td.l{text-align:left}
+/* 10 列要塞进一屏：单元格留白收窄一点，并禁止「↑ 0.22%」被折成两行 */
+#pwTable th,#pwTable td{padding:9px 8px}
+#pwTable td{white-space:nowrap}
+.qrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tblwrap.long{max-height:74vh}
+/* 页头快捷链接：不让「→」被挤到下一行 */
+.pagehead .actions a.btn{white-space:nowrap}
+.pwsku{display:flex;align-items:center;gap:9px;min-width:0}
+.pwsku img,.pwsku .pwph{width:34px;height:34px;border-radius:6px;object-fit:cover;
+  background:var(--soft);flex:0 0 34px;display:block}
+.pwsku .nm{font-size:12.5px;line-height:1.35;color:var(--ink);max-width:300px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.pwsku .id{font-size:11px;color:var(--muted2);font-family:var(--mono)}
+.pwcur{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+.pwsub{font-size:11px;color:var(--muted2);font-variant-numeric:tabular-nums;line-height:1.5;
+  white-space:nowrap}
+.pwspark{width:118px;height:26px;display:block;margin-left:auto}
+tr.pwrow{cursor:pointer}
+tr.pwrow:hover td{background:#fbf8f3}
+tr.pwrow.on td{background:var(--surface-card)}
+#pwChart{height:340px;width:100%}
+.pwcover{display:flex;gap:8px 18px;flex-wrap:wrap;align-items:center;font-size:12px;
+  color:var(--muted);margin:2px 0 0}
+.pwcover b{color:var(--ink)}
+.pwempty{color:var(--muted);font-size:13px;padding:26px 0;text-align:center}
+"""
+
+PRICE_JS = r"""
+(function(){
+var INIT = window.PW_INIT || {};
+var API = INIT.api || '/api/price';
+var DAYS = [], ROWS = [], TOT = {}, SEL = null, LAST = null, CH = null;
+var SORT = {k:'amt', d:-1};
+
+var COLS = [
+  {k:'__item',  t:'商品',      l:1},
+  {k:'priceLatest', t:'最新前台价'},
+  {k:'changeDodPct', t:'较上日'},
+  {k:'changePct', t:'较区间初'},
+  {k:'priceAvg', t:'区间均价'},
+  {k:'__band',  t:'区间价带'},
+  {k:'qty',     t:'成交件数'},
+  {k:'amt',     t:'成交金额'},
+  {k:'uv',      t:'访客数'},
+  {k:'__spark', t:'走势'}
+];
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function num(v){ if(v===null||v===undefined||v==='') return null; var n=Number(v);
+  return isNaN(n)?null:n; }
+function fx(v,dec){ var n=num(v); if(n===null) return '—';
+  return n.toLocaleString('zh-CN',{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
+function money(v){ var n=num(v); return n===null?'—':('¥'+fx(n,2)); }
+function cnt(v){ var n=num(v); return n===null?'—':n.toLocaleString('zh-CN'); }
+function msg(s,bad){ var el=$('pwMsg'); if(!el) return; el.textContent=s||'';
+  el.style.color = bad ? 'var(--redink)' : 'var(--muted)'; }
+
+function pctCell(v, extra){
+  var n = num(v);
+  if(n===null) return '<span class="flat">—</span>'+(extra?'<div class="pwsub">'+extra+'</div>':'');
+  // ±0.05% 以内算平稳：显示 0.00% 却配个红绿箭头会让人误判
+  var c = n > 0.05 ? 'up' : (n < -0.05 ? 'down' : 'flat');
+  var a = n > 0.05 ? '↑' : (n < -0.05 ? '↓' : '·');
+  return '<span class="delta '+c+'">'+a+' '+fx(Math.abs(n),2)+'%</span>'
+       + (extra?'<div class="pwsub">'+extra+'</div>':'');
+}
+/* 行内走势：把每日价画成折线；没有价的天断开（不插值，避免编出一个不存在的价格） */
+function spark(arr){
+  arr = arr || [];
+  var vals = [], i;
+  for(i=0;i<arr.length;i++){ if(num(arr[i])!==null) vals.push(+arr[i]); }
+  if(vals.length < 2) return '<span class="pwsub" style="display:block;text-align:right">—</span>';
+  var min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+  var span = (max - min) || 1, W = 118, H = 26, P = 3;
+  function x(i){ return P + (W-2*P) * (arr.length<2 ? 0 : i/(arr.length-1)); }
+  function y(v){ return P + (H-2*P) * (1 - (v-min)/span); }
+  var segs = [], cur = [];
+  for(i=0;i<arr.length;i++){
+    var v = num(arr[i]);
+    if(v===null){ if(cur.length){ segs.push(cur); cur = []; } }
+    else { cur.push([i, +v]); }
+  }
+  if(cur.length) segs.push(cur);
+  var d = segs.map(function(s){
+    return s.map(function(p,k){ return (k?'L':'M') + x(p[0]).toFixed(1) + ' ' + y(p[1]).toFixed(1); }).join('');
+  }).join('');
+  var last = vals[vals.length-1], first = vals[0];
+  var col = last > first ? '#2E9E5B' : (last < first ? '#D64545' : '#8e8b82');
+  var lastPt = null;
+  for(i=arr.length-1;i>=0;i--){ if(num(arr[i])!==null){ lastPt = [i, +arr[i]]; break; } }
+  var dot = lastPt ? ('<circle cx="'+x(lastPt[0]).toFixed(1)+'" cy="'+y(lastPt[1]).toFixed(1)
+    +'" r="2.2" fill="'+col+'"/>') : '';
+  return '<svg class="pwspark" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" aria-hidden="true">'
+    + '<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="1.4" stroke-linejoin="round"/>'
+    + dot + '</svg>';
+}
+
+function head(){
+  var h = '<tr>';
+  COLS.forEach(function(c){
+    var mark = (SORT.k === c.k) ? (SORT.d<0 ? ' ↓' : ' ↑') : '';
+    h += '<th class="'+(c.l?'l ':'')+'noSort" data-key="'+c.k+'" onclick="PW.sort(\''+c.k+'\')">'
+       + esc(c.t) + mark + '</th>';
+  });
+  return h + '</tr>';
+}
+
+function rowHtml(r){
+  var on = (SEL === r.skuId) ? ' on' : '';
+  var img = r.img ? '<img src="'+esc(r.img)+'" alt="" loading="lazy">' : '<span class="pwph"></span>';
+  var dod = num(r.changeDod), chg = num(r.change);
+  var dodExtra = dod===null ? '' : ((dod>0?'+':'')+fx(dod,2)+' 元');
+  var chgExtra = chg===null ? '' : ((chg>0?'+':'')+fx(chg,2)+' 元');
+  return '<tr class="pwrow'+on+'" data-sku="'+esc(r.skuId)+'" onclick="PW.pick(this)">'
+    + '<td class="l"><div class="pwsku">'+img
+      + '<div><div class="nm" title="'+esc(r.itemName)+'">'+esc(r.itemName||'—')+'</div>'
+      + '<div class="id">'+esc(r.skuId)+'</div></div></div></td>'
+    + '<td><span class="pwcur">'+money(r.priceLatest)+'</span>'
+      + '<div class="pwsub">'+esc(String(r.latestDay||'').slice(5))
+      + ' · '+cnt(r.priceDays)+'天有价</div></td>'
+    + '<td>'+pctCell(r.changeDodPct, dodExtra)+'</td>'
+    + '<td>'+pctCell(r.changePct, chgExtra)+'</td>'
+    + '<td>'+money(r.priceAvg)+'</td>'
+    + '<td>'+money(r.priceMin)+'~'+money(r.priceMax)
+      + '<div class="pwsub">振幅 '+fx(r.swingPct,1)+'%</div></td>'
+    + '<td>'+cnt(r.qty)+'</td>'
+    + '<td>'+money(r.amt)+'</td>'
+    + '<td>'+cnt(r.uv)+'</td>'
+    + '<td>'+spark(r.spark)+'</td>'
+    + '</tr>';
+}
+
+function sortVal(r, k){
+  if(k==='__item') return String(r.itemName||'');
+  if(k==='__band') return num(r.swingPct);
+  if(k==='__spark') return num(r.changePct);
+  return num(r[k]);
+}
+
+function render(){
+  var kw = ($('pwFilter') ? $('pwFilter').value : '').trim().toLowerCase();
+  var list = ROWS.filter(function(r){
+    if(!kw) return true;
+    return String(r.skuId||'').indexOf(kw) >= 0
+        || String(r.itemName||'').toLowerCase().indexOf(kw) >= 0;
+  });
+  list = list.slice().sort(function(a,b){
+    var x = sortVal(a, SORT.k), y = sortVal(b, SORT.k);
+    if(typeof x === 'string' || typeof y === 'string'){
+      return String(x||'').localeCompare(String(y||'')) * SORT.d;
+    }
+    if(x===null) x = -1e18;
+    if(y===null) y = -1e18;
+    return (x-y) * SORT.d;
+  });
+  $('pwHead').innerHTML = head();
+  $('pwBody').innerHTML = list.map(rowHtml).join('')
+    || '<tr><td colspan="'+COLS.length+'" class="l pwempty">没有匹配的商品</td></tr>';
+  $('pwCount').textContent = '共 ' + ROWS.length + ' 个有成交的 SKU'
+    + (list.length !== ROWS.length ? ('，筛选后 ' + list.length + ' 行') : '');
+}
+
+function kpiBox(label, val, sub){
+  return '<div class="kpi"><div class="lbl">'+esc(label)+'</div><div class="val">'+val+'</div>'
+    + (sub?'<div class="sub">'+sub+'</div>':'') + '</div>';
+}
+
+function kpis(){
+  var up = 0, down = 0, flat = 0, best = null, worst = null;
+  ROWS.forEach(function(r){
+    var n = num(r.changePct);
+    if(n===null) return;
+    // 选「最大涨幅」时跳过件数太少的：个位数成交的均价会被规格/优惠组合带飞
+    if(n > 0.5){
+      up++; if(r.qty >= 10 && (!best || n > +best.changePct)) best = r;
+    } else if(n < -0.5){
+      down++; if(r.qty >= 10 && (!worst || n < +worst.changePct)) worst = r;
+    } else { flat++; }
+  });
+  var t = TOT || {};
+  var box = '';
+  box += kpiBox('有价 SKU', cnt(t.skuCount),
+      '商智明细 <b>'+cnt(t.dataDays)+'</b>/'+cnt(t.rangeDays)+' 天有数据');
+  box += kpiBox('全店加权均价', money(t.avgPrice),
+      '成交 '+cnt(t.qty)+' 件 · '+money(t.amt));
+  box += kpiBox('较区间初 涨 / 跌', '<span class="up">'+up+'</span> / <span class="down">'+down+'</span>',
+      '平稳 '+flat+' 个（±0.5% 内）');
+  if(best){
+    box += kpiBox('最大涨幅（≥10 件）', '<span class="up">+'+fx(best.changePct,1)+'%</span>',
+        esc(String(best.itemName || best.skuId).slice(0, 26))
+        + '<br>'+money(best.priceFirst)+' → '+money(best.priceLatest)
+        + ' · '+cnt(best.qty)+' 件');
+  } else {
+    box += kpiBox('最大跌幅（≥10 件）',
+        worst ? ('<span class="down">'+fx(worst.changePct,1)+'%</span>') : '—',
+        worst ? (esc(String(worst.itemName||worst.skuId).slice(0,26))
+                 + '<br>'+money(worst.priceFirst)+' → '+money(worst.priceLatest)
+                 + ' · '+cnt(worst.qty)+' 件')
+              : '区间内没有可比的两天');
+  }
+  $('pwKpis').innerHTML = box;
+  $('pwKpis').style.display = '';
+}
+
+function cover(){
+  var t = TOT || {}, bits = [];
+  bits.push('区间 <b>'+esc(LAST.start)+' ~ '+esc(LAST.end)+'</b>');
+  bits.push('商智明细已入库 <b>'+cnt(t.dataDays)+'</b>/'+cnt(t.rangeDays)+' 天');
+  var miss = (LAST.missingDays || []), empty = (LAST.emptyDays || []);
+  if(miss.length){
+    bits.push('缺 <b>'+miss.length+'</b> 天未抓：'+esc(miss.slice(0,4).join('、'))
+      + (miss.length>4?' …':''));
+  }
+  if(empty.length){
+    bits.push('<b>'+empty.length+'</b> 天 0 行（抓早了，商智还没出数）');
+  }
+  var html = bits.join(' <span class="dot" style="display:inline-block;width:3px;height:3px;'
+    + 'border-radius:50%;background:var(--muted2);margin:0 4px;vertical-align:middle"></span> ');
+  if(miss.length || empty.length){
+    html += ' <button class="btn sec mini" style="margin-left:8px" onclick="PW.sync()">'
+      + '补齐缺失天数</button>';
+  }
+  $('pwCover').innerHTML = html;
+}
+
+function detail(r){
+  $('pwDetail').style.display = '';
+  $('pwDTitle').textContent = r.itemName || r.skuId;
+  $('pwDSub').innerHTML = 'SKU '+esc(r.skuId)
+    + '　最新 <b>'+money(r.priceLatest)+'</b>（'+esc(r.latestDay||'—')+'）'
+    + '　区间均价 <b>'+money(r.priceAvg)+'</b>'
+    + '　区间价带 '+money(r.priceMin)+' ~ '+money(r.priceMax)
+    + '　成交 '+cnt(r.qty)+' 件 / '+money(r.amt)
+    + '　访客 '+cnt(r.uv);
+  drawChart(r);
+  $('pwDetail').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+function drawChart(r){
+  var box = $('pwChart');
+  if(!box || !window.echarts) return;
+  if(!CH) CH = echarts.init(box);
+  var xs = DAYS.map(function(d){ return String(d).slice(5); });
+  CH.setOption({
+    animationDuration: 260,
+    grid:{left:58, right:58, top:34, bottom:36},
+    tooltip:{trigger:'axis', formatter:function(ps){
+      if(!ps || !ps.length) return '';
+      var out = DAYS[ps[0].dataIndex] || '';
+      ps.forEach(function(p){
+        var v = (p.value===null || p.value===undefined) ? null : p.value;
+        out += '<br>' + p.marker + p.seriesName + '：'
+          + (v===null ? '—' : (p.seriesName==='前台价' ? (v+' 元/件') : (v+' 件')));
+      });
+      return out;
+    }},
+    legend:{top:0, right:56, itemWidth:12, itemHeight:8,
+      textStyle:{fontSize:11, color:'#6c6a64'}},
+    xAxis:{type:'category', data:xs,
+      axisLabel:{fontSize:10, color:'#8e8b82'}, axisLine:{lineStyle:{color:'#e6dfd8'}},
+      axisTick:{show:false}},
+    yAxis:[
+      {type:'value', name:'元/件', scale:true,
+       nameTextStyle:{fontSize:10, color:'#8e8b82'},
+       axisLabel:{fontSize:10, color:'#8e8b82'},
+       splitLine:{lineStyle:{color:'#f1ece4'}}},
+      {type:'value', name:'件', nameTextStyle:{fontSize:10, color:'#8e8b82'},
+       axisLabel:{fontSize:10, color:'#8e8b82'}, splitLine:{show:false}}
+    ],
+    series:[
+      {name:'前台价', type:'line', data:r.spark, connectNulls:false,
+       symbol:'circle', symbolSize:5,
+       lineStyle:{width:2, color:'#cc785c'}, itemStyle:{color:'#cc785c'},
+       areaStyle:{color:'rgba(204,120,92,.07)'},
+       markLine:{silent:true, symbol:'none',
+         data:[{yAxis:r.priceAvg, lineStyle:{type:'dashed', color:'#8e8b82'},
+           label:{formatter:'区间均价 '+r.priceAvg, position:'insideEndTop',
+                  fontSize:10, color:'#6c6a64'}}]}},
+      {name:'成交件数', type:'bar', yAxisIndex:1, data:r.sparkQty,
+       barMaxWidth:16, itemStyle:{color:'rgba(108,106,100,.16)'}}
+    ]
+  }, true);
+  CH.resize();
+}
+
+function clearDetail(){
+  SEL = null;
+  $('pwDetail').style.display = 'none';
+}
+
+function poll(){
+  fetch('/api/run/status').then(function(r){ return r.json(); }).then(function(j){
+    if(j.active){
+      msg('补抓中：' + (j.progress || '') + (j.account ? ('　' + j.account) : ''));
+      setTimeout(poll, 3000);
+    } else if(j.error){
+      msg('补抓失败：' + String(j.error).slice(0, 300), true);
+    } else {
+      msg('补抓完成，正在刷新…');
+      setTimeout(function(){ location.reload(); }, 800);
+    }
+  }).catch(function(){ setTimeout(poll, 5000); });
+}
+
+function load(acc, s, e){
+  msg('读取本地商智明细…');
+  LAST = null; ROWS = []; DAYS = []; TOT = {}; clearDetail();
+  $('pwKpis').style.display = 'none';
+  fetch(API + '?account=' + encodeURIComponent(acc)
+        + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e))
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ msg(j.error || '读取失败', true); return; }
+      LAST = j; DAYS = j.days || []; ROWS = j.rows || []; TOT = j.totals || {};
+      if(!ROWS.length){
+        msg('该区间没有有成交的商品：可能还没抓这几天的商智明细（见下方覆盖提示）', true);
+      } else {
+        msg('已读取本地商智明细（未请求京东）。点任意商品看逐日价格曲线。');
+      }
+      render(); kpis(); cover();
+      history.replaceState(null, '', location.pathname + '?account=' + encodeURIComponent(acc)
+        + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e));
+    })
+    .catch(function(err){ msg('读取失败：' + err, true); });
+}
+
+window.PW = {
+  run: function(){
+    var acc = $('pwAcc').value, s = $('pwStart').value, e = $('pwEnd').value;
+    if(!s || !e){ msg('请先选好起止日期', true); return; }
+    if(s > e){ msg('结束日不能早于开始日', true); return; }
+    load(acc, s, e);
+  },
+  sort: function(k){
+    if(SORT.k === k) SORT.d = -SORT.d;
+    else { SORT.k = k; SORT.d = (k==='__item') ? 1 : -1; }
+    render();
+  },
+  pick: function(tr){
+    var sid = tr.getAttribute('data-sku');
+    var r = null;
+    ROWS.forEach(function(x){ if(String(x.skuId) === String(sid)) r = x; });
+    if(!r) return;
+    SEL = r.skuId;
+    var all = document.querySelectorAll('#pwTable tr.pwrow');
+    for(var i=0;i<all.length;i++){
+      all[i].className = 'pwrow' + (all[i].getAttribute('data-sku') === String(sid) ? ' on' : '');
+    }
+    detail(r);
+  },
+  render: render,
+  sync: function(){
+    if(!LAST) return;
+    var days = (LAST.missingDays || []).concat(LAST.emptyDays || []).sort();
+    if(!days.length){ msg('没有缺失的天'); return; }
+    var s = days[0], e = days[days.length-1];
+    msg('正在补抓商智明细 ' + s + ' ~ ' + e + '（会占用浏览器登录态，只抓商智）…');
+    fetch('/api/price/backfill?account=' + encodeURIComponent(LAST.account)
+          + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e),
+          {method:'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){ msg(j.error || '启动失败', true); return; }
+        // 等后台线程真的把 _RUNNING 置成 active 再轮询，否则第一次会误判成「已完成」
+        setTimeout(poll, 2500);
+      })
+      .catch(function(err){ msg('启动失败：' + err, true); });
+  }
+};
+
+function parseIso(s){
+  var p = String(s || '').split('-');
+  return (p.length === 3) ? new Date(+p[0], +p[1]-1, +p[2]) : null;
+}
+function iso(d){
+  function pad(n){ return (n<10?'0':'') + n; }
+  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
+}
+window.PWQUICK = function(k){
+  var t = parseIso(INIT.today) || new Date();
+  var end = new Date(t.getFullYear(), t.getMonth(), t.getDate()-1);   // 商智只到昨天
+  var start;
+  if(k === 'd7'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-6); }
+  else if(k === 'd14'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-13); }
+  else if(k === 'd30'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-29); }
+  else if(k === 'month'){
+    if(t.getDate() === 1){ start = new Date(end.getTime()); }
+    else { start = new Date(t.getFullYear(), t.getMonth(), 1); }
+  }
+  else if(k === 'lastmonth'){
+    end = new Date(t.getFullYear(), t.getMonth(), 0);
+    start = new Date(end.getFullYear(), end.getMonth(), 1);
+  }
+  if(!start) return;
+  $('pwStart').value = iso(start);
+  $('pwEnd').value = iso(end);
+  window.PW.run();
+};
+
+window.addEventListener('resize', function(){ if(CH) CH.resize(); });
+window.PW.run();
+})();
+"""
+
+
+@app.get("/price", response_class=HTMLResponse)
+def price_page(request: Request):
+    """SKU 前台价：逐日看每个 SKU 的「成交金额 ÷ 成交件数」怎么变。
+
+    只读本地按天入库的商智商品明细（不发请求），所以打开即出数；
+    缺天 / 0 行天会在页面上点名，并可一键补抓（只抓 sz_product）。
+    """
+    q = request.query_params
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = q.get("account") or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    end = _yesterday()
+    start = end - dt.timedelta(days=29)
+    if q.get("start") and q.get("end"):
+        try:
+            s0, e0 = dt.date.fromisoformat(ds.norm_day(q.get("start"))), \
+                dt.date.fromisoformat(ds.norm_day(q.get("end")))
+            if s0 <= e0:
+                start, end = s0, e0
+        except ValueError:
+            pass
+    opts = "".join(
+        f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    init = {"api": "/api/price", "account": acc, "today": _today().isoformat(),
+            "start": start.isoformat(), "end": end.isoformat()}
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SKU 前台价 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PRICE_CSS}</style>
+</head><body>
+{report2.navtop("/price")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}价格</div>
+  <h1>SKU 前台价走势</h1>
+  <div class="metaline">
+    <span>前台件单价 = 商智成交金额 ÷ 成交件数</span><span class="dot"></span>
+    <span>消费者实付（含优惠券 / 满减）</span><span class="dot"></span>
+    <span>只读本地按天入库，不发请求</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/profit">月度利润 →</a>
+    <a class="btn ghost mini" href="/report">分析报表 →</a>
+    <a class="btn ghost mini" href="/cache?kind=sz_product">缓存管理 →</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="card">
+  <div class="toolbar">
+    <label class="fld">账号 <select id="pwAcc" onchange="PW.run()">{opts}</select></label>
+    <label class="fld">起 <input type="date" id="pwStart" value="{_e(start.isoformat())}"></label>
+    <label class="fld">止 <input type="date" id="pwEnd" value="{_e(end.isoformat())}"></label>
+    <button class="btn" onclick="PW.run()">查询</button>
+    <span class="qrow" style="margin:0">
+      <button type="button" class="chip" onclick="PWQUICK('d7')">近 7 天</button>
+      <button type="button" class="chip" onclick="PWQUICK('d14')">近 14 天</button>
+      <button type="button" class="chip" onclick="PWQUICK('d30')">近 30 天</button>
+      <button type="button" class="chip" onclick="PWQUICK('month')">本月</button>
+      <button type="button" class="chip" onclick="PWQUICK('lastmonth')">上月</button>
+    </span>
+  </div>
+  <div class="hint" id="pwMsg" style="min-height:20px">读取本地商智商品明细…</div>
+  <div class="pwcover" id="pwCover"></div>
+</div>
+
+<div class="grid g4" id="pwKpis" style="display:none;margin-top:18px"></div>
+
+<div class="card" id="pwTableCard" style="margin-top:18px">
+  <h2>价格变化 <span class="tagline">点任意一行看逐日曲线</span></h2>
+  <div class="toolbar">
+    <input id="pwFilter" placeholder="筛选 SKU / 商品名" oninput="PW.render()"
+           style="min-width:240px;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
+    <span class="hint" id="pwCount" style="margin:0"></span>
+  </div>
+  <div class="tblwrap long">
+    <table id="pwTable"><thead id="pwHead"></thead><tbody id="pwBody"></tbody></table>
+  </div>
+</div>
+
+<div class="card" id="pwDetail" style="display:none">
+  <h2><span id="pwDTitle">—</span>
+    <span class="tagline">逐日前台件单价（成交金额 ÷ 成交件数）</span></h2>
+  <div class="hint" id="pwDSub"></div>
+  <div id="pwChart"></div>
+</div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>前台件单价</b> = 商智「商品明细」成交金额 ÷ 成交件数（消费者实付，已含优惠券/满减），
+     与「月度利润」页的前台件单价是同一口径；不是商品页标价（商智没有标价字段）。</p>
+  <p><b>有成交才有价</b>：某天 0 件，这天就没有价，曲线断开、不做插值——
+     不要把一个缺口当成涨价或降价。成交件数很小（个位数）时，均价还会被不同规格/优惠组合带偏，
+     看「区间均价 + 件数」一起判断更稳。</p>
+  <p><b>商智成交会回补</b>：T+1 大约只有一半、T+2~T+3 才定稿，最近一两天的价格会随夜间回补变化
+     （每晚自动重抓近 15 天）。所以「今天看到的跌价」先别急着改价，等定稿再看。</p>
+  <p><b>怎么用来调广告</b>：降价后同样的点击更容易成交，转化率上升是预期内的；
+     若降价后转化没起来，多半是流量/竞价问题而不是价格。涨价期 CTR 与转化下滑同样属正常，
+     可对照本页的访客数与成交件数判断是否要收预算。</p>
+</div>
+
+</div>
+{report2._echarts_src()}
+<script>window.PW_INIT = {json.dumps(init, ensure_ascii=False)};</script>
+<script>{PRICE_JS}</script>
+</body></html>""")
+
+
+@app.get("/api/price")
+def api_price(account: str | None = None, start: str = "", end: str = ""):
+    """某个账号某个区间内，每个 SKU 的逐日前台价与区间汇总（纯本地读）。"""
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = account or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    if not (start and end):
+        e = _yesterday()
+        start, end = (e - dt.timedelta(days=29)).isoformat(), e.isoformat()
+    try:
+        span = ds.day_span(start, end)
+    except ValueError:
+        return {"ok": False, "error": "日期格式应为 YYYY-MM-DD"}
+    if len(span) > 400:
+        return {"ok": False, "error": "区间最长 400 天，请缩小范围"}
+    return pricewatch.build(acc, span[0], span[-1])
+
+
+@app.post("/api/price/backfill")
+def api_price_backfill(account: str = "", start: str = "", end: str = ""):
+    """只补抓商智商品明细（sz_product），给「补齐缺失天数」用。
+
+    走与夜间抓取同一个后台任务 + 同一把浏览器锁；已经在抓时会直接返回占用提示。
+    """
+    if not (start and end):
+        return {"ok": False, "error": "缺少 start / end"}
+    try:
+        ds.day_span(start, end)
+    except ValueError:
+        return {"ok": False, "error": "日期格式应为 YYYY-MM-DD"}
+    acc = settings.get_account(account)
+    try:
+        return scrape_day.run_background([acc], start, end, kinds=["sz_product"],
+                                         name="price-backfill")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 # ================================================================ API
 @app.get("/api/status")
 def api_status():
@@ -3635,6 +4196,15 @@ class LoginSession:
         from .browser import has_login, launch_persistent, session_ok
         pw = ctx = None
         try:
+            # 容器里没有 X 显示：有头 Chromium 起不来（Playwright 只会抛一句难懂的
+            # "headed browser without having a XServer"），这里先给出可操作的提示。
+            if show_window and os.name != "nt" and not os.getenv("DISPLAY"):
+                self._set(state="error",
+                          message="当前环境没有图形界面（容器内没有 X 显示），勾选「显示浏览器窗口」"
+                                  "也弹不出窗口。请改用扫码登录；如果必须过滑块，在 WSL 终端执行 "
+                                  "./scripts/login_headed.sh <账号key>，窗口会出现在 Windows 桌面，"
+                                  "登录完这里刷新就是已登录")
+                return
             # 有头模式：遇到滑块/短信验证时用户可在窗口里手动完成
             pw, ctx = launch_persistent(headless=not show_window, account=account)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -4017,8 +4587,10 @@ def login_page(request: Request):
     <div class="fld"><input id="pwdPass" type="password" autocomplete="off" placeholder="密码"></div>
     <div class="fld"><label class="hint"><input type="checkbox" id="pwdWindow" checked> 显示浏览器窗口（遇到滑块/短信验证时可在窗口里手动完成）</label></div>
     <div style="margin-bottom:12px"><button class="btn" onclick="startPwdLogin()">登录</button></div>
-    <div class="warn">若登录页要求滑块或短信验证：保持「显示浏览器窗口」勾选，在弹出的窗口里完成验证即可，
-      页面状态会自动变为已登录。无桌面的容器环境请改为本地登录后挂载 Profile。</div>
+    <div class="warn">若登录页要求滑块或短信验证：需要真实浏览器窗口。线上容器是无头环境（没有 X 显示），
+      勾选「显示浏览器窗口」也弹不出来 —— 请改用上面的「扫码登录」，或在 WSL 终端执行
+      <code>./scripts/login_headed.sh main</code>（把 main 换成对应账号 key），
+      窗口会出现在 Windows 桌面，登录完成后刷新本页即为已登录。</div>
   </div>
 
   <div style="display:flex;gap:10px;align-items:center;margin-top:14px">
