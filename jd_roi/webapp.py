@@ -73,7 +73,9 @@ URL_PREFIX = (os.getenv("JD_URL_PREFIX", "") or "").rstrip("/")
 
 _ATTR_RE = re.compile(r'\b(href|src|action)=(["\'])/(?!/)')
 # 只给已知的首段路径补前缀，避免误伤 JS 里的 split('/') 之类的普通字符串
-_URL_STR_RE = re.compile(r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico)\b)')
+_URL_STR_RE = re.compile(
+    r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico'
+    r'|cashflow|paycomm|profit|price|cache)\b)')
 
 
 @app.middleware("http")
