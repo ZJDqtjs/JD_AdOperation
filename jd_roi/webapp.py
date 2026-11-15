@@ -6,16 +6,21 @@
 
 页面：
     /            控制台（区间选择、数据覆盖、立即抓取、扫码登录）
-    /report      任意区间的聚合分析报表（自带区间选择器）
+    /report      任意区间的聚合分析报表（自带区间选择器；⑧行业大盘页签）
     /ai          独立 AI 分析台：每日 AI 报告 + 可追问对话框（含思考过程流式展示）
     /paycomm     CPS 花费：按 SKU 看付款佣金金额，可导出 Excel
     /paycomm/spend  京准通花费：按 SKU 看广告花费（智能投放 + 全站智能推广），可导出 Excel
+    /price      SKU 前台价：逐日看每个 SKU 的成交均价怎么变（读本地按天入库的商智明细）
+    /cashflow    广告费流水：账户余额、充值/消费柱状图、每日消耗（财务记录口径）
     /login       扫码登录
 
 API：
     GET  /api/status            运行状态 / 登录状态 / 最近一次任务
     GET  /api/coverage          按天数据覆盖情况
     GET  /api/analysis          区间分析 JSON
+    GET  /api/industry/status   行业大盘缓存补齐进度
+    POST /api/industry/run      起后台任务补齐/重抓行业大盘
+    POST /api/industry/refresh  报表页「重新抓取」→ 重抓后跳回报表
     GET  /api/run/status        抓取进度 + 抓取锁状态
     POST /api/run               触发抓取（后台线程）
     POST /api/run/cancel        取消当前抓取 / 解锁卡死的抓取锁
@@ -48,10 +53,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
-                               Response, StreamingResponse)
+                               RedirectResponse, Response, StreamingResponse)
 
-from . import (aijobs, ai_page, analyze2, analyze_ai, config, dailystore as ds,
-               paycomm, profit, report2, scrape_day, settings)
+from . import (aijobs, ai_page, analyze2, analyze_ai, cashflow, config,
+               dailystore as ds, industry, paycomm, pricewatch, profit, report2,
+               scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -67,7 +73,9 @@ URL_PREFIX = (os.getenv("JD_URL_PREFIX", "") or "").rstrip("/")
 
 _ATTR_RE = re.compile(r'\b(href|src|action)=(["\'])/(?!/)')
 # 只给已知的首段路径补前缀，避免误伤 JS 里的 split('/') 之类的普通字符串
-_URL_STR_RE = re.compile(r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico)\b)')
+_URL_STR_RE = re.compile(
+    r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico'
+    r'|cashflow|paycomm|profit|price|cache)\b)')
 
 
 @app.middleware("http")
@@ -95,7 +103,7 @@ async def _prefix_urls(request: Request, call_next):
 
 KINDS_UI = [("jzt_campaign", "概览计划"), ("jst_campaign", "投放计划"),
             ("jst_sku", "投放商品"), ("jst_searchword", "搜索词"),
-            ("kw", "关键词"), ("sz_product", "商智商品"),
+            ("kw", "关键词"), ("kw_ad", "关键词创意(按品)"), ("sz_product", "商智商品"),
             ("sz_flow", "商智流量"), ("oplog", "操作日志"),
             ("hourly", "分时")]
 
@@ -174,6 +182,15 @@ def account_list(accounts) -> list:
     return got or settings.ACCOUNTS
 
 
+def _ensure_industry(keys: list, start: str, end: str, *, force: bool = False) -> dict:
+    """报表/AI 生成前先命中本地缓存；缺的账号起后台补齐，不阻塞页面渲染。"""
+    try:
+        return industry.ensure(keys, start, end, force=force)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "blocks": {}, "missing": list(keys), "status": {}}
+
+
 def _range_bar(start: str, end: str, keys: list, action: str = "/report",
                show_accounts: bool = True, extra: str = "") -> str:
     """区间选择器（控制台与报表共用）。"""
@@ -189,7 +206,11 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
     lm_start = lm_end.replace(day=1)
     pm_end = lm_start - dt.timedelta(days=1)
     pm_start = pm_end.replace(day=1)
-    cal = [("本月", first, today), ("上月", lm_start, lm_end), ("上上月", pm_start, pm_end)]
+    # 今天的数据还没出全（商智只到昨天），所以「本月」一律止于昨天；
+    # 每月 1 号本月还没有完整一天，此时不显示「本月」，避免点出一个空区间。
+    yday = today - dt.timedelta(days=1)
+    cal = ([("本月", first, yday)] if first <= yday else []) + [
+        ("上月", lm_start, lm_end), ("上上月", pm_start, pm_end)]
     cal_html = "".join(
         f'<button type="button" class="pre" onclick="setSpan(\'{s.isoformat()}\',\'{e.isoformat()}\')">'
         f'{_e(lab)}</button>'
@@ -768,6 +789,8 @@ def report(request: Request):
     q = request.query_params
     start, end = ui_range(q.get("start"), q.get("end"), q.get("days"), 7)
     accounts = account_list(q.getlist("accounts"))
+    keys = [a["key"] for a in accounts]
+    _ensure_industry(keys, start, end)
     t0 = time.time()
     try:
         data = analyze2.build(start=start, end=end, accounts=accounts)
@@ -781,7 +804,6 @@ def report(request: Request):
 <p><a class="btn" href="/">← 回到控制台</a>
 <a class="btn sec" href="/report?start={_e(start)}&end={_e(end)}&days=">重试</a></p></div></div></body></html>""",
             status_code=200)
-    keys = [a["key"] for a in accounts]
     ui = _range_bar(start, end, keys, "/report",
                     extra='<a href="/">← 控制台</a>'
                           '<a href="/ai?start=%s&end=%s&accounts=%s">AI 分析台（可追问）→</a>'
@@ -806,6 +828,8 @@ def ai_console(request: Request):
     q = request.query_params
     start, end = ui_range(q.get("start"), q.get("end"), q.get("days"), 7)
     accounts = account_list(q.getlist("accounts"))
+    keys = [a["key"] for a in accounts]
+    _ensure_industry(keys, start, end)
     try:
         data = analyze2.build(start=start, end=end, accounts=accounts)
     except FileNotFoundError as exc:
@@ -817,7 +841,6 @@ def ai_console(request: Request):
 <p class="hint">区间 {_e(start)} ~ {_e(end)} 内没有任何一天的京准通数据。</p>
 <p><a class="btn" href="/">← 回到控制台</a></p></div></div></body></html>""",
             status_code=200)
-    keys = [a["key"] for a in accounts]
     ui = _range_bar(start, end, keys, "/ai")
     title = f"AI 运营分析台 {start} ~ {end}"
     cached = analyze_ai.load_latest()
@@ -924,8 +947,10 @@ td.hot{font-weight:700;color:var(--ink)}
 # 花费一览（CPS / 京准通）与月度利润共用的时间快捷按钮：昨天 / 本月 / 上月 / 上上月。
 # 不放「今天」：花费当天不结算、商智成交只到昨天，这个区间查不出东西。
 # 基准日期由服务端注入（window.QRANGE_TODAY），避免浏览器时区或页面开着过夜把日期算错。
-QUICK_PRESETS = [("yesterday", "昨天"), ("month", "本月"),
-                 ("lastmonth", "上月"), ("prevmonth", "上上月")]
+QUICK_PRESETS = [("yesterday", "昨天", "昨天一天"),
+                 ("month", "本月", "本月 1 号 ~ 昨天（今天数据没出全，不含今天）"),
+                 ("lastmonth", "上月", "上个自然月整月"),
+                 ("prevmonth", "上上月", "上上个自然月整月")]
 
 QUICK_RANGE_CSS = """
 .qrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:-4px 0 12px}
@@ -954,7 +979,12 @@ window.QRANGE = (function(){
   function span(k){
     var t = today(), y = t.getFullYear(), m = t.getMonth(), d = t.getDate();
     if(k === 'yesterday') return [iso(new Date(y,m,d-1)), iso(new Date(y,m,d-1))];
-    if(k === 'month') return [iso(new Date(y,m,1)), iso(new Date(y,m,d))];
+    if(k === 'month'){
+      // 本月 = 1 号 ~ 昨天：今天数据没出全（商智只到昨天、花费当天不结算）。
+      // 每月 1 号本月还没有完整一天，这时退回「昨天」，不给自己点出一个空区间。
+      var yday = new Date(y,m,d-1);
+      return (d === 1) ? [iso(yday), iso(yday)] : [iso(new Date(y,m,1)), iso(yday)];
+    }
     if(k === 'lastmonth') return [iso(new Date(y,m-1,1)), iso(new Date(y,m,0))];
     if(k === 'prevmonth') return [iso(new Date(y,m-2,1)), iso(new Date(y,m-1,0))];
     return null;
@@ -974,9 +1004,9 @@ window.QRANGE = (function(){
 def _quick_html(prefix: str) -> str:
     """快捷区间按钮组。prefix 是页面 JS 命名空间（PC / PF）。"""
     out = ['<span class="qlbl">快捷区间</span>']
-    for k, lab in QUICK_PRESETS:
+    for k, lab, hint in QUICK_PRESETS:
         out.append(f'<button type="button" class="chip" data-k="{k}" '
-                   f'title="{lab}：点一下直接查询（有缓存秒出）" '
+                   f'title="{lab} = {hint}，点一下直接查询（有缓存秒出）" '
                    f'onclick="{prefix}.quick(\'{k}\')">{lab}</button>')
     return f'<div class="qrow" id="{prefix.lower()}Quick">{"".join(out)}</div>'
 
@@ -991,7 +1021,8 @@ var KPIS = INIT.kpis || [];
 var RATIO = INIT.ratioKeys || [];
 var LBL = {}, TYP = {};
 FIELDS.forEach(function(f){ LBL[f[0]] = f[1]; TYP[f[0]] = f[2]; });
-var DIM = 'sku', JOB = null, ROWS = [], SPEND = {}, SORT = {k: (INIT.sort || 'payCommAmount'), d: -1}, TIMER = null;
+var DIM = 'sku', JOB = null, ROWS = [], SPEND = {}, WARN = [],
+    SORT = {k: (INIT.sort || 'payCommAmount'), d: -1}, TIMER = null;
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
@@ -1107,6 +1138,11 @@ function render(){
   $('pcBody').innerHTML = rowsHtml(list);
   $('pcKpis').innerHTML = kpisHtml();
   $('pcKpis').style.display = '';
+  if($('pcWarn')){
+    var ws = (SPEND && SPEND.warnings) || WARN || [];
+    if(ws.length){ $('pcWarn').innerHTML = '⚠ ' + ws.map(esc).join('<br>⚠ '); $('pcWarn').style.display=''; }
+    else { $('pcWarn').innerHTML = ''; $('pcWarn').style.display='none'; }
+  }
   var cnt = cat ? ('共 '+list.length+' 个品类 / '+ROWS.length+' 个 SKU')
                 : ('共 '+ROWS.length+' 个 SKU'
                    + (list.length!==ROWS.length ? ('，筛选后 '+list.length+' 行') : ''));
@@ -1169,6 +1205,15 @@ function poll(silent){
       $('pcCancel').style.display = '';
       var pct = j.total ? Math.round(j.done*100/j.total) : 0;
       $('pcBar').style.width = pct+'%';
+      // 「全部账号」部分命中：先把已有缓存的账号照出来，缺的账号后台补抓，抓完自动整体刷新
+      if(j.partial && j.rows && j.rows.length){
+        var rg0 = j.range || [];
+        if(!rg0.length || (rg0[0] === $('pcStart').value && rg0[1] === $('pcEnd').value)){
+          ROWS = j.rows; SPEND = j.spend || {};
+          WARN = (SPEND && SPEND.warnings) || j.warnings || [];
+          showTable();
+        }
+      }
       msg((j.message||'抓取中') + (j.total ? ('　'+j.done+'/'+j.total+'（'+pct+'%）') : ''));
       clearTimeout(TIMER); TIMER = setTimeout(poll, 1500);
       return;
@@ -1178,14 +1223,22 @@ function poll(silent){
     $('pcCancel').style.display = 'none';
     $('pcBar').style.width = j.error ? '0' : '100%';
     if(!silent){
-      if(j.error){ msg(j.message || j.error, 'bad'); }
+      if(j.error){
+        msg(j.message || j.error, 'bad');
+        // 失败时清掉上一次（可能是别的账号）的 KPI 与表格，避免误读成本账号数据
+        ROWS = []; SPEND = {};
+        if($('pcKpis')){ $('pcKpis').innerHTML = ''; $('pcKpis').style.display = 'none'; }
+        $('pcTableCard').style.display = 'none'; $('pcCount').textContent = '';
+      }
       else if(j.message){ msg(j.message, 'ok'); }
     }
     if(j.rows && j.rows.length){
       var rg = j.range || [];
       var same = rg.length ? (rg[0] === $('pcStart').value && rg[1] === $('pcEnd').value) : true;
       if(same){
-        JOB = j.jobId; ROWS = j.rows; SPEND = j.spend || {}; showTable();
+        JOB = j.jobId; ROWS = j.rows; SPEND = j.spend || {};
+        WARN = (SPEND && SPEND.warnings) || j.warnings || [];
+        showTable();
       } else {
         msg('本页最近一次结果是 ' + rg[0] + ' ~ ' + rg[1] + '；当前区间点「查询」即可（有缓存秒出）');
       }
@@ -1223,6 +1276,9 @@ function run(force){
   if(s > e){ msg('起始日期不能晚于结束日期','bad'); return; }
   ROWS = []; JOB = null; SPEND = {};
   $('pcTableCard').style.display = 'none';
+  if($('pcKpis')){ $('pcKpis').innerHTML = ''; $('pcKpis').style.display = 'none'; }
+  if($('pcWarn')){ $('pcWarn').style.display = 'none'; $('pcWarn').innerHTML = ''; }
+  $('pcCount').textContent = '';
   $('pcExport').disabled = true;
   $('pcRun').disabled = true;
   $('pcRefetch').disabled = true;
@@ -1238,13 +1294,18 @@ function run(force){
       }
       JOB = j.jobId;
       if(j.cached){
-        msg(j.stitched
-          ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求京准通')
-          : ('命中本地缓存（' + (j.savedAt||'') + ' 抓取，共 ' + (j.rows||0) + ' 个 SKU），未请求京准通'));
+        if(j.partial){
+          msg('先用已缓存的 ' + (j.rows||0) + ' 个 SKU 出表；'
+              + (j.missing||[]).join('、') + ' 还没有该区间缓存，正在后台补抓（抓完自动刷新）');
+        } else {
+          msg(j.stitched
+            ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求京准通')
+            : ('命中本地缓存（' + (j.savedAt||'') + ' 抓取，共 ' + (j.rows||0) + ' 个 SKU），未请求京准通'));
+        }
       } else {
         msg('该区间没有完整缓存，已开始在后台抓取（约 20 秒 / 或几分钟）；完成后自动写入缓存');
       }
-      poll(); loadCache();
+      poll();
     }).catch(function(e){
       msg('请求失败 '+e,'bad');
       $('pcRun').disabled=false; $('pcRefetch').disabled=false;
@@ -1255,41 +1316,6 @@ function refetch(){
   var tip = '重新抓取 ' + s + ' ~ ' + e + '，会真实请求京准通并覆盖该区间缓存。继续？';
   if(!confirm(tip)) return;
   run(true);
-}
-function loadCache(){
-  fetch(API + '/cache').then(function(r){ return r.json(); }).then(function(j){
-    if(!j.ok || !j.entries){ return; }
-    var list = j.entries;
-    if(!list.length){
-      $('pcCacheBody').innerHTML = '<tr><td colspan="7" class="l">还没有缓存，点「查询」抓一次就会存下来</td></tr>';
-      return;
-    }
-    var html = list.map(function(en){
-      return '<tr><td class="l">'+esc(en.accountLabel || en.account)+'</td>'
-        + '<td class="l">'+esc(en.start)+' ~ '+esc(en.end)+'</td>'
-        + '<td class="n">'+esc(en.rows)+'</td>'
-        + '<td class="n">'+fmt(en.total,'money')+'</td>'
-        + '<td class="l">'+esc(en.savedAt)+'</td>'
-        + '<td class="n">'+esc(en.sizeKB)+' KB</td>'
-        + '<td class="n"><button class="btn danger mini" data-acc="'+esc(en.account)+'" '
-        + 'data-start="'+esc(en.start)+'" data-end="'+esc(en.end)+'" '
-        + 'onclick="PC.delCache(this)">删除</button></td></tr>';
-    }).join('');
-    $('pcCacheBody').innerHTML = html;
-  }).catch(function(){});
-}
-function delCache(btn){
-  var account = btn.getAttribute('data-acc');
-  var start = btn.getAttribute('data-start');
-  var end = btn.getAttribute('data-end');
-  if(!confirm('删除 ' + account + ' ' + start + ' ~ ' + end + ' 的本地缓存？删掉后下次查询会重新请求京准通。')) return;
-  var qs = new URLSearchParams({account: account, start: start, end: end});
-  fetch(API + '/cache/delete?' + qs.toString(), {method:'POST'}).then(function(r){ return r.json(); })
-    .then(function(j){
-      msg(j.ok && (j.deleted||[]).length ? ('已删除：'+j.deleted.join('、')) : (j.error||'删除失败'),
-          j.ok ? 'ok' : 'bad');
-      loadCache();
-    }).catch(function(e){ msg('删除失败 '+e,'bad'); });
 }
 function cancel(){
   fetch(API + '/cancel', {method:'POST'}).then(function(r){ return r.json(); })
@@ -1313,10 +1339,11 @@ function sort(k){
   render();
 }
 window.PC = {sort: sort, run: run, refetch: refetch, exp: exp, cancel: cancel,
-             render: render, loadCache: loadCache, delCache: delCache, dim: dim,
-             expView: expView, quick: quick};
+             render: render, dim: dim, expView: expView, quick: quick};
 function boot(){
-  poll(); loadCache();
+  poll();
+  // 从「缓存管理」点「查看」带区间打开：自动查一次，有缓存就直接秒出
+  if(INIT.auto) run();
   $('pcTable').addEventListener('click', function(e){
     var th = e.target.closest('th');
     if(!th || !th.getAttribute('data-key')) return;
@@ -1337,7 +1364,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = q.get("account") or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     start, end = _last_month_range()
     if q.get("start") and q.get("end"):
@@ -1345,10 +1372,14 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
             start, end = paycomm.norm_range(q.get("start"), q.get("end"))
         except ValueError:
             pass
-    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-                   f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    opts = ('<option value="all"%s>全部账号（总览）</option>'
+            % (" selected" if acc == "all" else "")) + "".join(
+        f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
     fields = paycomm.FIELDS if kind == "cps" else paycomm.SPEND_FIELDS
     init = {"mode": kind, "api": cfg["api"], "sort": cfg["sort"],
+            # 带 start/end 打开（缓存管理点「查看」）：进页面自动查一次，命中缓存直接秒出
+            "auto": bool(q.get("start") and q.get("end")),
             "fields": [[k, lab, t] for k, lab, t in fields],
             "webKeys": cfg["webKeys"], "kpis": cfg["kpis"], "showUnattr": cfg["showUnattr"],
             "ratioKeys": cfg.get("ratioKeys", [])}
@@ -1388,6 +1419,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
   <div class="metaline">{metaline}</div>
   <div class="actions">
     <a class="btn ghost mini" href="{_e(cfg["switch"][0])}">{_e(cfg["switch"][1])}</a>
+    <a class="btn ghost mini" href="/cache?kind={kind}">缓存管理 →</a>
     <a class="btn ghost mini" href="/login">登录 / 检查登录态</a>
   </div>
 </div></header>
@@ -1409,19 +1441,15 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
 </div>
 
 <div class="grid {cfg.get("grid", "g4")}" id="pcKpis" style="display:none;margin-top:18px"></div>
+<div class="hint" id="pcWarn" style="display:none;margin-top:10px;color:var(--red)"></div>
 
 <div class="card" id="pcCacheCard">
   <h2>本地缓存 <span class="tagline">不自动清理，删除由你决定</span></h2>
   <p class="hint">抓一次存一份：<code>{_e(str(settings.DATA_DIR))}/reports/</code>。
   同一账号 + 同一区间再点「查询」直接读文件，<b>不会请求京准通</b>；需要最新数据时点「重新抓取」覆盖这一份。
-  这里没有任何自动过期、也没有自动清理逻辑。</p>
-  <div class="tblwrap short">
-    <table><thead><tr>
-      <th class="l noSort">账号</th><th class="l noSort">区间</th><th class="n noSort">SKU</th>
-      <th class="n noSort">合计(元)</th><th class="l noSort">抓取时间</th>
-      <th class="n noSort">大小</th><th class="n noSort">操作</th>
-    </tr></thead><tbody id="pcCacheBody"></tbody></table>
-  </div>
+  没有任何自动过期、也没有自动清理逻辑。</p>
+  <p class="hint">缓存清单（按时间 / 按账号、搜索、删除、旧口径清理）已独立成页：</p>
+  <p><a class="btn ghost" href="/cache?kind={kind}">打开缓存管理 →</a></p>
 </div>
 
 <div class="card" id="pcTableCard" style="display:none">
@@ -1479,6 +1507,62 @@ def _paycomm_other_running(mode: str) -> str | None:
 def _paycomm_start(runner, account, start, end, force: bool = False) -> dict:
     """查询入口：默认先吃本地缓存（同账号+同区间），force=1 才重新请求京准通。"""
     acc = account or settings.MAIN_ACCOUNT
+    if str(acc).lower() == "all":
+        # 「全部账号」：先用已有的缓存秒出总览；缺的账号在后台补抓，抓完前端自动刷新。
+        # 一个账号都没有缓存时才整批抓（否则页面白等几分钟）。
+        if not force:
+            got = runner.all_payload(start, end, allow_missing=True)
+            if got is not None and got.get("rows"):
+                job_id = f"all-{runner.mode}-{start}_{end}"
+                got["jobId"] = job_id
+                missing = [settings.get_account(k).get("label") or k
+                           for k in (got.get("missing") or [])]
+                runner._results[job_id] = got
+                runner._state.update(
+                    {"running": False, "cached": True, "jobId": job_id, "account": "all",
+                     "range": [start, end], "total": len(got["rows"]),
+                     "done": len(got["rows"]), "error": None,
+                     "finishedAt": settings.now_iso(),
+                     "message": ("命中本地缓存：各账号已合并成一张总览" if not missing else
+                                 f"先用已有缓存出总览；还有 {len(missing)} 个账号在后台补抓："
+                                 f"{'、'.join(missing)}")})
+                if not missing:
+                    return {"ok": True, "cached": True, "jobId": job_id, "rows": len(got["rows"])}
+                out = {"ok": True, "cached": True, "partial": True, "jobId": job_id,
+                       "rows": len(got["rows"]), "missing": missing}
+                busy = _paycomm_other_running(runner.mode)
+                info = scrape_day.lock_info()
+                if busy or (info.get("locked") and info.get("alive")):
+                    out["warnings"] = ["现在有别的抓取任务占用浏览器登录态，"
+                                       "等它结束后再点「查询」会自动补抓缺的账号"]
+                    return out
+                started = runner.run_all_background(
+                    start, end,
+                    note=f"先用已有缓存出总览，正在补抓缺的 {len(missing)} 个账号…")
+                if not started.get("ok"):
+                    out["warnings"] = [started.get("error") or "后台补抓没能启动"]
+                    return out
+                # 补抓任务换了新 jobId：把这份部分结果挂上去，轮询时先显示这批数据
+                got["partial"] = True
+                got["missing"] = missing[:]
+                got["warnings"] = list(got.get("warnings") or [])
+                got["warnings"].append(f"以下账号还没有该区间缓存，正在后台补抓："
+                                       f"{'、'.join(missing)}（抓完自动刷新）")
+                runner._results[started["jobId"]] = got
+                out["backfill"] = started["jobId"]
+                return out
+        busy = _paycomm_other_running(runner.mode)
+        if busy:
+            return {"ok": False, "error": busy}
+        info = scrape_day.lock_info()
+        if info.get("locked") and info.get("alive"):
+            who = info.get("name") or info.get("thread") or "抓取任务"
+            return {"ok": False,
+                    "error": f"正在执行数据抓取（{who}，{info.get('acquiredAt') or ''} 开始），"
+                             f"浏览器登录态被占用，等它结束再查"}
+        note = ("「全部账号」：有账号还没有该区间缓存，正在逐个补抓…" if not force
+                else "「全部账号」重新抓取中（会覆盖各账号该区间缓存）…")
+        return runner.run_all_background(start, end, note=note)
     try:
         if not force:
             # 1) 精确命中（账号+起+止完全一致）  2) 多段相邻缓存拼接（8月 + 9月 → 8/1~9/30）
@@ -1600,6 +1684,572 @@ def api_paycomm_spend_cache_delete(account: str | None = None, start: str = "", 
     if not (account and start and end):
         return {"ok": False, "error": "缺少 account / start / end"}
     return _paycomm_spend.delete_cache(account, start, end)
+
+
+# ================================================================ 缓存管理（二级页）
+# 四类缓存各自的落盘文件：paycomm_*.json / paycomm_spend_*.json / profit_*.json / industry_*.json
+CACHE_KINDS = [("all", "全部"), ("cps", "CPS 花费"), ("spend", "京准通花费"),
+               ("profit", "月度利润"), ("industry", "行业大盘")]
+CACHE_LABELS = {"cps": "CPS 花费", "spend": "京准通花费",
+                "profit": "月度利润", "industry": "行业大盘"}
+CACHE_HREF = {"cps": "/paycomm", "spend": "/paycomm/spend",
+              "profit": "/profit", "industry": "/report"}
+
+CACHE_CSS = """
+.cgGrp{margin-bottom:18px}
+.cgGrp h3{font-size:14px;margin:0 0 10px;color:var(--ink)}
+.cgGrp h3 span{font-weight:400;color:var(--muted);margin-left:10px;font-size:12px}
+.cgBadge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;
+  border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.cgBadge.warn{color:var(--red);border-color:var(--red)}
+.cgBadge.legacy{border-style:dashed}
+"""
+
+CACHE_JS = r"""
+(function(){
+var INIT = window.CACHE_INIT || {};
+var ALL = [], KIND = INIT.kind || 'all', VIEW = 'time', Q = '';
+var LABEL = INIT.labels || {}, HREF = INIT.href || {};
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function fmtKB(kb){ var n = Number(kb||0);
+  return n >= 1024 ? (n/1024).toFixed(1)+' MB' : (Math.round(n*10)/10)+' KB'; }
+function money(v){ var n = Number(v||0);
+  return n.toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function match(en){
+  if(KIND !== 'all' && en.kind !== KIND) return false;
+  if(!Q) return true;
+  return [en.kindLabel, en.account, en.accountLabel, en.start, en.end]
+    .join(' ').toLowerCase().indexOf(Q) >= 0;
+}
+function sumKB(list){ var t = 0; list.forEach(function(e){ t += Number(e.sizeKB||0); }); return t; }
+function badges(en){
+  var out = '';
+  if(en.legacy) out += ' <span class="cgBadge legacy" title="旧命名/按账号存的缓存，现在的查询不会命中">旧格式</span>';
+  if(en.stale) out += ' <span class="cgBadge warn" title="口径版本已升级，这份缓存不会被命中，需要重算">口径过期</span>';
+  return out;
+}
+function buttons(en){
+  return '<button class="btn ghost mini" data-act="open" data-kind="'+esc(en.kind)+'" '
+    + 'data-acc="'+esc(en.account||'')+'" data-s="'+esc(en.start)+'" data-e="'+esc(en.end)+'">查看</button> '
+    + '<button class="btn danger mini" data-act="del" data-kind="'+esc(en.kind)+'" '
+    + 'data-acc="'+esc(en.account||'')+'" data-s="'+esc(en.start)+'" data-e="'+esc(en.end)+'" '
+    + 'data-file="'+esc((en.files||[])[0]||'')+'">删除</button>';
+}
+function rowsHtml(list, withKind){
+  return list.map(function(en){
+    return '<tr>'
+      + (withKind ? '<td class="l"><span class="cgBadge">'+esc(en.kindLabel)+'</span></td>' : '')
+      + '<td class="l">'+esc(en.accountLabel || en.account)+badges(en)+'</td>'
+      + '<td class="l">'+esc(en.start)+' ~ '+esc(en.end)+'</td>'
+      + '<td class="n">'+esc(en.rows)+'</td>'
+      + '<td class="n" title="'+(en.kind==='profit'?'净利合计':(en.kind==='cps'?'付款佣金合计':(en.kind==='industry'?'本店广告花费（行业数据为指数，不计费）':'京准通花费合计')))+'">'
+      + money(en.total)+(en.kind==='profit'?' <span class="cgBadge">净利</span>':'')+'</td>'
+      + '<td class="l">'+esc(en.savedAt)+'</td>'
+      + '<td class="n">'+fmtKB(en.sizeKB)+'</td>'
+      + '<td class="n" style="white-space:nowrap">'+buttons(en)+'</td></tr>';
+  }).join('');
+}
+function byTime(list, withKind){
+  return '<div class="card"><div class="tblwrap long"><table><thead><tr>'
+    + (withKind ? '<th class="l noSort">类型</th>' : '')
+    + '<th class="l noSort">账号</th><th class="l noSort">区间</th><th class="n noSort">行数</th>'
+    + '<th class="n noSort">合计(元)</th><th class="l noSort">抓取时间</th>'
+    + '<th class="n noSort">大小</th><th class="n noSort">操作</th>'
+    + '</tr></thead><tbody>' + rowsHtml(list, withKind) + '</tbody></table></div></div>';
+}
+function byAcct(list){
+  var groups = {}, order = [];
+  list.forEach(function(en){
+    var k = en.kind + '|' + (en.account || 'all');
+    if(!groups[k]){
+      groups[k] = {kind: en.kind, label: en.accountLabel || en.account || '全部账号', items: []};
+      order.push(k);
+    }
+    groups[k].items.push(en);
+  });
+  return order.map(function(k){
+    var g = groups[k];
+    return '<div class="card cgGrp"><h3>' + esc(g.label)
+      + '<span>' + esc(LABEL[g.kind] || g.kind) + ' · ' + g.items.length + ' 份 · '
+      + fmtKB(sumKB(g.items)) + '</span></h3>'
+      + '<div class="tblwrap short"><table><thead><tr>'
+      + '<th class="l noSort">区间</th><th class="n noSort">行数</th><th class="n noSort">合计(元)</th>'
+      + '<th class="l noSort">抓取时间</th><th class="n noSort">大小</th><th class="n noSort">操作</th>'
+      + '</tr></thead><tbody>' + rowsHtml(g.items, false) + '</tbody></table></div></div>';
+  }).join('');
+}
+function render(){
+  var list = ALL.filter(match);
+  var stat = '共 ' + list.length + ' 份 · ' + fmtKB(sumKB(list));
+  if(list.length !== ALL.length) stat += '（全部 ' + ALL.length + ' 份）';
+  $('cgStat').textContent = stat;
+  if(!list.length){
+    $('cgBody').innerHTML = '<div class="card"><p class="hint">没有匹配的缓存：换个类型或清空搜索试试。</p></div>';
+    return;
+  }
+  $('cgBody').innerHTML = (VIEW === 'acct')
+    ? byAcct(list)
+    : byTime(list, KIND === 'all');
+}
+function syncTabs(){
+  var nodes = document.querySelectorAll('#cgKinds [data-kind]');
+  for(var i=0;i<nodes.length;i++){
+    nodes[i].className = 'tab' + (nodes[i].getAttribute('data-kind') === KIND ? ' active' : '');
+  }
+}
+function openCache(d){
+  var base = HREF[d.kind] || '/';
+  var qs = new URLSearchParams({start: d.start, end: d.end});
+  if(d.kind === 'industry') qs.set('accounts', d.account || 'all');
+  else qs.set('account', d.kind === 'profit' ? 'all' : (d.account || 'all'));
+  window.location = base + '?' + qs.toString();
+}
+function delCache(d){
+  var tip = '删除「' + (LABEL[d.kind] || d.kind) + '」' + (d.account || '') + ' '
+    + d.start + ' ~ ' + d.end + ' 的本地缓存？\n删掉后下次查询会重新请求京东接口。';
+  if(!confirm(tip)) return;
+  var qs = new URLSearchParams({kind: d.kind, account: d.account || '',
+                                start: d.start, end: d.end, file: d.file || ''});
+  fetch('/api/cache/delete?' + qs.toString(), {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      $('cgMsg').textContent = (j.ok && (j.deleted||[]).length)
+        ? ('已删除：' + j.deleted.join('、')) : (j.error || '删除失败');
+      load();
+    }).catch(function(e){ $('cgMsg').textContent = '删除失败：' + e; });
+}
+function load(){
+  fetch('/api/cache/list').then(function(r){ return r.json(); }).then(function(j){
+    if(!j.ok){ $('cgMsg').textContent = '读取缓存清单失败' + (j.error ? '：' + j.error : ''); return; }
+    ALL = j.entries || [];
+    var parts = [];
+    ['cps','spend','profit','industry'].forEach(function(k){
+      var n = (j.counts || {})[k] || 0;
+      if(n) parts.push((LABEL[k] || k) + ' ' + n + ' 份');
+    });
+    $('cgMsg').textContent = parts.length
+      ? ('当前：' + parts.join(' · ') + '；删除后下次查询会重新请求京东接口。')
+      : '还没有任何缓存，去花费/利润/分析报表页查询一次就会存下来。';
+    render();
+  }).catch(function(e){ $('cgMsg').textContent = '读取缓存清单失败：' + e; });
+}
+function kind(k){ KIND = k; syncTabs(); render(); }
+function view(v){
+  VIEW = (v === 'acct') ? 'acct' : 'time';
+  $('cgVTime').className = 'tab' + (VIEW === 'time' ? ' active' : '');
+  $('cgVAcc').className = 'tab' + (VIEW === 'acct' ? ' active' : '');
+  render();
+}
+function search(){ Q = ($('cgQ').value || '').trim().toLowerCase(); render(); }
+window.CG = {kind: kind, view: view, search: search, load: load};
+document.getElementById('cgBody').addEventListener('click', function(ev){
+  var b = ev.target.closest ? ev.target.closest('button[data-act]') : null;
+  if(!b) return;
+  var d = {kind: b.getAttribute('data-kind'), account: b.getAttribute('data-acc') || '',
+           start: b.getAttribute('data-s'), end: b.getAttribute('data-e'),
+           file: b.getAttribute('data-file') || ''};
+  if(b.getAttribute('data-act') === 'open') openCache(d); else delCache(d);
+});
+load();
+})();
+"""
+
+
+@app.get("/api/cache/list")
+def api_cache_list():
+    """四类缓存合成一张清单：花费两份 + 利润 + 行业大盘，条目自带 kind。"""
+    entries: list[dict] = []
+    for en in _paycomm.cache_entries():
+        en["kind"] = "cps"
+        entries.append(en)
+    for en in _paycomm_spend.cache_entries():
+        en["kind"] = "spend"
+        entries.append(en)
+    for en in profit.cache_entries():
+        en["kind"] = "profit"
+        entries.append(en)
+    for en in industry.cache_entries():
+        en["kind"] = "industry"
+        entries.append(en)
+    counts = {"cps": 0, "spend": 0, "profit": 0, "industry": 0}
+    for en in entries:
+        en["kindLabel"] = CACHE_LABELS.get(en["kind"], en["kind"])
+        counts[en["kind"]] = counts.get(en["kind"], 0) + 1
+    entries.sort(key=lambda e: e.get("savedAt") or "", reverse=True)
+    return {"ok": True, "entries": entries, "count": len(entries), "counts": counts,
+            "totalKB": round(sum(float(e.get("sizeKB") or 0) for e in entries), 1)}
+
+
+@app.post("/api/cache/delete")
+def api_cache_delete(kind: str = "", account: str = "", start: str = "",
+                     end: str = "", file: str = ""):
+    if kind == "cps":
+        return _paycomm.delete_cache(account, start, end)
+    if kind == "spend":
+        return _paycomm_spend.delete_cache(account, start, end)
+    if kind == "profit":
+        return profit.delete_cache(start, end, file=file)
+    if kind == "industry":
+        return industry.delete_cache(account, start, end)
+    return {"ok": False, "error": "未知的缓存类型（kind 只能是 cps / spend / profit / industry）"}
+
+
+@app.get("/cache", response_class=HTMLResponse)
+def cache_page(request: Request):
+    """本地缓存管理（二级页）：按时间 / 按账号两种视图，可搜索、可删。"""
+    kind = request.query_params.get("kind") or "all"
+    if kind not in CACHE_LABELS:
+        kind = "all"
+    tabs = "".join(
+        f'<button type="button" class="tab{" active" if k == kind else ""}" '
+        f'data-kind="{k}" onclick="CG.kind(\'{k}\')">{lab}</button>'
+        for k, lab in CACHE_KINDS)
+    init = {"kind": kind, "labels": CACHE_LABELS, "href": CACHE_HREF}
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>本地缓存管理 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+<style>{CACHE_CSS}</style>
+</head><body>
+{report2.navtop("/cache")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}缓存</div>
+  <h1>本地缓存管理</h1>
+  <div class="metaline">
+    <span>一次抓取 = 一份文件（<code>{_e(str(settings.DATA_DIR))}/reports/</code>）</span><span class="dot"></span>
+    <span>不自动过期，删除由你决定</span><span class="dot"></span>
+    <span>旧格式 / 口径过期的缓存不会被命中</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/paycomm">CPS 花费 →</a>
+    <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
+    <a class="btn ghost mini" href="/profit">月度利润 →</a>
+    <a class="btn ghost mini" href="/report">行业大盘（报表页签）</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="card">
+  <div class="toolbar">
+    <span class="tabs" id="cgKinds">{tabs}</span>
+    <span class="tabs" style="margin-left:16px">
+      <button type="button" class="tab active" id="cgVTime" onclick="CG.view('time')">按时间</button>
+      <button type="button" class="tab" id="cgVAcc" onclick="CG.view('acct')">按账号</button>
+    </span>
+    <input id="cgQ" placeholder="搜索账号 / 区间 / 类型" oninput="CG.search()"
+           style="min-width:240px;padding:7px 10px;border-radius:8px;border:1px solid var(--line);margin-left:16px">
+    <span class="hint" id="cgStat" style="margin-left:auto"></span>
+  </div>
+  <div class="hint" id="cgMsg" style="min-height:20px">读取缓存清单…</div>
+</div>
+
+<div id="cgBody" style="margin-top:18px"></div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>CPS 花费 / 京准通花费</b>：每个「账号 + 区间」一份，点「查看」会带着区间跳到对应页面并直接命中这份缓存。</p>
+  <p><b>月度利润</b>：每个区间一份，里面同时装各账号的表；切账号不用重算。口径版本升级后旧文件不再命中，标「口径过期」的可以删掉。</p>
+  <p>删除只影响本地文件，京东侧数据不受影响；下次查询会重新抓取一次。</p>
+</div>
+
+</div>
+<script>window.CACHE_INIT = {json.dumps(init, ensure_ascii=False)};</script>
+<script>{CACHE_JS}</script>
+</body></html>""")
+
+
+# ================================================================ 广告费流水
+# 数据在 jd_roi/cashflow.py：逐账号抓「账户中心 → 财务记录」的充值/消费/分配/冻结，
+# 这里只做页面与接口。页面直接读本地缓存（不发请求），要新数据点「重新抓取」。
+CASHFLOW_CSS = """
+.cfkpi{margin:14px 0 4px}
+.cfchart{background:var(--canvas);border:1px solid var(--hair);border-radius:var(--r-md);
+  padding:10px 14px 4px;margin-bottom:14px}
+.cfchd{display:flex;justify-content:space-between;align-items:center;font-size:13px;
+  color:var(--body);margin-bottom:2px}
+.cfchd b{font-weight:600}
+.cfchd span{color:var(--muted2);font-size:12px}
+.cfchd i{display:inline-block;width:10px;height:10px;border-radius:2px;
+  margin:0 3px 0 10px;vertical-align:-1px}
+.cfchd i.g{background:#2E9E5B}.cfchd i.r{background:#D64545}
+.cfchart text.ax{font-size:11px;fill:#9d968b}
+.cfchart text.v{font-size:9.5px}
+.cfchart text.gv{fill:#2E9E5B}.cfchart text.rv{fill:#D64545}
+.cfchart text.empty{fill:#bdb6aa;font-size:12px}
+table.cftable{width:100%;border-collapse:collapse;font-size:12.5px}
+table.cftable th{background:var(--soft);color:var(--muted);font-weight:600;text-align:right;
+  padding:7px 10px;border-bottom:1px solid var(--hair);white-space:nowrap}
+table.cftable th:first-child,table.cftable td:first-child{text-align:left}
+table.cftable td{padding:6px 10px;border-bottom:1px solid var(--hair2);text-align:right;
+  font-variant-numeric:tabular-nums}
+table.cftable tbody tr:hover td{background:#fbf8f3}
+table.cftable td.dim{color:var(--muted2)}
+table.cftable tfoot td{font-weight:600;background:var(--soft);border-top:1px solid var(--hair)}
+.cfscroll{max-height:620px;overflow:auto;border:1px solid var(--hair);border-radius:var(--r-md)}
+.cfscroll thead th{position:sticky;top:0;z-index:2}
+.cfwarn{color:var(--amberink);background:var(--amberbg);border-radius:8px;padding:8px 12px;
+  font-size:12.5px;margin:10px 0}
+"""
+
+CASHFLOW_JS = r"""
+(function(){
+function $(id){ return document.getElementById(id); }
+function msg(s, bad){ var el=$('cfMsg'); if(!el) return; el.textContent=s||'';
+  el.style.color = bad ? 'var(--redink)' : 'var(--muted)'; }
+function poll(){
+  fetch('/api/cashflow/status').then(function(r){return r.json();}).then(function(j){
+    if(j.running){
+      msg('抓取中 ' + (j.done||0) + '/' + (j.total||0) + '　' + (j.account||'') +
+          '　' + (j.message||''));
+      setTimeout(poll, 2500);
+    } else if(j.error){
+      msg('失败：' + j.error, true);
+      var b=$('cfRun'); if(b) b.disabled=false;
+    } else if(j.finishedAt){
+      msg((j.message||'完成') + '，正在刷新页面…');
+      setTimeout(function(){ location.reload(); }, 900);
+    }
+  }).catch(function(){ setTimeout(poll, 4000); });
+}
+window.CFRUN = function(){
+  var bEl = $('cfStart'), eEl = $('cfEnd'), btn = $('cfRun');
+  var b = (bEl && bEl.value) || '', e = (eEl && eEl.value) || '';
+  if(!b || !e){ msg('请先选好起止日期', true); return; }
+  if(b > e){ msg('结束日不能早于开始日', true); return; }
+  if(btn) btn.disabled = true;
+  msg('已提交（' + b + ' ~ ' + e + '），等待浏览器登录态…');
+  fetch('/api/cashflow/run?start=' + encodeURIComponent(b) + '&end=' + encodeURIComponent(e),
+        {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ msg(j.error || '启动失败', true); if(btn) btn.disabled=false; return; }
+      poll();
+    })
+    .catch(function(e2){ msg('启动失败：' + e2, true); if(btn) btn.disabled=false; });
+};
+/* 快捷区间：改完日期直接把页面带到该区间（有缓存就秒开） */
+window.CFSET = function(days){
+  var e = new Date(), s = new Date();
+  s.setDate(e.getDate() - (days - 1));
+  function iso(d){ return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0')
+    + '-' + String(d.getDate()).padStart(2,'0'); }
+  location.href = '/cashflow?start=' + iso(s) + '&end=' + iso(e);
+};
+window.CFSPAN = function(b, e){
+  location.href = '/cashflow?start=' + b + '&end=' + e;
+};
+if(window.CF_RUNNING) poll();
+})();
+"""
+
+
+def _cf_money(v) -> str:
+    try:
+        return f"{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+@app.get("/cashflow", response_class=HTMLResponse)
+def cashflow_page(request: Request):
+    """广告费流水：余额、充值/消费柱状图、每日流水（读本地缓存，不触发抓取）。
+
+    区间由 URL 的 start/end 决定，默认近 30 天；缓存按区间分开存，补抓历史不会覆盖别的区间。
+    """
+    q = request.query_params
+    d_begin, d_end = cashflow.default_range(30)
+    begin = q.get("start") or d_begin
+    end = q.get("end") or d_end
+    snap = cashflow.snapshot(begin, end)
+    begin, end = snap.get("begin") or begin, snap.get("end") or end
+    st = _cashflow.status()
+    running = bool(st.get("running"))
+    # 「上月」快捷区间（与其它页的日历口径一致）
+    first = _today().replace(day=1)
+    lm_end_d = first - dt.timedelta(days=1)
+    lm_start, lm_end = lm_end_d.replace(day=1).isoformat(), lm_end_d.isoformat()
+
+    # 已抓过的区间：点一下切过去看（补过的历史不用每次重抓）
+    rg = snap.get("ranges") or []
+    range_chips = "".join(
+        f'<a class="chip{" on" if r["begin"] == begin and r["end"] == end else ""}" '
+        f'href="/cashflow?start={_e(r["begin"])}&end={_e(r["end"])}">'
+        f'{_e(r["begin"][5:])} ~ {_e(r["end"][5:])}'
+        f'<span style="color:var(--muted2)"> · {len(r["accounts"])} 个账号</span></a>'
+        for r in rg[:12])
+
+    if snap.get("empty"):
+        meta = (f"<span>{begin} ~ {end}</span><span class='dot'></span>"
+                "<span>这个区间还没抓过</span>")
+        kpis = ""
+        body = ('<div class="card"><p class="hint">该区间还没有流水数据。点右上角「抓取」，'
+                f'会依次登录各账号拉一遍财务记录（{begin} ~ {end}）。</p>'
+                '<p class="hint">已抓过的区间可以直接点下方标签切换，不用重抓：</p>'
+                f'<div class="toolbar" style="margin-top:8px">{range_chips or "<span class=hint>暂无</span>"}</div></div>')
+    else:
+        accs = snap["accounts"]
+        begin, end = snap["begin"], snap["end"]
+        totals = snap["totals"]
+        day_avg = round(sum(a["day_avg"] for a in accs), 2)
+        cover = round(totals["cash"] / day_avg, 1) if day_avg else None
+        meta = (f"<span>{begin} ~ {end}</span><span class='dot'></span>"
+                f"<span>抓取于 {snap['fetched_at'][:16].replace('T', ' ')}</span>"
+                f"<span class='dot'></span><span>来源：京准通 → 账户中心 → 财务记录</span>")
+        kpis = (
+            '<div class="grid g4 cfkpi">'
+            f'<div class="kpi"><div class="lbl">可用余额合计</div>'
+            f'<div class="val">¥ {_cf_money(totals["cash"])}</div>'
+            f'<div class="sub">期初 {_cf_money(totals["begin"])}</div></div>'
+            f'<div class="kpi"><div class="lbl">区间充值</div>'
+            f'<div class="val">¥ {_cf_money(totals["recharge"])}</div>'
+            f'<div class="sub">{len([a for a in accs if a["recharge_sum"]])} 个账号有充值</div></div>'
+            f'<div class="kpi"><div class="lbl">区间消费</div>'
+            f'<div class="val">¥ {_cf_money(totals["consume"])}</div>'
+            f'<div class="sub">日均 {_cf_money(day_avg)}</div></div>'
+            f'<div class="kpi"><div class="lbl">余额可撑</div>'
+            f'<div class="val">{cover if cover is not None else "—"} 天</div>'
+            f'<div class="sub">按近 {len(accs)} 个账号合计日均消耗估算</div></div>'
+            '</div>')
+
+        # 账号汇总表
+        rows = []
+        for a in accs:
+            cover_a = a["cover_days"]
+            rows.append(
+                f'<tr><td><b>{_e(a["label"])}</b></td>'
+                f'<td class="dim">{a["account_id"]}</td>'
+                f'<td>{_cf_money(a["cash_balance"])}</td>'
+                f'<td>{_cf_money(a["begin_balance"])}</td>'
+                f'<td>{_cf_money(a["recharge_sum"])}</td>'
+                f'<td>{_cf_money(a["consume_sum"])}</td>'
+                f'<td>{_cf_money(a["day_avg"])}</td>'
+                f'<td>{"—" if cover_a is None else f"{cover_a:g} 天"}</td>'
+                f'<td class="dim">{_e(a["begin_from"])}</td></tr>')
+        rows.append(
+            f'<tr><td><b>合计</b></td><td class="dim"></td>'
+            f'<td><b>{_cf_money(totals["cash"])}</b></td>'
+            f'<td><b>{_cf_money(totals["begin"])}</b></td>'
+            f'<td><b>{_cf_money(totals["recharge"])}</b></td>'
+            f'<td><b>{_cf_money(totals["consume"])}</b></td>'
+            f'<td><b>{_cf_money(day_avg)}</b></td>'
+            f'<td><b>{"—" if cover is None else f"{cover:g} 天"}</b></td><td></td></tr>')
+        table = (
+            '<div class="card"><h2>账号汇总 <span class="tagline">按账号看资金</span></h2>'
+            '<div style="overflow:auto"><table class="cftable"><thead><tr>'
+            '<th>账号</th><th>账户ID</th><th>当前可用余额</th><th>区间期初</th>'
+            '<th>区间充值</th><th>区间消费</th><th>日均消费</th><th>可撑</th>'
+            '<th>期初口径</th></tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>'
+            '<p class="hint">消费 = 财务记录的「消费记录」合计（现金 + 红包）；'
+            '可撑 = 当前余额 ÷ 日均消费，<b>不足 2 天要补钱</b>。</p></div>')
+
+        # 柱状图
+        charts = ('<div class="card"><h2>充值 vs 消费 <span class="tagline">绿上红下 · 上下各自独立刻度</span></h2>'
+                  '<p class="hint">绿色向上是当日充值到账，红色向下是当日广告消耗。'
+                  '上下两块刻度独立，所以两向柱高不能直接比（左侧数字是各自的满格值）。'
+                  '鼠标悬停柱子可看精确金额。</p>'
+                  + cashflow.charts_html(snap) + '</div>')
+
+        # 每日流水（日期 × 账号 的消费）
+        dates = cashflow.date_list(begin, end)
+        mat = {(r["date"], r["account"]): r for r in snap["daily"]}
+        head = "".join(f"<th>{_e(a['label'])}</th>" for a in accs)
+        drows = []
+        for d in reversed(dates):
+            vals = [(mat.get((d, a["account"])) or {}).get("consume") or 0 for a in accs]
+            tot = round(sum(vals), 2)
+            if not tot:
+                continue
+            cells = "".join(
+                (f"<td>{_cf_money(v)}</td>" if v else '<td class="dim">—</td>') for v in vals)
+            drows.append(f"<tr><td>{d}</td>{cells}<td><b>{_cf_money(tot)}</b></td></tr>")
+        daily_table = (
+            '<div class="card"><h2>每日消费 <span class="tagline">按消耗日归属</span></h2>'
+            '<div class="cfscroll"><table class="cftable"><thead><tr>'
+            f'<th>日期</th>{head}<th>合计</th></tr></thead><tbody>'
+            + "".join(drows) + '</tbody></table></div>'
+            '<p class="hint">次日 08:45 左右批量扣款，所以「今天的消耗」要到明早才从余额里扣掉。'
+            '逐笔明细（充值/分配/冻结）在导出的 Excel 里。</p></div>')
+
+        range_bar = (f'<div class="toolbar" style="margin-top:4px">'
+                     f'<span class="mini" style="color:var(--muted)">已抓区间</span>{range_chips}</div>'
+                     ) if len(rg) > 1 else ""
+        body = range_bar + kpis + table + charts + daily_table
+        if snap.get("ranges_mixed"):
+            body = ('<div class="cfwarn">各账号的缓存区间不一致（可能只抓了部分账号），'
+                    '点「重新抓取」可统一。</div>' + body)
+
+    run_hint = f'<span id="cfMsg" style="font-size:12px;color:var(--muted)">{"抓取中…" if running else ""}</span>'
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>广告费流水 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{CASHFLOW_CSS}</style>
+</head><body>
+{report2.navtop("/cashflow")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}财务</div>
+  <h1>广告费流水</h1>
+  <div class="metaline">{meta}</div>
+  <div class="actions">
+    <label style="font-size:12px;color:var(--muted)">起
+      <input id="cfStart" type="date" value="{begin}"
+             style="padding:6px 9px;border-radius:8px;border:1px solid var(--line)"></label>
+    <label style="font-size:12px;color:var(--muted)">止
+      <input id="cfEnd" type="date" value="{end}"
+             style="padding:6px 9px;border-radius:8px;border:1px solid var(--line)"></label>
+    <button class="btn ghost mini" onclick="CFSET(7)">近7天</button>
+    <button class="btn ghost mini" onclick="CFSET(30)">近30天</button>
+    <button class="btn ghost mini" onclick="CFSPAN('{lm_start}','{lm_end}')">上月</button>
+    <button class="btn" id="cfRun" onclick="CFRUN()" {"disabled" if running else ""}>抓取</button>
+    <a class="btn ghost mini" href="/api/cashflow/export?start={begin}&end={end}">导出 Excel</a>
+    <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
+    {run_hint}
+  </div>
+</div></header>
+<div class="wrap">
+{body}
+<div class="note" style="margin-top:18px">
+  <p><b>口径</b>：交易日期 = 广告实际消耗日；记账时间 = 次日 08:45 左右批量扣款；
+  结余取接口原值，接口不返回结余的账号按「期初 + 充值 − 消费」逐日滚动推算。</p>
+  <p><b>分配</b>是同一资金户内「商家账户 ↔ 投放子账户」的划转，不改变账户现金总额，不计入余额滚动。</p>
+  <p>缓存<b>按区间分开存</b>：补抓某段历史不会覆盖别的区间，切换区间直接读本地文件，不会重新请求京东。要新数据点「抓取」。</p>
+</div>
+</div>
+<script>window.CF_RUNNING = {"true" if running else "false"};</script>
+<script>{CASHFLOW_JS}</script>
+</body></html>""")
+
+
+@app.post("/api/cashflow/run")
+def api_cashflow_run(start: str = "", end: str = "", days: int = 0):
+    """起后台任务抓财务流水（逐账号，约 2~4 分钟）。
+
+    start/end 为 YYYY-MM-DD；只给 days 时按「含今天往前 N 天」换算（兼容老链接）。
+    """
+    if not (start and end):
+        start, end = cashflow.default_range(days or 30)
+    return _cashflow.start(start, end)
+
+
+@app.get("/api/cashflow/status")
+def api_cashflow_status():
+    return _cashflow.status()
+
+
+@app.get("/api/cashflow/export")
+def api_cashflow_export(start: str = "", end: str = ""):
+    """导出与页面同口径的 Excel（汇总/每日/明细/口径/柱状图）。"""
+    snap = cashflow.snapshot(start, end)
+    if not snap.get("ok"):
+        return JSONResponse({"ok": False, "error": "还没有数据，请先抓取一次"}, status_code=404)
+    data = cashflow.xlsx_bytes(snap["accounts"], snap["daily"], snap["begin"], snap["end"])
+    from urllib.parse import quote
+    fname = f"账号广告费流水表_{snap['begin']}_{snap['end']}.xlsx"
+    disp = f"attachment; filename=\"cashflow.xlsx\"; filename*=UTF-8''{quote(fname)}"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
 
 
 # ================================================================ 月度利润分析
@@ -1839,6 +2489,11 @@ function run(force){
           ? ('命中本地缓存拼接：' + (j.pieces||[]).join(' + ') + '（共 ' + (j.rows||0) + ' 个 SKU），未请求商智')
           : ('命中本地缓存（'+(j.savedAt||'')+' 计算，共 '+(j.rows||0)+' 个 SKU），未请求商智');
         msg(head + (j.busy ? '；后台还有任务在跑，本次只读缓存' : ''));
+      } else if(j.resumed){
+        // 断点续抓：上次算到哪，这次就从哪接着抓，不回头重抓整段
+        var rp = j.resumed;
+        msg('复用本地 ' + (rp.pieces||[]).join(' + ') + '，只补抓 '
+            + rp.tail[0] + ' ~ ' + rp.tail[1] + '…');
       }
       poll();
     }).catch(function(e){ msg('请求失败 '+e,'bad'); $('pfRun').disabled=false; $('pfRefetch').disabled=false; });
@@ -1887,6 +2542,8 @@ window.PF = {run:run, refetch:refetch, exp:exp, expView:expView, dim:dim, sort:s
              render:render, switchAcc:switchAcc, reprice:reprice, quick:quick};
 function boot(){
   poll();
+  // 从「缓存管理」点「查看」带区间打开：自动查一次，有缓存就直接秒出
+  if(INIT.auto) run();
   $('pfTable').addEventListener('click', function(e){
     var th = e.target.closest('th');
     if(!th || !th.getAttribute('data-key')) return;
@@ -1907,7 +2564,7 @@ def profit_page(request: Request):
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = q.get("account") or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     start, end = _last_month_range()
     if q.get("start") and q.get("end"):
@@ -1915,9 +2572,13 @@ def profit_page(request: Request):
             start, end = profit.norm_range(q.get("start"), q.get("end"))
         except ValueError:
             pass
-    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-                   f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    opts = ('<option value="all"%s>全部账号（总览）</option>'
+            % (" selected" if acc == "all" else "")) + "".join(
+        f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
     init = {"api": "/api/profit", "fields": [[k, lab, t] for k, lab, t in profit.FIELDS],
+            # 带 start/end 打开（缓存管理点「查看」）：进页面自动查一次，命中缓存直接秒出
+            "auto": bool(q.get("start") and q.get("end")),
             "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
             "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
@@ -1941,6 +2602,7 @@ def profit_page(request: Request):
   <div class="actions">
     <a class="btn ghost mini" href="/paycomm">CPS 花费 →</a>
     <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
+    <a class="btn ghost mini" href="/cache?kind=profit">缓存管理 →</a>
     <a class="btn ghost mini" href="/login">登录 / 检查登录态</a>
   </div>
 </div></header>
@@ -2060,6 +2722,649 @@ def api_profit_export(job: str | None = None, account: str | None = None,
         headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
 
 
+# ================================================================ SKU 前台价
+# 数据只读本地按天入库的商智商品明细（jd_roi/pricewatch.py），不发任何请求。
+# 前台件单价 = 成交金额 ÷ 成交件数，所以「有成交才有价」：某天 0 件，这天就没有价。
+PRICE_CSS = """
+#pwTable td.l{text-align:left}
+/* 10 列要塞进一屏：单元格留白收窄一点，并禁止「↑ 0.22%」被折成两行 */
+#pwTable th,#pwTable td{padding:9px 8px}
+#pwTable td{white-space:nowrap}
+.qrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tblwrap.long{max-height:74vh}
+/* 页头快捷链接：不让「→」被挤到下一行 */
+.pagehead .actions a.btn{white-space:nowrap}
+.pwsku{display:flex;align-items:center;gap:9px;min-width:0}
+.pwsku img,.pwsku .pwph{width:34px;height:34px;border-radius:6px;object-fit:cover;
+  background:var(--soft);flex:0 0 34px;display:block}
+.pwsku .nm{font-size:12.5px;line-height:1.35;color:var(--ink);max-width:300px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.pwsku .id{font-size:11px;color:var(--muted2);font-family:var(--mono)}
+.pwcur{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+.pwsub{font-size:11px;color:var(--muted2);font-variant-numeric:tabular-nums;line-height:1.5;
+  white-space:nowrap}
+.pwspark{width:118px;height:26px;display:block;margin-left:auto}
+tr.pwrow{cursor:pointer}
+tr.pwrow:hover td{background:#fbf8f3}
+tr.pwrow.on td{background:var(--surface-card)}
+#pwChart{height:340px;width:100%}
+.pwcover{display:flex;gap:8px 18px;flex-wrap:wrap;align-items:center;font-size:12px;
+  color:var(--muted);margin:2px 0 0}
+.pwcover b{color:var(--ink)}
+.pwempty{color:var(--muted);font-size:13px;padding:26px 0;text-align:center}
+"""
+
+PRICE_JS = r"""
+(function(){
+var INIT = window.PW_INIT || {};
+var API = INIT.api || '/api/price';
+var DAYS = [], ROWS = [], TOT = {}, SEL = null, LAST = null, CH = null;
+var SORT = {k:'amt', d:-1};
+
+var COLS = [
+  {k:'__item',  t:'商品',      l:1},
+  {k:'priceLatest', t:'最新前台价'},
+  {k:'changeDodPct', t:'较上日'},
+  {k:'changePct', t:'较区间初'},
+  {k:'priceAvg', t:'区间均价'},
+  {k:'__band',  t:'区间价带'},
+  {k:'qty',     t:'成交件数'},
+  {k:'amt',     t:'成交金额'},
+  {k:'uv',      t:'访客数'},
+  {k:'__spark', t:'走势'}
+];
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function num(v){ if(v===null||v===undefined||v==='') return null; var n=Number(v);
+  return isNaN(n)?null:n; }
+function fx(v,dec){ var n=num(v); if(n===null) return '—';
+  return n.toLocaleString('zh-CN',{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
+function money(v){ var n=num(v); return n===null?'—':('¥'+fx(n,2)); }
+function cnt(v){ var n=num(v); return n===null?'—':n.toLocaleString('zh-CN'); }
+function msg(s,bad){ var el=$('pwMsg'); if(!el) return; el.textContent=s||'';
+  el.style.color = bad ? 'var(--redink)' : 'var(--muted)'; }
+
+function pctCell(v, extra){
+  var n = num(v);
+  if(n===null) return '<span class="flat">—</span>'+(extra?'<div class="pwsub">'+extra+'</div>':'');
+  // ±0.05% 以内算平稳：显示 0.00% 却配个红绿箭头会让人误判
+  var c = n > 0.05 ? 'up' : (n < -0.05 ? 'down' : 'flat');
+  var a = n > 0.05 ? '↑' : (n < -0.05 ? '↓' : '·');
+  return '<span class="delta '+c+'">'+a+' '+fx(Math.abs(n),2)+'%</span>'
+       + (extra?'<div class="pwsub">'+extra+'</div>':'');
+}
+/* 行内走势：把每日价画成折线；没有价的天断开（不插值，避免编出一个不存在的价格） */
+function spark(arr){
+  arr = arr || [];
+  var vals = [], i;
+  for(i=0;i<arr.length;i++){ if(num(arr[i])!==null) vals.push(+arr[i]); }
+  if(vals.length < 2) return '<span class="pwsub" style="display:block;text-align:right">—</span>';
+  var min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+  var span = (max - min) || 1, W = 118, H = 26, P = 3;
+  function x(i){ return P + (W-2*P) * (arr.length<2 ? 0 : i/(arr.length-1)); }
+  function y(v){ return P + (H-2*P) * (1 - (v-min)/span); }
+  var segs = [], cur = [];
+  for(i=0;i<arr.length;i++){
+    var v = num(arr[i]);
+    if(v===null){ if(cur.length){ segs.push(cur); cur = []; } }
+    else { cur.push([i, +v]); }
+  }
+  if(cur.length) segs.push(cur);
+  var d = segs.map(function(s){
+    return s.map(function(p,k){ return (k?'L':'M') + x(p[0]).toFixed(1) + ' ' + y(p[1]).toFixed(1); }).join('');
+  }).join('');
+  var last = vals[vals.length-1], first = vals[0];
+  var col = last > first ? '#2E9E5B' : (last < first ? '#D64545' : '#8e8b82');
+  var lastPt = null;
+  for(i=arr.length-1;i>=0;i--){ if(num(arr[i])!==null){ lastPt = [i, +arr[i]]; break; } }
+  var dot = lastPt ? ('<circle cx="'+x(lastPt[0]).toFixed(1)+'" cy="'+y(lastPt[1]).toFixed(1)
+    +'" r="2.2" fill="'+col+'"/>') : '';
+  return '<svg class="pwspark" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" aria-hidden="true">'
+    + '<path d="'+d+'" fill="none" stroke="'+col+'" stroke-width="1.4" stroke-linejoin="round"/>'
+    + dot + '</svg>';
+}
+
+function head(){
+  var h = '<tr>';
+  COLS.forEach(function(c){
+    var mark = (SORT.k === c.k) ? (SORT.d<0 ? ' ↓' : ' ↑') : '';
+    h += '<th class="'+(c.l?'l ':'')+'noSort" data-key="'+c.k+'" onclick="PW.sort(\''+c.k+'\')">'
+       + esc(c.t) + mark + '</th>';
+  });
+  return h + '</tr>';
+}
+
+function rowHtml(r){
+  var on = (SEL === r.skuId) ? ' on' : '';
+  var img = r.img ? '<img src="'+esc(r.img)+'" alt="" loading="lazy">' : '<span class="pwph"></span>';
+  var dod = num(r.changeDod), chg = num(r.change);
+  var dodExtra = dod===null ? '' : ((dod>0?'+':'')+fx(dod,2)+' 元');
+  var chgExtra = chg===null ? '' : ((chg>0?'+':'')+fx(chg,2)+' 元');
+  return '<tr class="pwrow'+on+'" data-sku="'+esc(r.skuId)+'" onclick="PW.pick(this)">'
+    + '<td class="l"><div class="pwsku">'+img
+      + '<div><div class="nm" title="'+esc(r.itemName)+'">'+esc(r.itemName||'—')+'</div>'
+      + '<div class="id">'+esc(r.skuId)+'</div></div></div></td>'
+    + '<td><span class="pwcur">'+money(r.priceLatest)+'</span>'
+      + '<div class="pwsub">'+esc(String(r.latestDay||'').slice(5))
+      + ' · '+cnt(r.priceDays)+'天有价</div></td>'
+    + '<td>'+pctCell(r.changeDodPct, dodExtra)+'</td>'
+    + '<td>'+pctCell(r.changePct, chgExtra)+'</td>'
+    + '<td>'+money(r.priceAvg)+'</td>'
+    + '<td>'+money(r.priceMin)+'~'+money(r.priceMax)
+      + '<div class="pwsub">振幅 '+fx(r.swingPct,1)+'%</div></td>'
+    + '<td>'+cnt(r.qty)+'</td>'
+    + '<td>'+money(r.amt)+'</td>'
+    + '<td>'+cnt(r.uv)+'</td>'
+    + '<td>'+spark(r.spark)+'</td>'
+    + '</tr>';
+}
+
+function sortVal(r, k){
+  if(k==='__item') return String(r.itemName||'');
+  if(k==='__band') return num(r.swingPct);
+  if(k==='__spark') return num(r.changePct);
+  return num(r[k]);
+}
+
+function render(){
+  var kw = ($('pwFilter') ? $('pwFilter').value : '').trim().toLowerCase();
+  var list = ROWS.filter(function(r){
+    if(!kw) return true;
+    return String(r.skuId||'').indexOf(kw) >= 0
+        || String(r.itemName||'').toLowerCase().indexOf(kw) >= 0;
+  });
+  list = list.slice().sort(function(a,b){
+    var x = sortVal(a, SORT.k), y = sortVal(b, SORT.k);
+    if(typeof x === 'string' || typeof y === 'string'){
+      return String(x||'').localeCompare(String(y||'')) * SORT.d;
+    }
+    if(x===null) x = -1e18;
+    if(y===null) y = -1e18;
+    return (x-y) * SORT.d;
+  });
+  $('pwHead').innerHTML = head();
+  $('pwBody').innerHTML = list.map(rowHtml).join('')
+    || '<tr><td colspan="'+COLS.length+'" class="l pwempty">没有匹配的商品</td></tr>';
+  $('pwCount').textContent = '共 ' + ROWS.length + ' 个有成交的 SKU'
+    + (list.length !== ROWS.length ? ('，筛选后 ' + list.length + ' 行') : '');
+}
+
+function kpiBox(label, val, sub){
+  return '<div class="kpi"><div class="lbl">'+esc(label)+'</div><div class="val">'+val+'</div>'
+    + (sub?'<div class="sub">'+sub+'</div>':'') + '</div>';
+}
+
+function kpis(){
+  var up = 0, down = 0, flat = 0, best = null, worst = null;
+  ROWS.forEach(function(r){
+    var n = num(r.changePct);
+    if(n===null) return;
+    // 选「最大涨幅」时跳过件数太少的：个位数成交的均价会被规格/优惠组合带飞
+    if(n > 0.5){
+      up++; if(r.qty >= 10 && (!best || n > +best.changePct)) best = r;
+    } else if(n < -0.5){
+      down++; if(r.qty >= 10 && (!worst || n < +worst.changePct)) worst = r;
+    } else { flat++; }
+  });
+  var t = TOT || {};
+  var box = '';
+  box += kpiBox('有价 SKU', cnt(t.skuCount),
+      '商智明细 <b>'+cnt(t.dataDays)+'</b>/'+cnt(t.rangeDays)+' 天有数据');
+  box += kpiBox('全店加权均价', money(t.avgPrice),
+      '成交 '+cnt(t.qty)+' 件 · '+money(t.amt));
+  box += kpiBox('较区间初 涨 / 跌', '<span class="up">'+up+'</span> / <span class="down">'+down+'</span>',
+      '平稳 '+flat+' 个（±0.5% 内）');
+  if(best){
+    box += kpiBox('最大涨幅（≥10 件）', '<span class="up">+'+fx(best.changePct,1)+'%</span>',
+        esc(String(best.itemName || best.skuId).slice(0, 26))
+        + '<br>'+money(best.priceFirst)+' → '+money(best.priceLatest)
+        + ' · '+cnt(best.qty)+' 件');
+  } else {
+    box += kpiBox('最大跌幅（≥10 件）',
+        worst ? ('<span class="down">'+fx(worst.changePct,1)+'%</span>') : '—',
+        worst ? (esc(String(worst.itemName||worst.skuId).slice(0,26))
+                 + '<br>'+money(worst.priceFirst)+' → '+money(worst.priceLatest)
+                 + ' · '+cnt(worst.qty)+' 件')
+              : '区间内没有可比的两天');
+  }
+  $('pwKpis').innerHTML = box;
+  $('pwKpis').style.display = '';
+}
+
+function cover(){
+  var t = TOT || {}, bits = [];
+  bits.push('区间 <b>'+esc(LAST.start)+' ~ '+esc(LAST.end)+'</b>');
+  bits.push('商智明细已入库 <b>'+cnt(t.dataDays)+'</b>/'+cnt(t.rangeDays)+' 天');
+  var miss = (LAST.missingDays || []), empty = (LAST.emptyDays || []);
+  if(miss.length){
+    bits.push('缺 <b>'+miss.length+'</b> 天未抓：'+esc(miss.slice(0,4).join('、'))
+      + (miss.length>4?' …':''));
+  }
+  if(empty.length){
+    bits.push('<b>'+empty.length+'</b> 天 0 行（抓早了，商智还没出数）');
+  }
+  var html = bits.join(' <span class="dot" style="display:inline-block;width:3px;height:3px;'
+    + 'border-radius:50%;background:var(--muted2);margin:0 4px;vertical-align:middle"></span> ');
+  if(miss.length || empty.length){
+    html += ' <button class="btn sec mini" style="margin-left:8px" onclick="PW.sync()">'
+      + '补齐缺失天数</button>';
+  }
+  $('pwCover').innerHTML = html;
+}
+
+function detail(r){
+  $('pwDetail').style.display = '';
+  $('pwDTitle').textContent = r.itemName || r.skuId;
+  $('pwDSub').innerHTML = 'SKU '+esc(r.skuId)
+    + '　最新 <b>'+money(r.priceLatest)+'</b>（'+esc(r.latestDay||'—')+'）'
+    + '　区间均价 <b>'+money(r.priceAvg)+'</b>'
+    + '　区间价带 '+money(r.priceMin)+' ~ '+money(r.priceMax)
+    + '　成交 '+cnt(r.qty)+' 件 / '+money(r.amt)
+    + '　访客 '+cnt(r.uv);
+  drawChart(r);
+  $('pwDetail').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+function drawChart(r){
+  var box = $('pwChart');
+  if(!box || !window.echarts) return;
+  if(!CH) CH = echarts.init(box);
+  var xs = DAYS.map(function(d){ return String(d).slice(5); });
+  CH.setOption({
+    animationDuration: 260,
+    grid:{left:58, right:58, top:34, bottom:36},
+    tooltip:{trigger:'axis', formatter:function(ps){
+      if(!ps || !ps.length) return '';
+      var out = DAYS[ps[0].dataIndex] || '';
+      ps.forEach(function(p){
+        var v = (p.value===null || p.value===undefined) ? null : p.value;
+        out += '<br>' + p.marker + p.seriesName + '：'
+          + (v===null ? '—' : (p.seriesName==='前台价' ? (v+' 元/件') : (v+' 件')));
+      });
+      return out;
+    }},
+    legend:{top:0, right:56, itemWidth:12, itemHeight:8,
+      textStyle:{fontSize:11, color:'#6c6a64'}},
+    xAxis:{type:'category', data:xs,
+      axisLabel:{fontSize:10, color:'#8e8b82'}, axisLine:{lineStyle:{color:'#e6dfd8'}},
+      axisTick:{show:false}},
+    yAxis:[
+      {type:'value', name:'元/件', scale:true,
+       nameTextStyle:{fontSize:10, color:'#8e8b82'},
+       axisLabel:{fontSize:10, color:'#8e8b82'},
+       splitLine:{lineStyle:{color:'#f1ece4'}}},
+      {type:'value', name:'件', nameTextStyle:{fontSize:10, color:'#8e8b82'},
+       axisLabel:{fontSize:10, color:'#8e8b82'}, splitLine:{show:false}}
+    ],
+    series:[
+      {name:'前台价', type:'line', data:r.spark, connectNulls:false,
+       symbol:'circle', symbolSize:5,
+       lineStyle:{width:2, color:'#cc785c'}, itemStyle:{color:'#cc785c'},
+       areaStyle:{color:'rgba(204,120,92,.07)'},
+       markLine:{silent:true, symbol:'none',
+         data:[{yAxis:r.priceAvg, lineStyle:{type:'dashed', color:'#8e8b82'},
+           label:{formatter:'区间均价 '+r.priceAvg, position:'insideEndTop',
+                  fontSize:10, color:'#6c6a64'}}]}},
+      {name:'成交件数', type:'bar', yAxisIndex:1, data:r.sparkQty,
+       barMaxWidth:16, itemStyle:{color:'rgba(108,106,100,.16)'}}
+    ]
+  }, true);
+  CH.resize();
+}
+
+function clearDetail(){
+  SEL = null;
+  $('pwDetail').style.display = 'none';
+}
+
+function poll(){
+  fetch('/api/run/status').then(function(r){ return r.json(); }).then(function(j){
+    if(j.active){
+      msg('补抓中：' + (j.progress || '') + (j.account ? ('　' + j.account) : ''));
+      setTimeout(poll, 3000);
+    } else if(j.error){
+      msg('补抓失败：' + String(j.error).slice(0, 300), true);
+    } else {
+      msg('补抓完成，正在刷新…');
+      setTimeout(function(){ location.reload(); }, 800);
+    }
+  }).catch(function(){ setTimeout(poll, 5000); });
+}
+
+function load(acc, s, e){
+  msg('读取本地商智明细…');
+  LAST = null; ROWS = []; DAYS = []; TOT = {}; clearDetail();
+  $('pwKpis').style.display = 'none';
+  fetch(API + '?account=' + encodeURIComponent(acc)
+        + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e))
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ msg(j.error || '读取失败', true); loadSnap(acc); return; }
+      LAST = j; DAYS = j.days || []; ROWS = j.rows || []; TOT = j.totals || {};
+      if(!ROWS.length){
+        msg('该区间没有有成交的商品：可能还没抓这几天的商智明细（见下方覆盖提示）', true);
+      } else {
+        msg('已读取本地商智明细（未请求京东）。点任意商品看逐日价格曲线。');
+      }
+      render(); kpis(); cover();
+      loadSnap(acc);
+      history.replaceState(null, '', location.pathname + '?account=' + encodeURIComponent(acc)
+        + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e));
+    })
+    .catch(function(err){ msg('读取失败：' + err, true); loadSnap(acc); });
+}
+
+/* 夜间自动核算：每天凌晨抓完数据后由服务端算好落盘，这里只读结果做摘要 */
+function loadSnap(acc){
+  var m = $('pwAutoMsg'), box = $('pwAutoBody');
+  if(!m || !box) return;
+  m.textContent = '读取最近一次夜间核算…';
+  box.innerHTML = '';
+  fetch('/api/price/snapshot?account=' + encodeURIComponent(acc || $('pwAcc').value))
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){
+        m.textContent = j.error || '还没有核算记录';
+        return;
+      }
+      var at = String(j.generatedAt || '').replace('T', ' ').slice(0, 16);
+      m.innerHTML = '最近核算 <b>' + esc(j.day) + '</b>'
+        + (at ? '（' + esc(at) + '）' : '')
+        + '　当日有成交 <b>' + cnt(j.skuCount) + '</b> 个 SKU'
+        + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>'
+        + '　当日均价 <b>' + money(j.avgPrice) + '</b>（成交 ' + cnt(j.qty) + ' 件）';
+      var list = (j.rows || []).filter(function(r){
+        var n = num(r.changeDodPct);
+        return n !== null && Math.abs(n) >= 2 && num(r.qty) >= 5;
+      });
+      list.sort(function(a, b){ return Math.abs(num(b.changeDodPct)) - Math.abs(num(a.changeDodPct)); });
+      list = list.slice(0, 6);
+      if(!list.length){
+        box.innerHTML = '<div class="pwsub">当天没有「变动 ≥2% 且件数 ≥5」的 SKU。</div>';
+        return;
+      }
+      box.innerHTML = '<div class="tblwrap short" style="margin-top:10px"><table><thead><tr>'
+        + '<th class="l noSort">商品（变动最大的 6 个）</th>'
+        + '<th class="n noSort">当日前台价</th><th class="n noSort">上次价格</th>'
+        + '<th class="n noSort">变动</th><th class="n noSort">件数</th></tr></thead><tbody>'
+        + list.map(function(r){
+            return '<tr class="pwrow" data-sku="' + esc(r.skuId) + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
+              + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">' + esc(r.itemName || r.skuId) + '</div>'
+              + '<div class="id">' + esc(r.skuId) + '</div></td>'
+              + '<td>' + money(r.priceLatest) + '</td>'
+              + '<td>' + money(r.pricePrev) + '</td>'
+              + '<td>' + pctCell(r.changeDodPct, '') + '</td>'
+              + '<td>' + cnt(r.qty) + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    })
+    .catch(function(){ m.textContent = '读取夜间核算记录失败'; });
+}
+
+window.PW = {
+  run: function(){
+    var acc = $('pwAcc').value, s = $('pwStart').value, e = $('pwEnd').value;
+    if(!s || !e){ msg('请先选好起止日期', true); return; }
+    if(s > e){ msg('结束日不能早于开始日', true); return; }
+    load(acc, s, e);
+  },
+  sort: function(k){
+    if(SORT.k === k) SORT.d = -SORT.d;
+    else { SORT.k = k; SORT.d = (k==='__item') ? 1 : -1; }
+    render();
+  },
+  pick: function(tr){
+    var sid = tr.getAttribute('data-sku');
+    var r = null;
+    ROWS.forEach(function(x){ if(String(x.skuId) === String(sid)) r = x; });
+    if(!r) return;
+    SEL = r.skuId;
+    var all = document.querySelectorAll('#pwTable tr.pwrow');
+    for(var i=0;i<all.length;i++){
+      all[i].className = 'pwrow' + (all[i].getAttribute('data-sku') === String(sid) ? ' on' : '');
+    }
+    detail(r);
+  },
+  /* 夜间核算摘要里点某个 SKU：滚到主表并打开它的曲线 */
+  pickSku: function(sid){
+    var tr = document.querySelector('#pwBody tr.pwrow[data-sku="' + String(sid) + '"]');
+    if(!tr){
+      msg('当前区间的表里没有这个 SKU，把区间调到包含核算日再看', true);
+      return;
+    }
+    tr.scrollIntoView({behavior:'smooth', block:'center'});
+    window.PW.pick(tr);
+  },
+  render: render,
+  sync: function(){
+    if(!LAST) return;
+    var days = (LAST.missingDays || []).concat(LAST.emptyDays || []).sort();
+    if(!days.length){ msg('没有缺失的天'); return; }
+    var s = days[0], e = days[days.length-1];
+    msg('正在补抓商智明细 ' + s + ' ~ ' + e + '（会占用浏览器登录态，只抓商智）…');
+    fetch('/api/price/backfill?account=' + encodeURIComponent(LAST.account)
+          + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e),
+          {method:'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){ msg(j.error || '启动失败', true); return; }
+        // 等后台线程真的把 _RUNNING 置成 active 再轮询，否则第一次会误判成「已完成」
+        setTimeout(poll, 2500);
+      })
+      .catch(function(err){ msg('启动失败：' + err, true); });
+  }
+};
+
+function parseIso(s){
+  var p = String(s || '').split('-');
+  return (p.length === 3) ? new Date(+p[0], +p[1]-1, +p[2]) : null;
+}
+function iso(d){
+  function pad(n){ return (n<10?'0':'') + n; }
+  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
+}
+window.PWQUICK = function(k){
+  var t = parseIso(INIT.today) || new Date();
+  var end = new Date(t.getFullYear(), t.getMonth(), t.getDate()-1);   // 商智只到昨天
+  var start;
+  if(k === 'd7'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-6); }
+  else if(k === 'd14'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-13); }
+  else if(k === 'd30'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-29); }
+  else if(k === 'month'){
+    if(t.getDate() === 1){ start = new Date(end.getTime()); }
+    else { start = new Date(t.getFullYear(), t.getMonth(), 1); }
+  }
+  else if(k === 'lastmonth'){
+    end = new Date(t.getFullYear(), t.getMonth(), 0);
+    start = new Date(end.getFullYear(), end.getMonth(), 1);
+  }
+  if(!start) return;
+  $('pwStart').value = iso(start);
+  $('pwEnd').value = iso(end);
+  window.PW.run();
+};
+
+window.addEventListener('resize', function(){ if(CH) CH.resize(); });
+window.PW.run();
+})();
+"""
+
+
+@app.get("/price", response_class=HTMLResponse)
+def price_page(request: Request):
+    """SKU 前台价：逐日看每个 SKU 的「成交金额 ÷ 成交件数」怎么变。
+
+    只读本地按天入库的商智商品明细（不发请求），所以打开即出数；
+    缺天 / 0 行天会在页面上点名，并可一键补抓（只抓 sz_product）。
+    """
+    q = request.query_params
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = q.get("account") or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    end = _yesterday()
+    start = end - dt.timedelta(days=29)
+    if q.get("start") and q.get("end"):
+        try:
+            s0, e0 = dt.date.fromisoformat(ds.norm_day(q.get("start"))), \
+                dt.date.fromisoformat(ds.norm_day(q.get("end")))
+            if s0 <= e0:
+                start, end = s0, e0
+        except ValueError:
+            pass
+    opts = "".join(
+        f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+    init = {"api": "/api/price", "account": acc, "today": _today().isoformat(),
+            "start": start.isoformat(), "end": end.isoformat()}
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SKU 前台价 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PRICE_CSS}</style>
+</head><body>
+{report2.navtop("/price")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}价格</div>
+  <h1>SKU 前台价走势</h1>
+  <div class="metaline">
+    <span>前台件单价 = 商智成交金额 ÷ 成交件数</span><span class="dot"></span>
+    <span>消费者实付（含优惠券 / 满减）</span><span class="dot"></span>
+    <span>只读本地按天入库，不发请求</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/profit">月度利润 →</a>
+    <a class="btn ghost mini" href="/report">分析报表 →</a>
+    <a class="btn ghost mini" href="/cache?kind=sz_product">缓存管理 →</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="card">
+  <div class="toolbar">
+    <label class="fld">账号 <select id="pwAcc" onchange="PW.run()">{opts}</select></label>
+    <label class="fld">起 <input type="date" id="pwStart" value="{_e(start.isoformat())}"></label>
+    <label class="fld">止 <input type="date" id="pwEnd" value="{_e(end.isoformat())}"></label>
+    <button class="btn" onclick="PW.run()">查询</button>
+    <span class="qrow" style="margin:0">
+      <button type="button" class="chip" onclick="PWQUICK('d7')">近 7 天</button>
+      <button type="button" class="chip" onclick="PWQUICK('d14')">近 14 天</button>
+      <button type="button" class="chip" onclick="PWQUICK('d30')">近 30 天</button>
+      <button type="button" class="chip" onclick="PWQUICK('month')">本月</button>
+      <button type="button" class="chip" onclick="PWQUICK('lastmonth')">上月</button>
+    </span>
+  </div>
+  <div class="hint" id="pwMsg" style="min-height:20px">读取本地商智商品明细…</div>
+  <div class="pwcover" id="pwCover"></div>
+</div>
+
+<div class="card" id="pwAutoCard" style="margin-top:18px">
+  <h2>夜间自动核算 <span class="tagline">每天凌晨抓完昨天数据后自动生成</span></h2>
+  <div class="hint" id="pwAutoMsg" style="margin-bottom:0">读取最近一次夜间核算…</div>
+  <div id="pwAutoBody"></div>
+</div>
+
+<div class="grid g4" id="pwKpis" style="display:none;margin-top:18px"></div>
+
+<div class="card" id="pwTableCard" style="margin-top:18px">
+  <h2>价格变化 <span class="tagline">点任意一行看逐日曲线</span></h2>
+  <div class="toolbar">
+    <input id="pwFilter" placeholder="筛选 SKU / 商品名" oninput="PW.render()"
+           style="min-width:240px;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
+    <span class="hint" id="pwCount" style="margin:0"></span>
+  </div>
+  <div class="tblwrap long">
+    <table id="pwTable"><thead id="pwHead"></thead><tbody id="pwBody"></tbody></table>
+  </div>
+</div>
+
+<div class="card" id="pwDetail" style="display:none">
+  <h2><span id="pwDTitle">—</span>
+    <span class="tagline">逐日前台件单价（成交金额 ÷ 成交件数）</span></h2>
+  <div class="hint" id="pwDSub"></div>
+  <div id="pwChart"></div>
+</div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>前台件单价</b> = 商智「商品明细」成交金额 ÷ 成交件数（消费者实付，已含优惠券/满减），
+     与「月度利润」页的前台件单价是同一口径；不是商品页标价（商智没有标价字段）。</p>
+  <p><b>有成交才有价</b>：某天 0 件，这天就没有价，曲线断开、不做插值——
+     不要把一个缺口当成涨价或降价。成交件数很小（个位数）时，均价还会被不同规格/优惠组合带偏，
+     看「区间均价 + 件数」一起判断更稳。</p>
+  <p><b>商智成交会回补</b>：T+1 大约只有一半、T+2~T+3 才定稿，最近一两天的价格会随夜间回补变化
+     （每晚自动重抓近 15 天）。所以「今天看到的跌价」先别急着改价，等定稿再看。</p>
+  <p><b>怎么用来调广告</b>：降价后同样的点击更容易成交，转化率上升是预期内的；
+     若降价后转化没起来，多半是流量/竞价问题而不是价格。涨价期 CTR 与转化下滑同样属正常，
+     可对照本页的访客数与成交件数判断是否要收预算。</p>
+  <p><b>夜间自动核算</b>：每天凌晨抓完昨天的商智数据后，服务端会把那一天的逐 SKU 前台价
+     （以及相对各自上一个有价日的变动）算好存一份，就是顶部「夜间自动核算」卡片；
+     因为商智 T+1 只出一半、T+2~T+3 才定稿，每次会把最近 3 个有数据的日子一起重算覆盖。
+     凌晨抓「昨天」时商智常常还没出数（0 行），白天 08:00~23:00 会每小时自动只补商智，
+     补到就立刻重算，任务日志里能看到「商智补抓」「前台价已核算 &lt;日期&gt;」。</p>
+</div>
+
+</div>
+{report2._echarts_src()}
+<script>window.PW_INIT = {json.dumps(init, ensure_ascii=False)};</script>
+<script>{PRICE_JS}</script>
+</body></html>""")
+
+
+@app.get("/api/price")
+def api_price(account: str | None = None, start: str = "", end: str = ""):
+    """某个账号某个区间内，每个 SKU 的逐日前台价与区间汇总（纯本地读）。"""
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = account or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    if not (start and end):
+        e = _yesterday()
+        start, end = (e - dt.timedelta(days=29)).isoformat(), e.isoformat()
+    try:
+        span = ds.day_span(start, end)
+    except ValueError:
+        return {"ok": False, "error": "日期格式应为 YYYY-MM-DD"}
+    if len(span) > 400:
+        return {"ok": False, "error": "区间最长 400 天，请缩小范围"}
+    return pricewatch.build(acc, span[0], span[-1])
+
+
+@app.get("/api/price/snapshot")
+def api_price_snapshot(account: str | None = None):
+    """最近一次「夜间自动核算」结果（凌晨抓完数据后由 pricewatch.run_nightly 落盘）。"""
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = account or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    snap = pricewatch.latest_snapshot(acc)
+    if not snap:
+        return {"ok": False, "empty": True,
+                "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）；"
+                         "下面价格表本身是现算的，可以先直接看"}
+    return {"ok": True, **snap}
+
+
+@app.post("/api/price/backfill")
+def api_price_backfill(account: str = "", start: str = "", end: str = ""):
+    """只补抓商智商品明细（sz_product），给「补齐缺失天数」用。
+
+    走与夜间抓取同一个后台任务 + 同一把浏览器锁；已经在抓时会直接返回占用提示。
+    """
+    if not (start and end):
+        return {"ok": False, "error": "缺少 start / end"}
+    try:
+        ds.day_span(start, end)
+    except ValueError:
+        return {"ok": False, "error": "日期格式应为 YYYY-MM-DD"}
+    acc = settings.get_account(account)
+    try:
+        return scrape_day.run_background([acc], start, end, kinds=["sz_product"],
+                                         name="price-backfill")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 # ================================================================ API
 @app.get("/api/status")
 def api_status():
@@ -2106,6 +3411,33 @@ def api_analysis(start: str | None = None, end: str | None = None,
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     return {"ok": True, "range": {"start": s, "end": e}, "data": data}
+
+
+# ---------------------------------------------------------------- 行业大盘接口
+@app.get("/api/industry/status")
+def api_industry_status():
+    """后台补齐进度（报表页据此自动刷新）。"""
+    return {"ok": True, **industry.status()}
+
+
+@app.post("/api/industry/run")
+def api_industry_run(start: str | None = None, end: str | None = None,
+                     days: int | None = None, accounts: list[str] | None = Query(None),
+                     force: int = 0):
+    """手动起一次补齐；force=1 才强制重抓（平时一律先命中本地缓存）。"""
+    s, e = ui_range(start, end, days)
+    keys = [a["key"] for a in account_list(accounts)]
+    res = industry.ensure(keys, s, e, force=bool(force), auto=True)
+    return {"ok": True, "range": {"start": s, "end": e}, "accounts": keys, **res}
+
+
+@app.post("/api/industry/refresh")
+def api_industry_refresh(start: str, end: str, accounts: str = ""):
+    """报表页表单：显式重抓行业大盘后跳回报表（避免刷新页面时反复 force）。"""
+    keys = [a["key"] for a in account_list(accounts)]
+    industry.ensure(keys, start, end, force=True, auto=True)
+    return RedirectResponse(
+        f"/report?start={start}&end={end}&accounts={','.join(keys)}", status_code=303)
 
 
 @app.get("/api/run/status")
@@ -2950,6 +4282,15 @@ class LoginSession:
         from .browser import has_login, launch_persistent, session_ok
         pw = ctx = None
         try:
+            # 容器里没有 X 显示：有头 Chromium 起不来（Playwright 只会抛一句难懂的
+            # "headed browser without having a XServer"），这里先给出可操作的提示。
+            if show_window and os.name != "nt" and not os.getenv("DISPLAY"):
+                self._set(state="error",
+                          message="当前环境没有图形界面（容器内没有 X 显示），勾选「显示浏览器窗口」"
+                                  "也弹不出窗口。请改用扫码登录；如果必须过滑块，在 WSL 终端执行 "
+                                  "./scripts/login_headed.sh <账号key>，窗口会出现在 Windows 桌面，"
+                                  "登录完这里刷新就是已登录")
+                return
             # 有头模式：遇到滑块/短信验证时用户可在窗口里手动完成
             pw, ctx = launch_persistent(headless=not show_window, account=account)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -3070,11 +4411,16 @@ def _autofill_account_id(page, key: str) -> None:
 
 
 _login = LoginSession()
+# 行业大盘补齐与扫码登录 / 保活 / 花费抓取共用同一把 Profile 锁，
+# 避免两个 Chromium 同时打开同一个 user_data_dir 把登录态顶掉。
+industry.set_profile_lock(_login._profile_lock)
 # 花费一览两个独立任务（CPS 付款佣金 / 京准通广告花费）：与登录 / 保活共用同一把 Profile 锁
 _paycomm = paycomm.PayCommRunner("cps", profile_lock=_login._profile_lock)
 _paycomm_spend = paycomm.PayCommRunner("spend", profile_lock=_login._profile_lock)
 # 月度利润分析：商智销量 + ERP 成本 + 上面两套花费缓存
 _profit = profit.ProfitRunner(profile_lock=_login._profile_lock)
+# 广告费流水（账户中心-财务记录）：与登录 / 保活 / 其它抓取共用同一把 Profile 锁
+_cashflow = cashflow.runner(_login._profile_lock)
 
 
 class AiRunner:
@@ -3108,6 +4454,11 @@ class AiRunner:
         def _work():
             try:
                 job.emit("phase", f"正在读取本地按天库（{start} ~ {end}）…")
+                # 行业大盘缺缓存就地自动补齐；等落盘后再生成解读，AI 才拿得到行业基准
+                ind_res = industry.ensure(keys, start, end)
+                if ind_res.get("missing"):
+                    job.emit("phase", "行业大盘缓存补齐中（地域/关键词/客户/趋势）…")
+                    industry.wait_for(ind_res["missing"], start, end, timeout=300)
                 data = analyze2.build(start=start, end=end,
                                       accounts=[a for a in settings.ACCOUNTS if a["key"] in keys])
                 job.emit("phase", "数据就绪（保本线 / 词分层 / 定向缺口已算好），交给模型套方法论判断…")
@@ -3160,6 +4511,31 @@ def _ai_after_scrape(summary: dict) -> None:
     _ai.run_background(start, end, settings.ACCOUNTS)
 
 
+def _price_snapshot() -> None:
+    """核算前台价并落盘。单独 try 住：算价格失败不能连累 AI 解读 / 抓取结果。"""
+    try:
+        done = pricewatch.run_nightly(settings.ACCOUNTS, log=_log_progress)
+        if done:
+            _log_progress("前台价核算完成：" + "；".join(
+                f"{x['label']} {x['day']} {x['skuCount']} 个 SKU" for x in done))
+        else:
+            _log_progress("前台价核算：没有可用的商智商品明细，跳过")
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"前台价核算失败：{type(exc).__name__}: {exc}")
+
+
+def _after_scrape(summary: dict) -> None:
+    """夜间抓取成功后的后置任务：先核算前台价，再生成 AI 解读。
+
+    前台价核算放在这里而不是页面里现算：抓完就有、第二天打开就能看到，
+    而且「算过哪一天」会作为文件留下来（页面顶部的「夜间自动核算」卡片读它）。
+    """
+    if summary.get("cancelled"):
+        return
+    _price_snapshot()
+    _ai_after_scrape(summary)
+
+
 LOGIN_CSS = DASH_CSS + """
 /* 登录页：按钮式页签（复用 .tabs 容器，但登录用 button） */
 .tabs{border-bottom:1px solid var(--hair);margin-bottom:18px;gap:2px;margin-top:0}
@@ -3188,7 +4564,8 @@ LOGIN_ACC_JS = r"""
   function loadAccounts(){
     fetch('/api/accounts').then(function(r){ return r.json(); }).then(function(j){
       if(!j.ok) return;
-      var rows = (j.accounts || []).map(function(a){
+      var list = j.accounts || [];
+      var rows = list.map(function(a, i){
         var st = '<span class="badge ' + (CLS[a.state] || 'b-idle') + '">'
                + (LBL[a.state] || a.state) + '</span>';
         var main = a.isMain ? ' <span class="badge b-warn">主账号</span>' : '';
@@ -3198,6 +4575,10 @@ LOGIN_ACC_JS = r"""
           + '<td class="n">' + (a.account_id || '—') + '</td>'
           + '<td class="l">' + st + ' ' + esc(a.message || '') + empty + '</td>'
           + '<td class="n">'
+          + '<button class="btn ghost mini" data-act="up" data-key="' + esc(a.key) + '" '
+          + (i === 0 ? 'disabled ' : '') + 'title="上移（同时调整控制台显示顺序）">↑</button> '
+          + '<button class="btn ghost mini" data-act="down" data-key="' + esc(a.key) + '" '
+          + (i === list.length - 1 ? 'disabled ' : '') + 'title="下移（同时调整控制台显示顺序）">↓</button> '
           + '<button class="btn sec mini" data-act="rename" data-key="' + esc(a.key) + '">改名</button> '
           + '<button class="btn ghost mini" data-act="detect" data-key="' + esc(a.key) + '">识别账户ID</button> '
           + '<button class="btn danger mini" data-act="delete" data-key="' + esc(a.key) + '">删除</button>'
@@ -3216,6 +4597,14 @@ LOGIN_ACC_JS = r"""
         if(!j.ok){ tip('添加失败：' + (j.error || ''), 'bad'); return; }
         tip('已添加「' + j.account.label + '」，key=' + j.account.key + '，正在刷新…', 'ok');
         setTimeout(function(){ location.reload(); }, 700);
+      });
+  }
+  function moveAccount(key, dir){
+    post('/api/accounts/move?key=' + encodeURIComponent(key) + '&dir=' + encodeURIComponent(dir))
+      .then(function(j){
+        if(!j.ok){ tip('调整顺序失败：' + (j.error || ''), 'bad'); return; }
+        tip('已调整顺序，控制台与各页面下拉框会同步生效', 'ok');
+        setTimeout(function(){ location.reload(); }, 400);
       });
   }
   function renameAccount(key){
@@ -3259,6 +4648,7 @@ LOGIN_ACC_JS = r"""
     if(act === 'rename') renameAccount(key);
     else if(act === 'delete') delAccount(key);
     else if(act === 'detect') detectId(key);
+    else if(act === 'up' || act === 'down') moveAccount(key, act);
   });
   document.getElementById('addAccBtn').addEventListener('click', addAccount);
   loadAccounts();
@@ -3308,8 +4698,10 @@ def login_page(request: Request):
     <div class="fld"><input id="pwdPass" type="password" autocomplete="off" placeholder="密码"></div>
     <div class="fld"><label class="hint"><input type="checkbox" id="pwdWindow" checked> 显示浏览器窗口（遇到滑块/短信验证时可在窗口里手动完成）</label></div>
     <div style="margin-bottom:12px"><button class="btn" onclick="startPwdLogin()">登录</button></div>
-    <div class="warn">若登录页要求滑块或短信验证：保持「显示浏览器窗口」勾选，在弹出的窗口里完成验证即可，
-      页面状态会自动变为已登录。无桌面的容器环境请改为本地登录后挂载 Profile。</div>
+    <div class="warn">若登录页要求滑块或短信验证：需要真实浏览器窗口。线上容器是无头环境（没有 X 显示），
+      勾选「显示浏览器窗口」也弹不出来 —— 请改用上面的「扫码登录」，或在 WSL 终端执行
+      <code>./scripts/login_headed.sh main</code>（把 main 换成对应账号 key），
+      窗口会出现在 Windows 桌面，登录完成后刷新本页即为已登录。</div>
   </div>
 
   <div style="display:flex;gap:10px;align-items:center;margin-top:14px">
@@ -3475,6 +4867,33 @@ def api_accounts_rename(key: str = "", name: str = ""):
                                     "account_id": acc.get("account_id") or 0}}
 
 
+@app.post("/api/accounts/move")
+def api_accounts_move(key: str = "", dir: str = "up"):
+    """调整账号显示顺序（up/down）：写回 accounts.json，控制台与各页下拉框同步。
+
+    只改顺序，不改主账号：主账号由 accounts.json 的 `main: true` 显式记录。
+    """
+    if dir not in ("up", "down"):
+        return {"ok": False, "error": "dir 只能是 up 或 down"}
+    try:
+        accs = settings.move_account(key, dir)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "main": settings.MAIN_ACCOUNT,
+            "accounts": [{"key": a["key"], "label": a.get("label") or a["key"]} for a in accs]}
+
+
+@app.post("/api/accounts/setmain")
+def api_accounts_setmain(key: str = ""):
+    """把某个账号设为「主账号」（之后调整顺序不会改变它）。"""
+    try:
+        acc = settings.set_main_account(key)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "account": {"key": acc["key"], "label": acc.get("label") or acc["key"]},
+            "main": settings.MAIN_ACCOUNT}
+
+
 @app.post("/api/accounts/delete")
 def api_accounts_delete(key: str = "", remove_profile: int = 0):
     """删除账号；remove_profile=1 时连浏览器 Profile 一起删。"""
@@ -3600,9 +5019,19 @@ def api_login_qr():
 # ================================================================ 调度
 def _nightly_job():
     """回刷最近 REFRESH_DAYS 天，并补齐停机期间的空洞。"""
+    # 行业大盘按「本地实际有数据的区间」单独补一份缓存：
+    # 即使按天数据已经最新，也要让明天的报表 / AI 解读能直接命中行业基准。
+    try:
+        lr = analyze_ai.local_range(settings.ACCOUNTS)
+        if lr:
+            industry.ensure([a["key"] for a in settings.ACCOUNTS], lr[0], lr[1])
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"行业大盘补齐未启动：{type(exc).__name__}: {exc}")
     rng = scrape_day.catchup_range()
     if rng is None:
         _log_progress("数据已是最新，无需抓取")
+        # 没有抓取也要核算：可能是白天手动补过数，页面摘要不该停在更早的一天
+        _price_snapshot()
         return
     start, end = rng
     newest = scrape_day.newest_day()
@@ -3610,7 +5039,7 @@ def _nightly_job():
     res = scrape_day.run_background(settings.ACCOUNTS, start, end, force=False,
                                      log=_log_progress, name="nightly",
                                      trigger="schedule",
-                                     after=_ai_after_scrape)
+                                     after=_after_scrape)
     if not res.get("ok"):
         _log_progress(f"定时任务未启动：{res.get('error')}")
 
@@ -3661,6 +5090,60 @@ def _scheduler_tick():
 _sched_lock = threading.Lock()
 _sched_state = {}
 
+# 商智「昨天」的商品明细在凌晨 1 点还没出数（接口成功但 0 行），
+# 而夜间任务只跑一次 → 前台价会一直停在两天前。这里白天定时只补商智。
+_sz_retry_state = {"last": 0.0}
+
+
+def _sz_retry_days() -> list:
+    """最近几天里「商智商品明细还没文件 / 0 行」的天（不算今天）。"""
+    today = _today()
+    out = set()
+    for a in settings.ACCOUNTS:
+        for i in range(1, max(settings.SZ_RETRY_LOOKBACK, 1) + 1):
+            day = (today - dt.timedelta(days=i)).isoformat()
+            if ds.payload_rows(ds.load_day(a["key"], day, "sz_product")) == 0:
+                out.add(day)
+    return sorted(out)
+
+
+def _after_sz_retry(summary: dict) -> None:
+    """补到商智数据后重算一次前台价（页面「夜间自动核算」卡片跟着更新）。"""
+    if summary.get("cancelled"):
+        return
+    _price_snapshot()
+
+
+def _sz_retry_loop() -> None:
+    """白天补商智：只在 08:00~23:00、两次尝试至少间隔 1 小时、且确实还有 0 行天才发请求。
+
+    请求量很小（每个账号 sz_product + sz_flow 各一次），不走整轮夜间抓取，
+    避免为了一个空天把京准通那堆报表重抓一遍。
+    """
+    while True:
+        time.sleep(300)
+        try:
+            if not settings.SZ_RETRY_ENABLED:
+                continue
+            now = dt_now()
+            if not (settings.SZ_RETRY_START_HOUR <= now.hour <= settings.SZ_RETRY_END_HOUR):
+                continue
+            if time.time() - _sz_retry_state["last"] < settings.SZ_RETRY_INTERVAL:
+                continue
+            days = _sz_retry_days()
+            if not days:
+                continue
+            _sz_retry_state["last"] = time.time()
+            _log_progress(f"商智补抓：{days[0]} ~ {days[-1]} 仍是 0 行，只补商智商品/流量")
+            res = scrape_day.run_background(
+                settings.ACCOUNTS, days[0], days[-1], kinds=["sz_product", "sz_flow"],
+                log=_log_progress, name="sz-retry", trigger="schedule",
+                after=_after_sz_retry)
+            if not res.get("ok"):
+                _log_progress(f"商智补抓未启动：{res.get('error')}")
+        except Exception as exc:  # noqa: BLE001
+            _log_progress(f"商智补抓异常：{type(exc).__name__}: {exc}")
+
 
 @app.on_event("startup")
 def _startup():
@@ -3687,6 +5170,11 @@ def _startup():
                   f"（{settings.TZ}）｜今天实际 { _t.strftime('%H:%M') }", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[webapp] 调度启动失败：{exc}", flush=True)
+        if settings.SZ_RETRY_ENABLED:
+            threading.Thread(target=_sz_retry_loop, name="sz-retry", daemon=True).start()
+            print("[webapp] 商智补抓已启动：白天每 "
+                  f"{max(settings.SZ_RETRY_INTERVAL // 60, 1)} 分钟检查一次「0 行天」",
+                  flush=True)
     if settings.RUN_ON_START:
         rng = scrape_day.catchup_range()
         if rng is not None:

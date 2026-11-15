@@ -10,7 +10,8 @@
 kind 取值：
     jzt_campaign 京准通概览-计划    jst_campaign 智能投放-计划
     jst_sku      智能投放-商品      jst_searchword 智能投放-搜索词
-    kw           快车-关键词        sz_product  商智-商品明细
+    kw           快车-关键词        kw_ad       关键词创意(按 SKU 花钱)
+    sz_product  商智-商品明细
     sz_flow      商智-流量概况      oplog       京准通操作日志
     crowd        定向-人群(DMP)     area        定向-地域
     hourly       京准通分时曲线（列表行「趋势」背后的数据；只抓昨天，见 OPTIONAL_KINDS）
@@ -27,12 +28,13 @@ from pathlib import Path
 from . import settings
 from .indicators import FLOW_SUM, PRODUCT_SUM, SRC_AMT, SRC_UV, SZ_AMT, SZ_ORDN, SZ_UV
 
-KINDS = ["jzt_campaign", "jst_campaign", "jst_sku", "jst_searchword", "kw",
+KINDS = ["jzt_campaign", "jst_campaign", "jst_sku", "jst_searchword", "kw", "kw_ad",
          "sz_product", "sz_flow", "oplog", "crowd", "area", "hourly"]
 
 # 「可选」数据源：不是每天都能/都需要抓（分时只在夜间随抓取跑一次、只抓昨天）。
 # `_day_complete` 判定「这天抓全了没」时会忽略它们，否则历史天永远算「不完整」。
-OPTIONAL_KINDS = {"hourly"}
+# kw_ad 是「关键词创意按天花费」（一次区间请求拆成多天），老数据的缺失不该让整天算未完成。
+OPTIONAL_KINDS = {"hourly", "kw_ad"}
 
 # 广告类报表可相加的字段
 AD_SUM = ["impressions", "clicks", "cost", "totalOrderCnt", "totalOrderSum", "totalCartCnt"]
@@ -51,6 +53,8 @@ AGG = {
                        "keep": ["campaignName", "searchTerm"]},
     "kw": {"key": ["campaignId", "groupId", "keywordName", "targetingType"], "sum": AD_SUM,
            "keep": ["campaignName", "groupName", "keywordName", "targetingType"]},
+    # 关键词创意按 SKU：报表中心创意报表（含已删计划）按天拆出来的花费，用来把关键词的钱归到商品
+    "kw_ad": {"key": ["skuId"], "sum": AD_SUM, "keep": ["adName", "campaignId", "campaignName"]},
     # 人群：按 DMP 人群包 × 计划 汇总（人群包名挂在 dmpName）
     "crowd": {"key": ["crowdId", "campaignId"], "sum": AD_SUM + CROWD_EXTRA_SUM,
               "keep": ["dmpName", "campaignName"]},

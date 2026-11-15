@@ -240,6 +240,7 @@ function renderChat(force){
     log.innerHTML='<div class="chatempty">就当前区间向 AI 追问，例如：<br>'
       + '· 定向人群（DMP 人群包）到底要不要做？先怎么做？<br>'
       + '· 哪些地域该屏蔽、哪些该加价？<br>'
+      + '· 行业大盘里本店和行业的 CTR/转化率差在哪？<br>'
       + '· 这周只改三件事，先改哪三件？</div>';
     log.__stick = true; toggleJump(); return;
   }
@@ -492,6 +493,8 @@ document.addEventListener('DOMContentLoaded', bootstrap);
 
 _QUICK = ["定向人群（DMP 人群包）要不要做？先怎么做？",
           "哪些地域该屏蔽、哪些该加价？",
+          "行业大盘里本店 CTR/转化率和行业差多少？先改什么？",
+          "行业热词和飙升词有哪些本店还没投？怎么加词测试？",
           "昨天哪几个时段在烧钱？分时折扣怎么设？",
           "这周只改三件事，先改哪三件？",
           "拉新和收割的计划结构平衡吗？",
@@ -514,8 +517,9 @@ def render(ai, d, ui: str = "", title: str = "AI 运营分析台") -> str:
     if not ai:
         report_html = (
             '<div class="aicard empty"><div class="aihd"><span class="aibadge off">AI</span> 暂无本区间解读'
-            '</div><div class="aidisc">点下面「生成本区间解读」，AI 会套用《京东快车底层逻辑》方法论，'
-            '贴着本地已抓取的数据出一份详细报告（含诊断、逐计划判断、词级建议、'
+            '</div><div class="aidisc">点下面「生成本区间解读」，AI 会套用《京东快车底层逻辑》+'
+            '《1小时吃透快车》官方课程知识库，贴着本地已抓取的数据出一份详细报告（含诊断、'
+            'SOP 体检（词量/配比/出价空间/观察周期）、质量分四构成、出价与保本 CPC、逐计划判断、词级建议、'
             '以及定向人群/地域等**还没用起来的功能**建议）。生成过程中可实时看到它的思考过程，'
             '中途离开页面也不会中断。</div>'
             '<div class="aidt" style="margin-top:10px"><button class="aibig" style="max-width:320px" '

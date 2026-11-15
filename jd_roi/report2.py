@@ -9,9 +9,10 @@ from __future__ import annotations
 import html as _html
 import json
 import sys
+from datetime import date as _date, timedelta as _timedelta
 from pathlib import Path
 
-from . import config
+from . import config, settings
 
 ASSETS = Path(__file__).resolve().parent / "assets" / "echarts.min.js"
 
@@ -25,7 +26,9 @@ SPIKE_SVG = (
 
 _NAV_ITEMS = [("/", "控制台"), ("/report", "分析报表"), ("/ai", "AI 分析台"),
               ("/paycomm", "CPS花费"), ("/paycomm/spend", "京准通花费"),
-              ("/profit", "月度利润"), ("/login", "登录")]
+              ("/cashflow", "广告费流水"), ("/profit", "月度利润"),
+              ("/price", "SKU前台价"),
+              ("/cache", "缓存"), ("/login", "登录")]
 
 
 def navtop(active: str = "", right: str = "") -> str:
@@ -225,11 +228,20 @@ tbody tr:hover{background:var(--soft)}
   font-size:12.5px;font-weight:500;color:var(--muted);transition:all .15s;line-height:1.4}
 .chip:hover{border-color:var(--primary);color:var(--ink)}
 .chip.on{background:var(--surface-card);color:var(--ink);border-color:var(--cream);font-weight:600}
+/* 卡片标题右侧的视图切换（如计划明细：区间详细 / 三期趋势） */
+.vswitch{margin-left:auto;display:inline-flex;border:1px solid var(--hair);border-radius:9999px;
+  overflow:hidden;background:var(--canvas)}
+.vswitch button{border:0;background:transparent;color:var(--muted);font-size:12.5px;font-weight:500;
+  padding:5px 14px;cursor:pointer;transition:all .15s;line-height:1.4;font-family:var(--sans)}
+.vswitch button:hover{color:var(--ink)}
+.vswitch button.on{background:var(--surface-card);color:var(--ink);font-weight:600}
 input,select,textarea{font-family:inherit}
 input[type=date],input[type=text],select{background:var(--canvas);border:1px solid var(--hair);
   border-radius:var(--r-sm);padding:7px 10px;font-size:13px;color:var(--ink)}
-input[type=date]:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary);
-  box-shadow:0 0 0 3px rgba(204,120,92,.15)}
+input[type=date]:focus,input[type=text]:focus,select:focus,textarea:focus{outline:none;
+  border-color:var(--primary);box-shadow:0 0 0 3px rgba(204,120,92,.15)}
+.srch{flex:1 1 220px;min-width:220px}
+.srchcount{color:var(--muted2);font-size:12px;min-width:66px;white-space:nowrap}
 input[type=checkbox]{accent-color:var(--primary)}
 
 /* ---------------------------------------------------------------- 提示块 */
@@ -241,6 +253,7 @@ input[type=checkbox]{accent-color:var(--primary)}
   border-radius:0 var(--r-sm) var(--r-sm) 0;font-size:12.5px;color:var(--redink);margin:12px 0;line-height:1.75}
 .covbox{background:var(--amberbg);border-left:3px solid var(--amber);padding:12px 16px;
   border-radius:0 var(--r-sm) var(--r-sm) 0;font-size:12.5px;color:var(--amberink);margin-bottom:16px;line-height:1.75}
+.gapmark{color:var(--red);font-weight:700;margin-left:2px;cursor:help}
 ul.sum{margin:8px 0 0;padding-left:20px}
 ul.sum li{margin:7px 0;line-height:1.7}
 .opDetail{font-size:11.5px;color:var(--muted);max-width:560px;word-break:break-word}
@@ -288,6 +301,17 @@ function showTab(id, el){
   Object.keys(window.__CH||{}).forEach(function(k){try{window.__CH[k].resize();}catch(e){}});
   window.scrollTo({top:0,behavior:'smooth'});
 }
+function planView(btn, v){
+  /* 计划明细：区间详细 / 三期趋势。两张表都已在页面里，只切显示，不重新请求。 */
+  var card=btn.closest('.card');
+  card.querySelectorAll('.vswitch button').forEach(function(b){
+    b.classList.toggle('on', b.dataset.v===v);
+  });
+  card.querySelectorAll('[data-pview]').forEach(function(w){
+    w.style.display=(w.dataset.pview===v)?'':'none';
+  });
+  cardFilter(card);   /* 有筛选条件时，把「显示 x / y」同步成当前视图的行数 */
+}
 function sortTable(th){
   var tb=th.closest('table');
   var idx=Array.prototype.indexOf.call(th.parentNode.children,th);
@@ -315,22 +339,170 @@ function initSort(){
     th.addEventListener('click',function(){sortTable(th);});
   });
 }
+/* 档位 / 账号 / 关键词三个筛选条件叠加：状态记在卡片的 dataset 上，
+   任何一项变化都重算一遍，避免互相覆盖（以前点完档位再点账号会把档位冲掉）。 */
+/* 关键词匹配：「；」= 任一命中（或），「：」= 同时命中（且），全角半角都认。
+   例：玉米；雪莲果 → 两个词命中一个就显示；玉米：梓云茶 → 两个都得有。 */
+function matchQuery(text, q){
+  if(!q) return true;
+  var t=(text||'').toLowerCase();
+  var groups=q.split(/[：:]/);
+  for(var g=0; g<groups.length; g++){
+    var part=groups[g].trim();
+    if(!part) continue;
+    var words=part.split(/[；;]/).map(function(x){return x.trim().toLowerCase();})
+                  .filter(function(x){return x;});
+    if(!words.length) continue;
+    var hit=false;
+    for(var w=0; w<words.length; w++){ if(t.indexOf(words[w])>=0){hit=true;break;} }
+    if(!hit) return false;
+  }
+  return true;
+}
+function cardFilter(card){
+  var tier=card.dataset.tier||'all', acct=card.dataset.acct||'all';
+  var q=(card.dataset.q||'').trim().toLowerCase();
+  var rows=card.querySelectorAll('table tbody tr'), shown=0, total=0;
+  for(var i=0;i<rows.length;i++){
+    var tr=rows[i], ok=true;
+    if(tier!=='all' && (tr.dataset.tier||'')!==tier) ok=false;
+    if(ok && acct!=='all' && (tr.dataset.acct||'').split(',').indexOf(acct)<0) ok=false;
+    if(ok && q && !matchQuery(tr.textContent, q)) ok=false;
+    tr.style.display=ok?'':'none';
+    /* 同一张卡片可能有两张表（如计划明细的区间详细 / 三期趋势），
+       计数只算当前显示的那张，否则「显示 x / y」会翻倍。 */
+    var pv=tr.closest('[data-pview]');
+    if(!pv || pv.style.display!=='none'){ total++; if(ok) shown++; }
+  }
+  var lab=card.querySelector('.srchcount');
+  if(lab) lab.textContent=(q||tier!=='all'||acct!=='all')?('显示 '+shown+' / '+total):'';
+}
 function applyTier(btn){
-  var val=btn.dataset.f; var card=btn.closest('.card');
-  card.querySelectorAll('.chip').forEach(function(c){c.classList.remove('on');});
+  var card=btn.closest('.card');
+  card.querySelectorAll('.chip[data-f]').forEach(function(c){c.classList.remove('on');});
   btn.classList.add('on');
-  card.querySelectorAll('table tbody tr').forEach(function(tr){
-    var t=tr.dataset.tier||'';
-    tr.style.display=(val==='all'||t===val)?'':'none';
-  });
+  card.dataset.tier=btn.dataset.f||'all';
+  cardFilter(card);
 }
 function applyAcct(btn){
-  var val=btn.dataset.a; var card=btn.closest('.card');
-  card.querySelectorAll('.chip').forEach(function(c){c.classList.remove('on');});
+  var card=btn.closest('.card');
+  card.querySelectorAll('.chip[data-a]').forEach(function(c){c.classList.remove('on');});
   btn.classList.add('on');
-  card.querySelectorAll('table tbody tr').forEach(function(tr){
-    var t=(tr.dataset.acct||'').split(',');
-    tr.style.display=(val==='all'||t.indexOf(val)>=0)?'':'none';
+  card.dataset.acct=btn.dataset.a||'all';
+  cardFilter(card);
+}
+function applySearch(input){
+  var card=input.closest('.card');
+  card.dataset.q=input.value||'';
+  cardFilter(card);
+}
+/* ---- SKU 图（ROI vs 保本线 / 广告渗透率）的卡片内筛选 ----
+   明细由 window.__SKUCHART 下发（账号 × 窗口），这里按「全部账号/单账号 + 前N + 关键词」
+   重算并 setOption，而不是整页跳转（跳页会把日期、滚动位置一起刷掉）。
+   「全部账号」= 各账号本期花费/成交/商智成交分别相加，ROI 与渗透率再按合计重算，
+   不能把各账号比率直接平均。 */
+function _skLatest(win){
+  var ks=(window.__SKUCHART||{}).wkeys||[], i, v;
+  for(i=ks.length-1;i>=0;i--){v=(win||{})[ks[i]]; if(v&&v.cost>0) return v;}
+  for(i=ks.length-1;i>=0;i--){v=(win||{})[ks[i]]; if(v) return v;}
+  return null;
+}
+function _skCalc(sk, ak){
+  var all=sk.a||{};
+  var use=(ak==='all')?Object.keys(all):(all[ak]?[ak]:[]);
+  var cost=0, amt=0, sz=0;
+  use.forEach(function(k){
+    var v=_skLatest(all[k]); if(!v) return;
+    cost+=v.cost||0; amt+=v.amt||0; sz+=v.szAmt||0;
+  });
+  var share=(sz>0)?Math.round(amt/sz*1000)/10:null;
+  if(share!==null && share>110) share=null;   /* 广告成交>店铺成交：口径不可比，不给值 */
+  return {cost:cost, roi:cost?Math.round(amt/cost*100)/100:0, share:share};
+}
+function skuChartRender(card){
+  if(!card.dataset.skc){
+    var bar=card.querySelector('.toolbar[data-skc]');
+    if(bar) card.dataset.skc=bar.dataset.skc;
+  }
+  var cid=card.dataset.skc, el=document.getElementById(cid);
+  var ch=window.__CH&&window.__CH[cid], p=window.__SKUCHART;
+  if(!el||!ch||!p) return;
+  var ak=card.dataset.ak||'all', q=(card.dataset.q||'').trim();
+  var n=parseInt(card.dataset.n||'15',10);
+  var rows=[];
+  (p.rows||[]).forEach(function(sk){
+    if(q && !matchQuery(sk.name+' '+sk.id, q)) return;
+    var m=_skCalc(sk, ak);
+    if(cid==='chSkuRoi'){ if(!(m.cost>0)) return; rows.push({n:sk.name, v:m.roi, be:sk.be, c:m.cost}); }
+    else { if(m.share===null) return; rows.push({n:sk.name, v:m.share, be:sk.be, c:m.cost}); }
+  });
+  var total=rows.length;
+  rows.sort(function(a,b){return b.c-a.c;});          /* 按花费排序，切账号后仍然「花费前 N」 */
+  if(n>0) rows=rows.slice(0,n);
+  rows.reverse();                                      /* ECharts 类目轴自下而上，倒过来才是花费高的在上 */
+  var names=rows.map(function(r){return (r.n||'').slice(0,16);});
+  var opt;
+  if(cid==='chSkuRoi'){
+    opt={tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},
+      legend:{data:['实际ROI','保本ROI'],top:0},
+      grid:{left:130,right:50,top:40,bottom:30},
+      xAxis:{type:'value',name:'ROI'},
+      yAxis:{type:'category',data:names,axisLabel:{fontSize:11}},
+      series:[
+        {name:'实际ROI',type:'bar',barMaxWidth:16,
+         label:{show:true,position:'right',fontSize:11},
+         data:rows.map(function(r){
+           return {value:Math.round(r.v*100)/100,
+                   itemStyle:{color:(r.be>0&&r.v>=r.be)?'#5db872':'#c64545'}};})},
+        {name:'保本ROI',type:'bar',barMaxWidth:16,
+         itemStyle:{color:'#d9d2c7'},label:{show:true,position:'right',fontSize:11},
+         data:rows.map(function(r){return Math.round(r.be*100)/100;})}]};
+  }else{
+    opt={tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},
+      grid:{left:130,right:60,top:24,bottom:30},
+      xAxis:{type:'value',name:'广告成交/店铺成交 %',max:100},
+      yAxis:{type:'category',data:names,axisLabel:{fontSize:11}},
+      series:[{type:'bar',barMaxWidth:16,
+        itemStyle:{color:'#5db8a6',borderRadius:[0,4,4,0]},
+        label:{show:true,position:'right',fontSize:11,formatter:'{c}%'},
+        data:rows.map(function(r){return Math.round(r.v*10)/10;}),
+        markLine:{silent:true,symbol:'none',lineStyle:{color:'#c64545',type:'dashed'},
+                  data:[{xAxis:100,label:{formatter:'广告=自然'}}]}}]};
+  }
+  /* 条数变了要跟着改画布高度，否则「全部」会把 100 条压成糊 */
+  el.style.height=Math.max(430, rows.length*26+80)+'px';
+  opt.textStyle={fontFamily:'-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif',color:'#3d3d3a'};
+  ch.setOption(opt,true);
+  ch.resize();
+  var lab=card.querySelector('.srchcount');
+  if(lab) lab.textContent='显示 '+rows.length+' / '+total+' 个';
+}
+function skuChartAcct(btn){
+  var card=btn.closest('.card');
+  card.querySelectorAll('.chip[data-ak]').forEach(function(c){c.classList.remove('on');});
+  btn.classList.add('on');
+  card.dataset.ak=btn.dataset.ak||'all';
+  skuChartRender(card);
+}
+function skuChartN(sel){
+  var card=sel.closest('.card');
+  card.dataset.n=sel.value||'15';
+  skuChartRender(card);
+}
+function skuChartSearch(input){
+  var card=input.closest('.card');
+  card.dataset.q=input.value||'';
+  skuChartRender(card);
+}
+function skuChartInit(){
+  if(!window.__SKUCHART) return;
+  document.querySelectorAll('.toolbar[data-skc]').forEach(function(bar){
+    var card=bar.closest('.card');
+    if(!card) return;
+    card.dataset.skc=bar.dataset.skc;   /* 卡片本身要知道画哪张图（data-skc 在工具条上） */
+    card.dataset.ak='all';
+    card.dataset.n='15';
+    skuChartRender(card);
   });
 }
 function applyWordType(btn){
@@ -347,6 +519,29 @@ function toggleWords(btn){
   d.style.display=(d.style.display==='none'||!d.style.display)?'block':'none';
   btn.textContent=d.style.display==='block'?'收起':'展开';
 }
+function indShow(key, el){
+  var root=el.closest('.indwrap')||document;
+  root.querySelectorAll('.indacct').forEach(function(s){s.classList.remove('active');});
+  var target=root.querySelector('.indacct[data-ind="'+key+'"]');
+  if(target) target.classList.add('active');
+  root.querySelectorAll('.indtab').forEach(function(t){t.classList.remove('active');});
+  el.classList.add('active');
+  try{
+    var u=new URL(location.href); u.searchParams.set('ind_account',key);
+    history.replaceState(null,'',u.toString());
+  }catch(e){}
+  if(target) target.querySelectorAll('.chart').forEach(function(d){
+    var ch=window.__CH&&window.__CH[d.id]; if(ch){try{ch.resize();}catch(e){}}
+  });
+}
+function indInit(){
+  var root=document.querySelector('#p-ind .indwrap'); if(!root) return;
+  var want=new URLSearchParams(location.search).get('ind_account');
+  var tabs=root.querySelectorAll('.indtab'), tab=null;
+  tabs.forEach(function(t){if(t.dataset.ind===want) tab=t;});
+  if(!tab) tab=tabs[0];
+  if(tab) indShow(tab.dataset.ind,tab);
+}
 function initCharts(){
   window.__CH=window.__CH||{};
   initSort();
@@ -360,6 +555,8 @@ function initCharts(){
     var opt=c.option||{}; opt.textStyle={fontFamily:'-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif',color:'#3d3d3a'};
     var ch=echarts.init(el); ch.setOption(opt); window.__CH[c.id]=ch;
   });
+  if(typeof skuChartInit==='function') skuChartInit();
+  if(typeof indInit==='function') indInit();
   window.addEventListener('resize',function(){
     Object.keys(window.__CH).forEach(function(k){try{window.__CH[k].resize();}catch(e){}});});
 }
@@ -402,6 +599,30 @@ def _num(v, dec=2) -> str:
 
 def _pct(v, dec=1) -> str:
     return "—" if v is None else f"{_n(v):.{dec}f}%"
+
+
+def _cost_col(d) -> tuple:
+    """「花费」列的表头跟着所选区间走（原先写死「近周花费」，单选一天时会误导）。
+
+    返回 (表头文字, 悬停说明)。区间只有 1 天时叫「昨日花费 / 当日花费」，
+    多天叫「本期花费」；取数值一律用 w2（所选区间），不回退到上一期。
+    """
+    m = d.get("meta") or {}
+    w2 = (m.get("windows") or [{}])[-1] or {}
+    rng = m.get("range") or {}
+    start = rng.get("start") or w2.get("start") or ""
+    end = rng.get("end") or w2.get("end") or ""
+    n = 0
+    try:
+        n = (_date.fromisoformat(end) - _date.fromisoformat(start)).days + 1
+    except (TypeError, ValueError):
+        pass
+    if n == 1:
+        label = "昨日花费" if end == (settings.today() - _timedelta(days=1)).isoformat() else "当日花费"
+    else:
+        label = "本期花费"
+    span = f"{start} ~ {end}" + (f"（{n} 天）" if n else "")
+    return label, f"所选区间 {span} 的京准通花费，跟随页面顶部的起止日期，不是固定一周"
 
 
 def _delta(cur, pre, better_high=True, dec=1) -> tuple:
@@ -465,6 +686,10 @@ def _sku_advice(s) -> str:
     cur = _latest(s)
     roi, cost = _n(cur["roi"]), _n(cur["cost"])
     tier = s["verdict"]["tier"]
+    if be <= 0:
+        return (f"每件到手结算价扣完成本后为负（毛利/件 ¥{_n(s.get('grossPerOrder')):.1f}）："
+                f"卖一件亏一件，不存在保本 ROI；ROI {roi:.2f} 只是换算好看，实际投得越多亏得越多，"
+                f"优先停投或先谈下成本")
     if tier == "放大":
         return f"ROI {roi:.2f} 明显高于保本 {be:.2f}：日预算 +20~30%，核心词出价 +10~20%，当作增量池"
     if tier == "优化":
@@ -483,6 +708,9 @@ def _plan_advice(p) -> str:
     roi, cost = _n(cur["roi"]), _n(cur["cost"])
     t = p["tier"]
     grow = _n(p.get("growLine")) or round(be * 1.25, 2)
+    if be <= 0:
+        return (f"计划内的商品扣完成本后为负（无保本 ROI）：ROI {roi:.2f} 再怎么提也补不回单件亏损，"
+                f"优先降预算 / 换高毛利商品")
     if t == "放大":
         return f"ROI {roi:.2f} ≥ 放量线 {grow:.2f}（保本 {be:.2f}）：加预算 20~30%，可复制到同款 SKU"
     if t == "优化":
@@ -529,8 +757,8 @@ def build_charts(d):
              "itemStyle": {"color": "#5db872"}, "lineStyle": {"width": 3},
              "label": {"show": True, "fontSize": 12, "fontWeight": "bold"}}]}})
 
-    # 2) 分账号 花费 & ROI
-    accts = d["accounts"]
+    # 2) 分账号 花费 & ROI（无数据的账号不画，否则图上多几条贴 0 的线）
+    accts = _data_accs(d)
     series = []
     for i, a in enumerate(accts):
         series.append({"name": a["label"] + " 花费", "type": "bar", "barMaxWidth": 34,
@@ -550,12 +778,16 @@ def build_charts(d):
                   {"type": "value", "name": "ROI", "splitLine": {"show": False}}],
         "series": series}})
 
-    # 3) SKU：实际 ROI vs 保本 ROI（花费前 15）
-    skus = [s for s in d["skus"] if _n(_latest(s)["cost"]) > 0][:15]
+    # 3) SKU：实际 ROI vs 保本 ROI（默认花费前 15，卡片内可切账号 / 前 N / 搜索）
+    #    排序按「本期花费」而不是 d["skus"] 的原始顺序，切账号后口径才一致；
+    #    保本线为 0（卖一件亏一件）也涂红，与页面 _roi_cls 的判定保持一致。
+    skus = sorted([s for s in d["skus"] if _n(_latest(s)["cost"]) > 0],
+                  key=lambda s: -_n(_latest(s)["cost"]))[:15]
     names = [(s["name"] or s["skuId"])[:16] for s in skus][::-1]
     roi = [round(_n(_latest(s)["roi"]), 2) for s in skus][::-1]
     be = [round(_n(s["breakeven"]), 2) for s in skus][::-1]
-    colors = ["#5db872" if _n(_latest(s)["roi"]) >= _n(s["breakeven"]) else "#c64545" for s in skus][::-1]
+    colors = ["#5db872" if (_n(s["breakeven"]) > 0 and _n(_latest(s)["roi"]) >= _n(s["breakeven"]))
+              else "#c64545" for s in skus][::-1]
     charts.append({"id": "chSkuRoi", "option": {
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
         "legend": {"data": ["实际ROI", "保本ROI"], "top": 0},
@@ -570,8 +802,9 @@ def build_charts(d):
              "itemStyle": {"color": "#d9d2c7"},
              "label": {"show": True, "position": "right", "fontSize": 11}}]}})
 
-    # 4) 广告渗透率
-    pen = [s for s in d["skus"] if s["wins"]["w2"].get("adShare") or s["wins"]["w1"].get("adShare")][:15]
+    # 4) 广告渗透率（同样默认花费前 15；没商智成交的商品渗透率不可算，不进图）
+    pen = sorted([s for s in d["skus"] if _latest(s).get("adShare") is not None],
+                 key=lambda s: -_n(_latest(s)["cost"]))[:15]
     pnames = [(s["name"] or s["skuId"])[:16] for s in pen][::-1]
     pval = [round(_n(_latest(s).get("adShare")), 1) for s in pen][::-1]
     charts.append({"id": "chShare", "option": {
@@ -637,11 +870,93 @@ def build_charts(d):
              "itemStyle": {"color": "#e8a55a", "borderRadius": [4, 4, 0, 0]}},
             {"name": "广告订单", "type": "bar", "data": so, "barMaxWidth": 44,
              "itemStyle": {"color": "#5db872", "borderRadius": [4, 4, 0, 0]}}]}})
+    # 行业大盘：分日指数趋势 + 24 小时点击指数（都是指数，不是金额）
+    ind = d.get("industry") or {}
+    ia = (ind.get("charts") or {}).get("accounts") or []
+    if ind.get("available") and ia:
+        # 按账号各出一份图，页面用账号切换只显示当前账号，避免图例被 5 个账号挤爆
+        for i, a in enumerate(ia):
+            color = _PALETTE[i % len(_PALETTE)]
+            trend = a.get("trend") or []
+            hours = a.get("hourly") or []
+            charts.append({"id": f"chIndTrend{i}", "option": {
+                "tooltip": {"trigger": "axis"}, "legend": {"top": 0, "type": "scroll"},
+                "grid": {"left": 80, "right": 80, "top": 50, "bottom": 46},
+                "xAxis": {"type": "category", "data": [x.get("date") or "" for x in trend]},
+                "yAxis": [{"type": "value", "name": "展现指数"},
+                          {"type": "value", "name": "点击指数", "splitLine": {"show": False}}],
+                "series": [
+                    {"name": "展现指数", "type": "line", "smooth": True, "symbolSize": 7,
+                     "yAxisIndex": 0, "lineStyle": {"width": 2},
+                     "itemStyle": {"color": color},
+                     "data": [_n(x.get("imp")) for x in trend]},
+                    {"name": "点击指数", "type": "line", "smooth": True, "symbolSize": 7,
+                     "yAxisIndex": 1, "lineStyle": {"width": 2, "type": "dashed"},
+                     "itemStyle": {"color": color},
+                     "data": [_n(x.get("clk")) for x in trend]},
+                ]}})
+            charts.append({"id": f"chIndHour{i}", "option": {
+                "tooltip": {"trigger": "axis"}, "legend": {"top": 0, "type": "scroll"},
+                "grid": {"left": 80, "right": 50, "top": 50, "bottom": 46},
+                "xAxis": {"type": "category", "data": [x.get("hour") or "" for x in hours],
+                          "name": "小时"},
+                "yAxis": {"type": "value", "name": "点击指数"},
+                "series": [{"name": "点击指数", "type": "line", "smooth": True,
+                            "symbolSize": 6, "itemStyle": {"color": color},
+                            "data": [_n(x.get("clk")) for x in hours]}]}})
     return charts
 
 
 def _chart_html(cid, tall=False):
     return f'<div class="chart{" tall" if tall else ""}" id="{cid}"></div>'
+
+
+def sku_chart_payload(d) -> dict:
+    """两张 SKU 图的下发数据：按「账号 × 窗口」保存明细，供卡片内切账号 / 搜索 / 前 N。
+
+    原来 build_charts 里直接 `[:15]` 切死，页面因此只有固定几个商品、也没有账号筛选。
+    这里把同一个 SKU 在各账号的本期花费、ROI、渗透率一起给前端，图表自己重算。
+    """
+    rows = []
+    for s in d["skus"]:
+        ba = s.get("byAcctWins") or {}
+        if not ba:
+            continue
+        rows.append({
+            "id": s["skuId"], "name": s["name"] or s["skuId"],
+            "be": round(_n(s.get("breakeven")), 2),
+            "a": {ak: {wk: {"cost": round(_n(v.get("cost")), 2),
+                            "amt": round(_n(v.get("amt")), 2),
+                            "szAmt": round(_n(v.get("szAmt")), 2),
+                            "roi": round(_n(v.get("roi")), 2),
+                            "share": (round(_n(v.get("adShare")), 1)
+                                      if v.get("adShare") is not None else None)}
+                   for wk, v in (wins or {}).items()}
+                  for ak, wins in ba.items()},
+        })
+    return {"rows": rows,
+            "wkeys": [w["key"] for w in d["meta"]["windows"]],
+            "accounts": [{"key": a["key"], "label": a["label"]} for a in _data_accs(d)]}
+
+
+def _sku_chart_bar(cid, d) -> str:
+    """SKU 图卡片内的筛选条：账号 chips + 前 N + 关键词（与交叉表那套 chips 视觉一致）。"""
+    chips = "".join(
+        f'<div class="chip{" on" if i == 0 else ""}" data-ak="{_e(k)}" '
+        f'onclick="skuChartAcct(this)">{_e(v)}</div>'
+        for i, (k, v) in enumerate([("all", "全部账号")] +
+                                   [(a["key"], a["label"]) for a in _data_accs(d)]))
+    return f"""<div class="toolbar" data-skc="{cid}">
+  {chips}<span style="width:12px"></span>
+  <label class="mini">显示
+    <select onchange="skuChartN(this)">
+      <option value="15">前 15</option><option value="30">前 30</option>
+      <option value="50">前 50</option><option value="0">全部</option>
+    </select></label>
+  <input type="text" class="srch" placeholder="🔍 搜商品名 / SKU（「；」任一命中）"
+         oninput="skuChartSearch(this)">
+  <span class="mini srchcount"></span>
+</div>"""
 
 
 def _kpi(label, main, sub="", cls="") -> str:
@@ -693,7 +1008,10 @@ def page_overview(d) -> str:
     acct_rows = []
     for a in d["accounts"]:
         t = a["totals"]
-        cells = f'<td class="l"><b>{_e(a["label"])}</b><div class="mini">ID {_e(a["accountId"])}</div></td>'
+        tag = ("" if a.get("hasData", True) else
+               '<div class="mini" style="color:var(--muted2)">该区间无数据（未抓取）</div>')
+        cells = (f'<td class="l"><b>{_e(a["label"])}</b>'
+                 f'<div class="mini">ID {_e(a["accountId"])}</div>{tag}</td>')
         for k in wkeys:
             m = t[k]
             cls = _roi_cls(m["roi"], _be_all(d))
@@ -746,7 +1064,13 @@ def page_overview(d) -> str:
 <div class="card">
   <h2>口径与成本假设 <span class="tagline">重要：这些是推算值</span></h2>
   <div class="note">
-    <b>数据口径</b>：广告=京准通概览（点击15天/成交订单）；智能投放=智能投放报表；商智=各店铺成交口径。
+    <b>数据口径</b>：广告=京准通概览（点击15天/成交订单）；智能投放=智能投放报表；
+    <b>SKU 花费 = 智能投放 ＋ 全站智能推广 ＋ 关键词计划</b>（关键词/商品定向按快车创意报表的
+    落地页 SKU 归因，推广管理创意接口兜底；<b>全站智能推广按 SPU 投放，SPU 下未拉黑的 SKU 平分</b>
+    （花费/成交/订单都按 SPU 级数据平分，京准通不提供 SPU 内的分 SKU 数据）；
+    归不到的单独列未归因，不摊到商品上）；商智=各店铺成交口径，
+    且成交额/件数<b>次日只结算约一半、T+2~T+3 才定稿</b>（流量指标 T+1 就是终值），
+    最近 15 天每晚重抓，更早的天不再变动。
     搜索词报表按「花费」降序取前 2000 行，覆盖约 99.9% 花费。
   </div>
   {_source_note(d)}
@@ -779,14 +1103,16 @@ def _cost_tip(s) -> str:
     if s.get("costSource") != "erp":
         return (f"未接入该 SKU 真实成本：保本线按全店 Excel 口径 {_n(s.get('breakeven')):.2f}；"
                 f"毛利/件 = 前台件单价 × 全店毛利率")
+    be_txt = ("、<b>每件亏本 ⇒ 不存在保本 ROI（投得越多亏得越多）</b>"
+              if _n(s.get("breakeven")) <= 0
+              else f" ⇒ 保本 {_n(s.get('breakeven')):.2f}、放量 {_n(s.get('growLine')):.2f}")
     tip = (f"每件（ERP 真实口径）：到手结算价 ¥{_n(cp.get('supply'))}"
            f" ＝ 前台件单价 ¥{_n(cp.get('aov'))} × 到手率 {_n(cp.get('settleRate')) * 100:.0f}%"
            f"（扣点与京东差价已扣）"
            f"；− 货款 ¥{_n(cp.get('productCost'))} − 运费 ¥{_n(cp.get('shipping'))}"
            f" − 包材 ¥{_n(cp.get('package'))} − 人工 ¥{_n(cp.get('labor'))}"
            f" = 贡献 ¥{_n(cp.get('grossPerOrder'))}"
-           f" → 占前台成交额 {_n(cp.get('margin')) * 100:.1f}% ⇒ 保本 {_n(s.get('breakeven')):.2f}"
-           f"、放量 {_n(s.get('growLine')):.2f}"
+           f" → 占前台成交额 {_n(cp.get('margin')) * 100:.1f}%{be_txt}"
            f"；占到手结算价 {_n(cp.get('marginSettle')) * 100:.1f}%（ERP 毛利率口径）"
            f" ⇒ 到手结算口径保本 {_n(cp.get('breakevenSettle')):.2f}"
            f"。判定用前者：京准通报的 ROI 分子是<b>前台成交额</b>（实测广告客单价≈商智客单价）")
@@ -797,6 +1123,16 @@ def _cost_tip(s) -> str:
     if cp.get("erpName"):
         tip += f"；ERP 品名 {cp.get('erpName')}"
     return tip
+
+
+def _cost_split_tip(s, cur) -> str:
+    """花费的来源拆分：智能投放 / 全站智能推广 / 关键词计划（按创意 SKU 归因）。"""
+    kw = _n((s.get("kwCost") or {}).get(_latest_key(s)))
+    if kw <= 0:
+        return "花费＝智能投放商品报表 ＋ 全站智能推广（本商品本期没有归到关键词计划）"
+    return (f"花费＝智能投放 ＋ 全站智能推广 ＋ 关键词计划；"
+            f"其中关键词/商品定向 ¥{_money(kw)}"
+            f"（按快车创意报表的落地页 SKU 归因，推广管理创意接口兜底）")
 
 
 def _supply_cell(s) -> str:
@@ -813,6 +1149,9 @@ def _roi_tip(s, roi, be) -> str:
     """ROI 悬停：平台报的是前台成交额，顺手折算成「每花 1 元真正回到我们账户多少钱」。"""
     cp = s.get("costParams") or {}
     rate = _n(cp.get("settleRate"))
+    if _n(be) <= 0:
+        return ("每件到手结算价扣完成本后为负（卖一件亏一件），不存在保本 ROI；"
+                "这里的 ROI 只是平台口径换算，不能当成「回本」")
     if s.get("costSource") != "erp" or rate <= 0:
         return "广告 ROI = 前台成交额 ÷ 花费（平台口径）"
     return (f"前台口径：ROI {roi:.2f}（分子是消费者实付）vs 保本 {be:.2f} ⇒ 判定用这一对\n"
@@ -829,9 +1168,32 @@ def _natural_qty(m) -> float:
     return max(q - _n(m.get("ord")), 0.0)
 
 
+def _natural_ok(m) -> bool:
+    """商智成交 ≥ 广告成交 时，「相减」才有意义。
+
+    商智的成交 T+1 只结算约一半，最近几天的商智成交常常小于广告成交；
+    这时 szAmt − amt 会被夹成 0，看起来像「完全没有自然成交」，所以改判为不可算。
+    阈值与 analyze2 的 adShare 一致（≤110%）。
+    """
+    sz, ad = _n(m.get("szAmt")), _n(m.get("amt"))
+    return sz > 0 and ad <= sz * 1.1
+
+
+def _be_txt(be, starred=False) -> str:
+    """保本 ROI 显示：≤0 表示每件毛利为负，保本线不存在 —— 显示「亏本」而不是 0.00。"""
+    b = _n(be)
+    if b <= 0:
+        return ('<span class="mini" style="color:var(--redink)" '
+                'title="每件到手结算价 − 货款 − 运费 − 包材 − 人工 ≤ 0：卖一件亏一件，'
+                '不存在保本 ROI（投得越多亏得越多）">亏本</span>')
+    return f'{b:.2f}{"*" if starred else ""}'
+
+
 def _sku_row(i, s, labels) -> str:
-    cur = _latest(s)
-    wk = _latest_key(s)
+    # 整行都只用 w2（所选区间），不再回退上一期：表头写「昨日/本期花费」时，
+    # 行里却出现前一期数字会自相矛盾（page_sku 已把本期无花费的 SKU 过滤掉）。
+    cur = s["wins"]["w2"]
+    wk = "w2"
     roi, be = _n(cur["roi"]), _n(s["breakeven"])
     gap = roi - be
     accts = ",".join(s.get("adAccounts") or [])
@@ -841,17 +1203,35 @@ def _sku_row(i, s, labels) -> str:
     shops = "／".join(f'{_e(k)} ¥{_money(v)}' for k, v in (s.get("shops") or {}).items())
     spark = _spark([s["wins"][k]["roi"] for k in ("w0", "w1", "w2")], be)
     tier = s["verdict"]["tier"]
+    nat_ok = _natural_ok(cur)
+    if nat_ok:
+        nat_html = (f'{_money(cur.get("naturalAmt"))}'
+                    f'<span class="qtysub"> {_num(_natural_qty(cur), 0)}件</span>')
+        nat_tip = "自然成交＝商智总成交 − 广告成交（金额口径）；件数为商智件数 − 广告订单数（近似）"
+        sz_attr = net_attr = ""
+        mark = ""
+    else:
+        # 商智 T+1 只出约一半，这时「商智 − 广告」会被夹成 0，看着像没有自然成交；
+        # 与其显示一个假的 0，不如标成未定稿（—/*），等商智回补后再看。
+        nat_html = '<span class="mini">—</span>'
+        nat_tip = ("商智成交 < 广告成交：商智 T+1 只结算约一半（T+2~T+3 才定稿），"
+                   "两个口径对不上，相减没有意义，故不给自然成交")
+        sz_attr = (' title="商智成交还没出全（T+1 约一半），件数同理；'
+                   '最近 1~2 天属正常滞后，2~3 天后自动补齐"')
+        net_attr = ' title="商智成交未出全，净利按广告成交兜底估算，会偏低；等商智回补后再看"'
+        mark = "*"
     return (
         f'<tr data-tier="{_e(tier)}" data-acct="{_e(accts)}">'
         f'<td class="mono">{i}</td>'
         f'<td class="l"><div class="prod">{img}<div><div class="nm" title="{_e(s["name"])}｜{_e(shops)}">'
         f'{_e(s["name"])}</div><div class="sid">{_e(s["skuId"])}</div></div></div></td>'
         f'<td class="l">{pills or "—"}</td>'
-        f'<td class="mono" data-v="{_n(cur["cost"])}">{_money(cur["cost"])}</td>'
+        f'<td class="mono" data-v="{_n(cur["cost"])}" title="{_e(_cost_split_tip(s, cur))}">'
+        f'{_money(cur["cost"])}</td>'
         f'<td class="mono" data-v="{_n(cur["amt"])}">{_money(cur["amt"])}</td>'
         f'<td class="mono {_roi_cls(roi, be)}" data-v="{roi}" title="{_e(_roi_tip(s, roi, be))}">{roi:.2f}</td>'
         f'<td class="mono" data-v="{be}" title="{_e(_cost_tip(s))}">'
-        f'{be:.2f}{"*" if s.get("costSource") != "erp" else ""}</td>'
+        f'{_be_txt(be, starred=(s.get("costSource") != "erp"))}</td>'
         f'<td class="mono" data-v="{_n(cur["ord"])}">{int(_n(cur["ord"]))}</td>'
         f'<td class="mono" data-v="{_n(cur["cpa"])}">{_num(cur["cpa"], 2)}</td>'
         f'<td class="mono" data-v="{_n(s.get("unitPrice"))}" '
@@ -861,14 +1241,13 @@ def _sku_row(i, s, labels) -> str:
         f'{_supply_cell(s)}'
         f'<td class="mono" data-v="{_n(s["grossPerOrder"])}" title="{_e(_cost_tip(s))}">{_num(s["grossPerOrder"], 1)}</td>'
         f'<td class="mono" data-v="{_n(cur.get("adShare"))}">{_pct(cur.get("adShare"))}</td>'
-        f'<td class="mono" data-v="{_n(cur.get("szAmt"))}">{_money(cur.get("szAmt"))}'
-        f'<span class="qtysub"> {_num(_n(cur.get("szQty")), 0)}件</span></td>'
-        f'<td class="mono" data-v="{_n(cur.get("naturalAmt"))}" '
-        f'title="自然成交＝商智总成交 − 广告成交（金额口径）；件数为商智件数 − 广告订单数（近似）">'
-        f'{_money(cur.get("naturalAmt"))}'
-        f'<span class="qtysub"> {_num(_natural_qty(cur), 0)}件</span></td>'
+        f'<td class="mono" data-v="{_n(cur.get("szAmt"))}"{sz_attr}>{_money(cur.get("szAmt"))}'
+        f'<span class="qtysub"> {_num(_n(cur.get("szQty")), 0)}件{mark}</span></td>'
+        f'<td class="mono" data-v="{_n(cur.get("naturalAmt")) if nat_ok else 0}" title="{_e(nat_tip)}">'
+        f'{nat_html}</td>'
         f'<td class="mono {"up" if _n(s["est"][wk]["netProfit"]) > 0 else "down"}" '
-        f'data-v="{_n(s["est"][wk]["netProfit"])}">{_money(s["est"][wk]["netProfit"])}</td>'
+        f'data-v="{_n(s["est"][wk]["netProfit"])}"{net_attr}>'
+        f'{_money(s["est"][wk]["netProfit"])}{mark}</td>'
         f'<td data-v="{roi}">{spark}</td>'
         f'<td class="l" title="{_e(_sku_advice(s))}">{_badge(tier)}</td>'
         f'</tr>')
@@ -876,12 +1255,15 @@ def _sku_row(i, s, labels) -> str:
 
 def page_sku(d) -> str:
     labels = {a["key"]: a["label"] for a in d["accounts"]}
-    skus = [s for s in d["skus"] if _n(s["wins"]["w0"]["cost"]) + _n(s["wins"]["w1"]["cost"]) + _n(s["wins"]["w2"]["cost"]) > 0]
+    cost_label, cost_tip = _cost_col(d)
+    # 只列「所选区间内真有投放」的 SKU：以前允许回退看上两期花费，
+    # 选一天时会把前一天的 SKU 混进来，和「昨日花费」表头对不上。
+    skus = [s for s in d["skus"] if _n(s["wins"]["w2"]["cost"]) > 0]
     rows = [_sku_row(i + 1, s, labels) for i, s in enumerate(skus)]
-    tot_cost = sum(_n(_latest(s)["cost"]) for s in skus)
-    tot_amt = sum(_n(_latest(s)["amt"]) for s in skus)
-    tot_sz = sum(_n(_latest(s).get("szAmt")) for s in skus)
-    tot_net = sum(_n(s["est"][_latest_key(s)]["netProfit"]) for s in skus)
+    tot_cost = sum(_n(s["wins"]["w2"]["cost"]) for s in skus)
+    tot_amt = sum(_n(s["wins"]["w2"]["amt"]) for s in skus)
+    tot_sz = sum(_n(s["wins"]["w2"].get("szAmt")) for s in skus)
+    tot_net = sum(_n(s["est"]["w2"]["netProfit"]) for s in skus)
     tier_count = {}
     for s in skus:
         tier_count[s["verdict"]["tier"]] = tier_count.get(s["verdict"]["tier"], 0) + 1
@@ -891,14 +1273,35 @@ def page_sku(d) -> str:
         [(t, f"{t} {tier_count.get(t, 0)}") for t in ["放大", "优化", "止损", "严重亏损"] if tier_count.get(t)])
     achips = "".join(
         f'<div class="chip{" on" if k == "all" else ""}" data-a="{k}" onclick="applyAcct(this)">{v}</div>'
-        for k, v in [("all", "全部账号")] + [(a["key"], a["label"]) for a in d["accounts"]])
+        for k, v in [("all", "全部账号")] + [(a["key"], a["label"]) for a in _data_accs(d)])
+    kwk = "w2" if any(_n(s["wins"]["w2"]["cost"]) > 0 for s in skus) else "w1"
+    kw = (d["meta"].get("kwSpend") or {}).get(kwk) or {}
+    kw_note = ""
+    if _n(kw.get("total")) > 0:
+        if _n(kw.get("unattr")) > 0.5:
+            kw_note = (f'<br>花费口径 = 智能投放 ＋ 全站智能推广 ＋ 关键词计划。本期关键词计划共 '
+                       f'¥{_money(kw.get("total"))}，其中 ¥{_money(kw.get("attributed"))} 已按创意 '
+                       f'SKU 归到商品，<b>¥{_money(kw.get("unattr"))} 归不到商品</b>'
+                       f'（一个计划推多个 SKU / 计划已删或已下线），未计入上表 —— '
+                       f'这几笔钱在账号总额里，但拆不到具体商品。')
+        else:
+            kw_note = (f'<br>花费口径 = 智能投放 ＋ 全站智能推广 ＋ 关键词计划；本期关键词计划 '
+                       f'¥{_money(kw.get("total"))} 已全部按创意 SKU 归到商品；'
+                       f'全站智能推广按 SPU 下未拉黑的 SKU 平分。')
+    # 商智有缺口时，商品表这一列会偏低 —— 表头打星 + 悬停说清楚是哪几个账号缺哪几天
+    sz_gap = _coverage_gap_text(d)
+    sz_tip = ("商智全店全渠道成交额，下方为成交件数" +
+              (f"｜数据不全：{sz_gap}（该列偏低）" if sz_gap else ""))
+    sz_mark = '<span class="gapmark" title="该列有账号数据不全">*</span>' if sz_gap else ""
+    empty_row = ('<tr><td colspan="18" class="l">所选区间没有任何广告花费（可换日期或账号）</td></tr>'
+                 if not rows else "")
     return f"""
 <div class="card">
   <h2>商品 ROI 交叉表 <span class="tagline">按 SKU 合并两个账号的广告，商智成交分店展示</span></h2>
   <p class="hint">
-    共 {len(skus)} 个有广告投放的 SKU，其中 {(d["meta"].get("costCoverage") or {}).get("skuErp", 0)} 个已接入
+    共 {len(skus)} 个在所选区间有广告投放的 SKU，其中 {(d["meta"].get("costCoverage") or {}).get("skuErp", 0)} 个已接入
     ERP 真实成本（覆盖本期花费 {((d["meta"].get("costCoverage") or {}).get("costShare") or 0):.0f}%）。
-    近周花费合计 <b>¥{_money(tot_cost)}</b>、广告成交 <b>¥{_money(tot_amt)}</b>
+    {cost_label}合计 <b>¥{_money(tot_cost)}</b>、广告成交 <b>¥{_money(tot_amt)}</b>
     （ROI {_n(tot_amt) / max(tot_cost, 1):.2f}），这些商品商智总成交 <b>¥{_money(tot_sz)}</b>，
     按成本假设估算净利 <b>¥{_money(tot_net)}</b>。
     「ROI」= 京准通平台报的广告 ROI（广告成交额 ÷ 花费，分子是消费者实付）；「保本ROI」= 该 SKU
@@ -906,10 +1309,18 @@ def page_sku(d) -> str:
     ROI 高于它才值得继续投（两者同一前台口径，可直接比大小）。标 <b>*</b> 表示 ERP 无此 SKU，按全店口径线判。
     「商智总成交」下方为该商品<b>全店全渠道成交件数</b>，「自然成交」下方为
     <b>自然成交件数</b>（商智件数 − 广告订单数，近似）。
+    <b>商智成交 &lt; 广告成交</b>时（商智 T+1 只结算约一半）两个口径对不上，
+    自然成交显示 <b>—</b>、预估净利标 <b>*</b>（按广告成交兜底、会偏低），2~3 天后自动恢复正常。
     「毛利/件」= 每卖一件真正赚到的钱（未扣广告费），算法是
     到手结算价 − 货款 − 运费 − 包材 − 人工，其中到手结算价 ≈ 前台件单价 × 到手率（7~9 成）。
+    「商智成交」会补：商智的成交额/件数在 T+1 只结算约一半，T+2~T+3 才定稿
+    （流量指标不受影响），所以最近 15 天每晚重抓，更早的天不再变动；
+    最近 1~2 天的成交会低于商智当前值，属正常滞后。{kw_note}
   </p>
   <div class="toolbar" id="skuChips">{chips}<span style="width:14px"></span>{achips}
+    <span style="width:10px"></span>
+    <input type="text" class="srch" placeholder="🔍 筛选 商品 / SKU / 账号…（「；」任一命中，「：」同时命中）" oninput="applySearch(this)">
+    <span class="mini srchcount"></span>
     <span class="mini" style="margin-left:8px">点表头排序 · 悬停商品名看分店成交 · 悬停 ROI / 到手结算价看「前台口径 vs 到手口径」换算</span>
   </div>
   <div class="tblwrap">
@@ -917,7 +1328,7 @@ def page_sku(d) -> str:
       <th class="noSort">#</th>
       <th class="l noSort">商品</th>
       <th class="l">投放账号</th>
-      <th data-num="1">近周花费</th><th data-num="1">成交额</th>
+      <th data-num="1" title="{_e(cost_tip)}">{_e(cost_label)}</th><th data-num="1">成交额</th>
       <th data-num="1" title="京准通平台报的广告ROI＝广告成交额÷花费">ROI</th>
       <th data-num="1" title="该 SKU 自己的保本 ROI 线，ROI 高于它才值得继续投">保本ROI</th>
       <th data-num="1" title="广告带来的成交订单数（京准通，点击后15天归因）">促成订单</th>
@@ -926,23 +1337,27 @@ def page_sku(d) -> str:
       <th data-num="1">到手结算价(到手率)</th>
       <th data-num="1" title="每卖一件真正赚到的钱（未扣广告费）">毛利/件</th>
       <th data-num="1">广告占比</th>
-      <th data-num="1" title="商智全店全渠道成交额，下方为成交件数">商智总成交</th>
+      <th data-num="1" title="{_e(sz_tip)}">商智总成交{sz_mark}</th>
       <th data-num="1" title="商智总成交 − 广告成交；下方为自然成交件数（近似）">自然成交</th>
       <th data-num="1">预估净利</th>
       <th data-num="1">近3周ROI</th><th class="l">档位</th>
-    </tr></thead><tbody>{''.join(rows)}</tbody></table>
+    </tr></thead><tbody>{''.join(rows) or empty_row}</tbody></table>
   </div>
 </div>
 
 <div class="card">
-  <h2>ROI vs 保本线 <span class="tagline">花费前 15 的 SKU</span></h2>
-  <p class="hint">绿色=实际 ROI 达到该商品自己的保本线；红色=低于保本线，广告纯亏。</p>
+  <h2>ROI vs 保本线 <span class="tagline">按{cost_label}排序，默认前 15 的 SKU</span></h2>
+  <p class="hint">绿色=实际 ROI 达到该商品自己的保本线；红色=低于保本线（或保本线为 0），广告纯亏。
+    默认统计所选账号合并后的结果，卡片内可切单个账号、改显示条数、搜商品。</p>
+  {_sku_chart_bar("chSkuRoi", d)}
   {_chart_html("chSkuRoi", tall=True)}
 </div>
 
 <div class="card">
   <h2>广告渗透率 <span class="tagline">广告成交 ÷ 该商品店铺总成交</span></h2>
-  <p class="hint">越低说明越靠自然流量；接近 100% 说明这个商品的成交基本靠广告买来，一旦停投会掉量。</p>
+  <p class="hint">越低说明越靠自然流量；接近 100% 说明这个商品的成交基本靠广告买来，一旦停投会掉量。
+    没投广告或该区间无商智成交的商品不会出现在图里（渗透率不可算），可用搜索定位具体商品。</p>
+  {_sku_chart_bar("chShare", d)}
   {_chart_html("chShare", tall=True)}
 </div>
 """
@@ -1043,46 +1458,93 @@ def page_adj(d) -> str:
 
 # ---------------------------------------------------------------- 页面：计划明细
 def page_plan(d) -> str:
-    plans = [p for p in d["plans"] if _n(p["wins"]["w0"]["cost"]) + _n(p["wins"]["w1"]["cost"]) + _n(p["wins"]["w2"]["cost"]) > 0]
-    plans.sort(key=lambda p: -(_n(p["wins"]["w1"]["cost"]) + _n(p["wins"]["w2"]["cost"])))
+    cost_label, _cost_tip = _cost_col(d)
+    # 两个视图共用同一批计划：只保留所选区间真有投放的，避免「区间详细」里
+    # 出现一堆本期 0 花费、只能靠回退上一期才有数的行。
+    plans = [p for p in d["plans"] if _n(p["wins"]["w2"]["cost"]) > 0]
+    plans.sort(key=lambda p: -_n(p["wins"]["w2"]["cost"]))
     tier_count = {}
     for p in plans:
         tier_count[p["tier"]] = tier_count.get(p["tier"], 0) + 1
-    rows = []
+
+    detail_rows, trend_rows = [], []
     for i, p in enumerate(plans):
-        cells = (f'<td class="mono">{i + 1}</td>'
-                 f'<td class="l"><b>{_e(p["name"])}</b><div class="sid">{_e(p["campaignId"])}</div></td>'
-                 f'<td class="l">{_e(p["accountLabel"])}</td>'
-                 f'<td class="l">{_e(p["typeLabel"])}</td>')
+        m = p["wins"]["w2"]
+        roi, be = _n(m["roi"]), _n(p["breakeven"])
+        head = (f'<td class="mono">{i + 1}</td>'
+                f'<td class="l"><b>{_e(p["name"])}</b><div class="sid">{_e(p["campaignId"])}</div></td>'
+                f'<td class="l">{_e(p["accountLabel"])}</td>'
+                f'<td class="l">{_e(p["typeLabel"])}</td>')
+        tail = f'<td class="l" title="{_e(_plan_advice(p))}">{_badge(p["tier"])}</td></tr>'
+        detail_rows.append(
+            f'<tr data-acct="{_e(p["account"])}" data-tier="{_e(p["tier"])}">' + head +
+            f'<td class="mono" data-v="{_n(m["cost"])}">{_money(m["cost"])}</td>'
+            f'<td class="mono" data-v="{_n(m["amt"])}">{_money(m["amt"])}</td>'
+            f'<td class="mono {_roi_cls(roi, be)}" data-v="{roi}">{roi:.2f}</td>'
+            f'<td class="mono" data-v="{be}">{_be_txt(be, starred=not p.get("costMapped"))}</td>'
+            f'<td class="mono" data-v="{_n(m["ord"])}">{int(_n(m["ord"]))}</td>'
+            f'<td class="mono" data-v="{_n(m["cpa"])}">{_num(m["cpa"], 2)}</td>'
+            f'<td class="mono" data-v="{_n(m["clk"])}">{int(_n(m["clk"]))}</td>'
+            f'<td class="mono" data-v="{_n(m["ctr"])}">{_num(m["ctr"], 2)}%</td>'
+            f'<td class="mono" data-v="{_n(m["cpc"])}">{_num(m["cpc"], 2)}</td>' + tail)
+
+        cells = head
         for k in ("w0", "w1", "w2"):
-            m = p["wins"][k]
-            cells += (f'<td class="mono" data-v="{_n(m["cost"])}">{_money(m["cost"])}</td>'
-                      f'<td class="mono {_roi_cls(m["roi"], p["breakeven"])}" data-v="{_n(m["roi"])}">{_n(m["roi"]):.2f}</td>')
+            w = p["wins"][k]
+            cells += (f'<td class="mono" data-v="{_n(w["cost"])}">{_money(w["cost"])}</td>'
+                      f'<td class="mono {_roi_cls(w["roi"], p["breakeven"])}" '
+                      f'data-v="{_n(w["roi"])}">{_n(w["roi"]):.2f}</td>')
         droi = _n(p["wins"]["w2"]["roi"]) - _n(p["wins"]["w0"]["roi"])
         cells += (f'<td class="mono {"up" if droi >= 0 else "down"}" data-v="{droi}">{droi:+.2f}</td>'
-                  f'<td data-v="{_n(p["wins"]["w2"]["roi"])}">{_spark([p["wins"][k]["roi"] for k in ("w0", "w1", "w2")], p["breakeven"])}</td>'
-                  f'<td class="l" title="{_e(_plan_advice(p))}">{_badge(p["tier"])}</td></tr>')
-        rows.append(f'<tr data-acct="{_e(p["account"])}" data-tier="{_e(p["tier"])}">' + cells)
+                  f'<td data-v="{_n(p["wins"]["w2"]["roi"])}">'
+                  f'{_spark([p["wins"][k]["roi"] for k in ("w0", "w1", "w2")], p["breakeven"])}</td>')
+        trend_rows.append(f'<tr data-acct="{_e(p["account"])}" data-tier="{_e(p["tier"])}">' + cells + tail)
 
     achips = "".join(f'<div class="chip{" on" if k == "all" else ""}" data-a="{k}" onclick="applyAcct(this)">{v}</div>'
-                     for k, v in [("all", f"全部 {len(plans)}")] + [(a["key"], a["label"]) for a in d["accounts"]])
+                     for k, v in [("all", f"全部 {len(plans)}")] + [(a["key"], a["label"]) for a in _data_accs(d)])
+    empty_row = ('<tr><td colspan="14" class="l">所选区间没有任何广告投放的计划（可换日期或账号）</td></tr>'
+                 if not detail_rows else "")
+    empty_trend = ('<tr><td colspan="13" class="l">所选区间没有任何广告投放的计划（可换日期或账号）</td></tr>'
+                   if not trend_rows else "")
     return f"""
 <div class="card">
-  <h2>计划明细 <span class="tagline">概览口径，按账号区分</span></h2>
+  <h2>计划明细 <span class="tagline">概览口径，按账号区分</span>
+    <span class="vswitch">
+      <button type="button" class="on" data-v="detail" onclick="planView(this,'detail')">区间详细</button>
+      <button type="button" data-v="trend" onclick="planView(this,'trend')">三期趋势</button>
+    </span>
+  </h2>
   <p class="hint">
     「概览」里的计划包含智能化 / 关键词 / 全站智能推广三种类型，口径与智能投放报表略有差异（订单口径）。
     放大 {tier_count.get("放大", 0)} 个 · 优化 {tier_count.get("优化", 0)} 个 ·
     止损 {tier_count.get("止损", 0)} 个 · 未投放 {tier_count.get("未投放", 0)} 个。
+    默认「区间详细」只看所选区间的花费 / 成交 / ROI；切到「三期趋势」看 w0 / w1 / w2 的环比与走势。
   </p>
-  <div class="toolbar" id="planChips">{achips}<span class="mini" style="margin-left:8px">悬停档位看具体建议</span></div>
-  <div class="tblwrap">
+  <div class="toolbar" id="planChips">{achips}
+    <span style="width:10px"></span>
+    <input type="text" class="srch" placeholder="🔍 筛选 计划 / 账号 / 类型…（「；」任一命中，「：」同时命中）" oninput="applySearch(this)">
+    <span class="mini srchcount"></span>
+    <span class="mini" style="margin-left:8px">悬停档位看具体建议</span>
+  </div>
+  <div class="tblwrap" data-pview="detail">
+    <table><thead><tr><th class="noSort">#</th><th class="l noSort">计划</th><th class="l noSort">账号</th>
+      <th class="l noSort">类型</th>
+      <th data-num="1">{_e(cost_label)}</th><th data-num="1">成交额</th>
+      <th data-num="1" title="京准通平台报的广告ROI＝广告成交额÷花费">ROI</th>
+      <th data-num="1" title="计划内商品按成交额加权的保本 ROI">保本ROI</th>
+      <th data-num="1">促成订单</th><th data-num="1">CPA</th>
+      <th data-num="1">点击</th><th data-num="1">CTR</th><th data-num="1">CPC</th>
+      <th class="l noSort">档位</th>
+    </tr></thead><tbody>{''.join(detail_rows) or empty_row}</tbody></table>
+  </div>
+  <div class="tblwrap" data-pview="trend" style="display:none">
     <table><thead><tr><th class="noSort">#</th><th class="l noSort">计划</th><th class="l noSort">账号</th>
       <th class="l noSort">类型</th>
       <th class="mono noSort">w0花费</th><th class="mono noSort">w0ROI</th>
       <th class="mono noSort">w1花费</th><th class="mono noSort">w1ROI</th>
       <th class="mono noSort">w2花费</th><th class="mono noSort">w2ROI</th>
       <th data-num="1">ROI变化</th><th data-num="1">3周ROI</th><th class="l noSort">档位</th>
-    </tr></thead><tbody>{''.join(rows)}</tbody></table>
+    </tr></thead><tbody>{''.join(trend_rows) or empty_trend}</tbody></table>
   </div>
 </div>
 """
@@ -1138,7 +1600,7 @@ def page_word(d) -> str:
         return (v.get("kw") or []), "关键词"
 
     out = []
-    for a in d["accounts"]:
+    for a in _data_accs(d):
         k = a["key"]
         wins = d["words"].get(k) or {}
         wk = "w2" if wins.get("w2") else ("w1" if wins.get("w1") else "w0")
@@ -1196,6 +1658,339 @@ def page_word(d) -> str:
     return "".join(out)
 
 
+# ---------------------------------------------------------------- 页面：快车 SOP 体检
+# 规则全部来自《1小时吃透快车：选词·出价·调整》08 期（吕双庆，2026-04-20）。
+# 这一页只做「代码可复算的确定性检查」，不做语义推断；AI 深度解读在上方 AI 卡片。
+_SOP_RULES = [
+    ("排名", "出价 × 质量分", "出价高 ≠ 排名高；新品质量分低时别硬抢 TOP1"),
+    ("扣费", "下一名出价 × 下一名质量分 ÷ 你的质量分 + 0.01", "出价只是参与下一名竞争的筹码"),
+    ("质量分", "基础 / 相关性 / 创意(CTR) / 转化(CVR)", "没有后台数值，用「平均点击成本是否持续下降」观测"),
+    ("选词", "精准长尾 70% + 品类核心大词 30%", "三级类目下选；建车期 20~50 个词"),
+    ("初始出价", "长尾=行业均值×0.8~1.0；核心大词=×1.10~1.20", "先比行业均值，再按词型定档"),
+    ("最终出价", "基础出价 × 时间折扣 × 人群溢价 × 抢排名溢价", "乘法链，不是加法；新品期不圈人群、不溢价"),
+    ("日预算", "日均点击成本 × 50~100 点击", "主推只放 1 个 SKU，预算才集中"),
+    ("调整节奏", "至少跑 3~4 天再动", "单日数据无代表性；四指标分开归因"),
+    ("否定词", "关键词 → 计划 → 单元 → 关键词 → 否定词设置", "高消耗 0 产出直接加黑"),
+    ("入口限制", "智能化 / 全站智能推广没有否定词入口", "只能改目标投产比/预算/商品黑名单（≤10 SKU）"),
+]
+
+
+def _sop_tone(v: str) -> str:
+    """把 SOP 结论映射到颜色：放大=绿，收缩=红，观察=灰，其余=琥珀。"""
+    if v == "可放大":
+        return "ok"
+    if v in ("建议收缩", "需改造"):
+        return "bad"
+    if v in ("先观察",):
+        return "info"
+    return "warn"
+
+
+def _sop_tone2(v: str) -> str:
+    """详情卡里的 tone 可能直接是 ok/warn/bad/info，也可能是结论词。"""
+    return v if v in ("ok", "warn", "bad", "info") else _sop_tone(v)
+
+
+def _sop_days(d) -> int:
+    from datetime import date
+    r = (d.get("meta") or {}).get("range") or {}
+    try:
+        s = date.fromisoformat(str(r.get("start") or ""))
+        e = date.fromisoformat(str(r.get("end") or ""))
+        return max((e - s).days + 1, 1)
+    except Exception:  # noqa: BLE001
+        return 7
+
+
+def _sop_bank(d, acct, name, wk):
+    pv = ((d.get("words") or {}).get(acct) or {}).get(wk, {}).get(name) or {}
+    kw, sw = pv.get("kw") or [], pv.get("sw") or []
+    if kw:
+        return kw, "关键词"
+    if sw:
+        return sw, "搜索词"
+    return [], ""
+
+
+def _sop_ops(d, acct, cid, name):
+    from datetime import date
+    out = []
+    for o in (d.get("ops") or []):
+        if not o.get("manual") or o.get("account") != acct:
+            continue
+        if str(o.get("targetId") or "") == str(cid):
+            out.append(o)
+            continue
+        t = (o.get("target") or "").strip()
+        if t and (t in name or name in t):
+            out.append(o)
+    days = []
+    for o in out:
+        try:
+            days.append(date.fromisoformat(str(o["time"])[:10]))
+        except Exception:  # noqa: BLE001
+            pass
+    return out, days
+
+
+def _sop_check(d, p, days: int, end_day) -> dict:
+    """一个计划的 SOP 自检：返回 checks / 结论 / 可复制动作。"""
+    wk = "w2" if _n(p["wins"]["w2"]["cost"]) > 0 else "w1"
+    m = p["wins"][wk]
+    be = _n(p.get("breakeven"))
+    margin = _n(p.get("planMargin")) or ((1 / be) if be > 0 else 0)
+    aov, cvr, cpc = _n(m.get("aov")), _n(m.get("cvr")) / 100.0, _n(m.get("cpc"))
+    be_cpc = aov * cvr * margin if (aov > 0 and cvr > 0 and margin > 0) else 0.0
+    clicks_day = _n(m.get("clk")) / days
+    bank, src = _sop_bank(d, p["account"], p.get("name") or "", wk)
+    smart = p.get("type") in (61, 153) or "智能" in (p.get("name") or "")
+    waste = [w for w in bank if w.get("kind") == "waste"]
+    low = [w for w in bank if w.get("kind") == "low"]
+    good = [w for w in bank if w.get("kind") == "good"]
+    bad_words = sorted(waste + low, key=lambda x: -_n(x.get("cost")))[:8]
+    boost_words = sorted(good, key=lambda x: -_n(x.get("roi")))[:6]
+    ops, opdays = _sop_ops(d, p["account"], p["campaignId"], p.get("name") or "")
+
+    checks = []   # (item, status, tone, evidence, action)
+
+    # 1) 日点击（课程：50~100 点击/天）
+    if clicks_day <= 0:
+        checks.append(("日点击", "无数据", "info", "所选区间没有点击", "先确认计划在投、预算未耗尽"))
+    elif clicks_day < 50:
+        checks.append(("日点击", "不足", "warn", f"日均 {clicks_day:.0f} 点击（课程建议 50~100）",
+                       "先确认 ROI≥保本，再提预算/出价或补词；不要为了凑点击盲加价"))
+    else:
+        checks.append(("日点击", "达标", "ok", f"日均 {clicks_day:.0f} 点击",
+                       "点击量已够，把精力放到词效率与转化率"))
+
+    # 2) 出价空间（保本 CPC = AOV × CVR × 毛利率）
+    if be_cpc > 0 and cpc > 0:
+        gap = (be_cpc - cpc) / be_cpc
+        if gap >= 0.15:
+            checks.append(("出价空间", "有提价空间", "ok",
+                           f"实际 CPC ¥{cpc:.2f} < 保本 CPC ¥{be_cpc:.2f}（余量 {gap * 100:.0f}%）",
+                           "按课程把核心大词抬到行业均值 +10%~20%，或抢排名/单独建计划；"
+                           "最终出价 = 基础 × 时间 × 人群 × 抢排名"))
+        elif gap >= -0.05:
+            checks.append(("出价空间", "接近保本", "warn",
+                           f"实际 CPC ¥{cpc:.2f} ≈ 保本 CPC ¥{be_cpc:.2f}（余量 {gap * 100:.0f}%）",
+                           "先不加价，观察 3 天；ROI 仍 ≥ 保本再小步提价，优先提高效词"))
+        else:
+            checks.append(("出价空间", "已超保本", "bad",
+                           f"实际 CPC ¥{cpc:.2f} > 保本 CPC ¥{be_cpc:.2f}（超出 {-gap * 100:.0f}%）",
+                           "降基础出价/关人群与抢排名溢价；把超出的花费拿去做否定词或降价"))
+    else:
+        checks.append(("出价空间", "无法计算", "info", "缺 AOV / CVR / 毛利率",
+                       "先补齐成本与转化数据，再判断提价空间"))
+
+    # 3) 词量与词结构
+    if smart:
+        checks.append(("词量", "不适用", "info", "智能化/全站由系统自动选词",
+                       "不人工加词；把精力放在商品黑名单、目标投产比与预算"))
+    elif bank:
+        n = len(bank)
+        if n < 20:
+            checks.append(("词量", "不足", "warn", f"{src}样本 {n} 个（建车期建议 20~50）",
+                           "补精准长尾词：长尾 70% + 品类核心大词 30%，三级类目下选"))
+        elif n > 50:
+            checks.append(("词量", "偏多", "warn", f"{src}样本 {n} 个（建议 20~50）",
+                           "先砍 0 单/低 ROI 词，再补长尾；词太多会摊薄预算"))
+        else:
+            checks.append(("词量", "达标", "ok", f"{src}样本 {n} 个",
+                           "按花费排序每周扫一遍，保持 70% 长尾 / 30% 核心大词"))
+    else:
+        checks.append(("词量", "无词数据", "info", "本区间没有该计划的搜索词/关键词明细",
+                       "换到有词数据的窗口，或先在报表中心抓词"))
+
+    # 4) 否定词 / 词效率
+    if bank and (waste or low):
+        cost_wa = sum(_n(w.get("cost")) for w in waste + low)
+        if smart:
+            checks.append(("否定词入口", "不可用", "bad",
+                           f"废词 {len(waste)} / 低效 {len(low)} 个，花费 ¥{cost_wa:,.0f}",
+                           "智能化/全站智能推广没有否定词入口：改商品黑名单（≤10 SKU），"
+                           "或降目标投产比/智能出价；不要承诺否定词"))
+        else:
+            checks.append(("词效率", "需处理", "warn",
+                           f"废词 {len(waste)} / 低效 {len(low)} 个，花费 ¥{cost_wa:,.0f}",
+                           "在 关键词→计划→单元→关键词→否定词设置 加黑高消耗 0 产出词；"
+                           "先跨 2 个窗口确认，避免误否高效大词"))
+    elif bank:
+        checks.append(("词效率", "达标", "ok", "样本内没有高消耗 0 产出词",
+                       "保持；继续按花费降序每周扫词"))
+
+    # 5) 观察周期（课程：至少 3~4 天再动）
+    recent_gap = None
+    if opdays:
+        last = max(opdays)
+        try:
+            recent_gap = (end_day - last).days
+        except Exception:  # noqa: BLE001
+            recent_gap = None
+        closing = sorted(opdays)
+        gaps = [(closing[i + 1] - closing[i]).days for i in range(len(closing) - 1)]
+        if recent_gap is not None and recent_gap < 3:
+            checks.append(("观察周期", "不足", "warn",
+                           f"最近调整 {last}，距今 {recent_gap} 天",
+                           "课程要求至少跑 3~4 天再动；先观察，别继续改出价/预算"))
+        else:
+            checks.append(("观察周期", "达标", "ok",
+                           f"最近调整 {last}，距今 {recent_gap} 天" if recent_gap is not None else f"最近调整 {last}",
+                           "已跑够观察期，可按展现/CTR/CVR/ROI 分开归因再决策"))
+        if len(opdays) >= 3 and gaps and min(gaps) < 3:
+            checks.append(("调整频率", "过频", "warn",
+                           f"区间内人工调整 {len(opdays)} 次，最短间隔 {min(gaps)} 天",
+                           "同一计划 3 天内反复改会让数据不可归因；固定一个观察窗口再动"))
+    else:
+        checks.append(("观察周期", "无近期调整", "info", "区间内没有人工操作",
+                       "可直接按当前数据决策；改完后至少留 3~4 天观察"))
+
+    # 结论
+    tone_rank = {"bad": 3, "warn": 2, "ok": 1, "info": 0}
+    worst = max((tone_rank.get(c[2], 0) for c in checks), default=0)
+    tier = p.get("tier") or ""
+    if recent_gap is not None and recent_gap < 3:
+        verdict = "先观察"
+    elif tier in ("止损", "严重亏损"):
+        verdict = "建议收缩"
+    elif tier == "放大" and worst <= 1:
+        verdict = "可放大"
+    elif worst >= 2:
+        verdict = "需改造"
+    else:
+        verdict = "可优化"
+
+    return {"wk": wk, "m": m, "be": be, "be_cpc": be_cpc, "cpc": cpc,
+            "clicks_day": clicks_day, "bank": bank, "src": src, "smart": smart,
+            "waste": waste, "low": low, "good": good,
+            "bad_words": bad_words, "boost_words": boost_words,
+            "ops": ops, "recent_gap": recent_gap,
+            "checks": checks, "verdict": verdict}
+
+
+def page_playbook(d) -> str:
+    days = _sop_days(d)
+    r = (d.get("meta") or {}).get("range") or {}
+    from datetime import date
+    try:
+        end_day = date.fromisoformat(str(r.get("end") or ""))
+    except Exception:  # noqa: BLE001
+        end_day = date.today()
+
+    plans = [p for p in (d.get("plans") or [])
+             if _n(p["wins"]["w2"]["cost"]) + _n(p["wins"]["w1"]["cost"]) > 0]
+    plans.sort(key=lambda p: -(_n(p["wins"]["w2"]["cost"]) + _n(p["wins"]["w1"]["cost"])))
+    rows, checks_by = [], {}
+    for i, p in enumerate(plans):
+        c = _sop_check(d, p, days, end_day)
+        checks_by[id(p)] = c
+        w = p["wins"][c["wk"]]
+        be_cpc = f'¥{c["be_cpc"]:.2f}' if c["be_cpc"] > 0 else "—"
+        words_cell = (f'不适用（系统选词）' if c["smart"]
+                      else (f'样本 {len(c["bank"])}<div class="mini">好 {len(c["good"])} / 废 {len(c["waste"])} / 低 {len(c["low"])}</div>'
+                            if c["bank"] else '无词数据'))
+        recent = f'{c["recent_gap"]} 天前' if c["recent_gap"] is not None else "无"
+        rows.append(
+            f'<tr>'
+            f'<td class="l"><b>{_e(p["name"])}</b><div class="sid">{_e(p["accountLabel"])} · {_e(p["campaignId"])}</div></td>'
+            f'<td class="l">{_e(p["typeLabel"])}</td>'
+            f'<td class="mono">¥{_money(w["cost"])}</td>'
+            f'<td class="mono {_roi_cls(w["roi"], p["breakeven"])}">{_n(w["roi"]):.2f}</td>'
+            f'<td class="mono">{_be_txt(p["breakeven"])}</td>'
+            f'<td class="mono">¥{c["cpc"]:.2f}<div class="mini">保本 {be_cpc}</div></td>'
+            f'<td class="mono">{c["clicks_day"]:.0f}</td>'
+            f'<td class="l">{words_cell}</td>'
+            f'<td class="l">{recent}</td>'
+            f'<td class="l"><span class="sopv {_sop_tone(c["verdict"])}">{_e(c["verdict"])}</span></td>'
+            f'</tr>')
+
+    n_low_click = sum(1 for p in plans if checks_by[id(p)]["clicks_day"] < 50)
+    n_room = sum(1 for p in plans if any(x[1] == "有提价空间" for x in checks_by[id(p)]["checks"]))
+    n_smart = sum(1 for p in plans if checks_by[id(p)]["smart"])
+    n_recent = sum(1 for p in plans if (checks_by[id(p)]["recent_gap"] or 99) < 3)
+
+    detail = []
+    for p in plans[:8]:
+        c = checks_by[id(p)]
+        m = c["m"]
+        items = "".join(
+            f'<div class="sopitem"><b class="{_sop_tone2(x[2])}">{_e(x[1])}</b> '
+            f'<span class="sopk">{_e(x[0])}</span>'
+            f'<div class="mini">{_e(x[3])}</div>'
+            f'<div class="sopact">{_e(x[4])}</div></div>'
+            for x in c["checks"])
+        bad = _word_pills([w for w in c["bad_words"]], "waste")
+        good = _word_pills([w for w in c["boost_words"]], "good")
+        if c["smart"]:
+            neg_block = ('<div class="b"><b>否定词入口：</b>'
+                         '<span class="down">不可用</span> —— 智能化/全站智能推广没有否定词设置，'
+                         '只能改目标投产比/预算/商品黑名单（≤10 SKU）</div>')
+        else:
+            neg_block = (f'<div class="b"><b>可否定（高消耗 0 单/低 ROI）：</b>{bad}</div>'
+                         f'<div class="b"><b>可提价（高效词）：</b>{good}</div>')
+        detail.append(f"""
+<div class="sopcard">
+  <div class="sophd"><b>{_e(p["name"])}</b>
+    <span class="sopv {_sop_tone2(c["verdict"])}">{_e(c["verdict"])}</span>
+    <span class="mini">{_e(p["typeLabel"])} · {_e(p["accountLabel"])} · {c["wk"]} 窗口</span>
+  </div>
+  <div class="sopmetrics">
+    <span>花费 <b>¥{_money(m["cost"])}</b></span>
+    <span>ROI <b class="{_roi_cls(m["roi"], p["breakeven"])}">{_n(m["roi"]):.2f}</b> / 保本 {_be_txt(p["breakeven"])}</span>
+    <span>CTR <b>{_n(m["ctr"]):.2f}%</b></span>
+    <span>CVR <b>{_n(m["cvr"]):.2f}%</b></span>
+    <span>CPC <b>¥{c["cpc"]:.2f}</b></span>
+    <span>点击/天 <b>{c["clicks_day"]:.0f}</b></span>
+  </div>
+  {neg_block}
+  <div class="sopchecks">{items}</div>
+</div>""")
+
+    kpis = "".join([
+        _kpi("体检计划", f"{len(plans)} 个", f"区间 {days} 天 · 按花费排序"),
+        _kpi("日均点击不足 50", f"{n_low_click} 个", "课程建议 50~100 点击/天"),
+        _kpi("有提价空间", f"{n_room} 个", "实际 CPC 低于保本 CPC ≥15%"),
+        _kpi("智能化无否定入口", f"{n_smart} 个", "只能改目标投产比/预算/黑名单"),
+    ])
+
+    rules = "".join(
+        f'<tr><td class="l"><b>{_e(a)}</b></td><td class="l">{_e(b)}</td>'
+        f'<td class="l">{_e(c)}</td></tr>' for a, b, c in _SOP_RULES)
+
+    return f"""
+<div class="card">
+  <h2>快车 SOP 体检 <span class="tagline">官方课程硬规则 × 当前区间实抓数据</span></h2>
+  <p class="hint">
+    本页是<b>确定性自检</b>：阈值与判断由代码按《1小时吃透快车》硬规则计算，不依赖 AI；
+    深度取舍与话术见上方「AI 运营解读」。{n_recent} 个计划在最近 3 天内被调整，按课程应先观察、别继续改。
+  </p>
+  <div class="grid g4">{kpis}</div>
+  <div class="tblwrap">
+    <table><thead><tr>
+      <th class="l noSort">计划</th><th class="l noSort">类型</th><th data-num="1">花费</th>
+      <th data-num="1">ROI</th><th data-num="1">保本ROI</th><th data-num="1">CPC / 保本CPC</th>
+      <th data-num="1">点击/天</th><th class="l noSort">词样本</th><th class="l noSort">最近调整</th>
+      <th class="l noSort">SOP 结论</th>
+    </tr></thead><tbody>{''.join(rows) or '<tr><td colspan="10" class="l">当前区间没有在投计划</td></tr>'}</tbody></table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>计划 SOP 明细 <span class="tagline">花费最高的 {len(detail)} 个计划</span></h2>
+  <div class="sopgrid">{''.join(detail)}</div>
+</div>
+
+<div class="card">
+  <h2>运营知识库速查 <span class="tagline">《1小时吃透快车：选词·出价·调整》08 期</span></h2>
+  <p class="hint">这张表已随仓库维护，并作为 AI 分析台的系统提示词来源（优先于本机旧版 skill）。</p>
+  <div class="tblwrap short">
+    <table><thead><tr><th class="l noSort">主题</th><th class="l noSort">硬规则</th><th class="l noSort">落地提醒</th></tr></thead>
+    <tbody>{rules}</tbody></table>
+  </div>
+</div>
+"""
+
+
 # ---------------------------------------------------------------- 页面：行动清单
 def page_action(d) -> str:
     adv = d["advice"]
@@ -1208,16 +2003,16 @@ def page_action(d) -> str:
     stop_rows = "".join(
         f'<tr><td class="l"><b>{_e(s["name"])}</b></td><td class="mono" data-v="{_n(s["cost"])}">¥{_money(s["cost"])}</td>'
         f'<td class="mono down" data-v="{_n(s["roi"])}">{_n(s["roi"]):.2f}</td>'
-        f'<td class="mono" data-v="{_n(s["breakeven"])}">{_n(s["breakeven"]):.2f}'
-        f'{"*" if s.get("costSource") != "erp" else ""}</td>'
+        f'<td class="mono" data-v="{_n(s["breakeven"])}">'
+        f'{_be_txt(s["breakeven"], starred=(s.get("costSource") != "erp"))}</td>'
         f'<td class="mono" data-v="{_n(s["netProfit"])}">¥{_money(s["netProfit"])}</td>'
         f'<td class="l">{_e(_sku_advice(next(x for x in d["skus"] if x["skuId"] == s["skuId"])))}</td></tr>'
         for s in stop)
     grow_rows = "".join(
         f'<tr><td class="l"><b>{_e(s["name"])}</b></td><td class="mono" data-v="{_n(s["cost"])}">¥{_money(s["cost"])}</td>'
         f'<td class="mono up" data-v="{_n(s["roi"])}">{_n(s["roi"]):.2f}</td>'
-        f'<td class="mono" data-v="{_n(s["breakeven"])}">{_n(s["breakeven"]):.2f}'
-        f'{"*" if s.get("costSource") != "erp" else ""}</td>'
+        f'<td class="mono" data-v="{_n(s["breakeven"])}">'
+        f'{_be_txt(s["breakeven"], starred=(s.get("costSource") != "erp"))}</td>'
         f'<td class="mono" data-v="{_n(s.get("growLine"))}">{_n(s.get("growLine")):.2f}</td>'
         f'<td class="mono" data-v="{_n(s.get("grossPerOrder"))}">{_num(s.get("grossPerOrder"), 1)}</td>'
         f'<td class="mono" data-v="{_n(s["cost"]) * 0.3}">¥{_money(_n(s["cost"]) * 0.3)}</td>'
@@ -1240,7 +2035,7 @@ def page_action(d) -> str:
     {_pct(_n(up["stopCost"]) / max(_n(up["lastCost"]), 1) * 100)}。逐个处理，不要一刀切关闭。
   </p>
   <div class="tblwrap short"><table><thead><tr>
-    <th class="l noSort">商品</th><th data-num="1">近周花费</th><th data-num="1">ROI</th>
+    <th class="l noSort">商品</th><th data-num="1">本期花费</th><th data-num="1">ROI</th>
     <th data-num="1">保本ROI</th><th data-num="1">预估净利</th><th class="l noSort">动作</th>
   </tr></thead><tbody>{stop_rows or '<tr><td colspan="6" class="l">没有低于保本线的商品 👍</td></tr>'}</tbody></table></div>
 </div>
@@ -1249,7 +2044,7 @@ def page_action(d) -> str:
   <h2>第二步 · 加投 <span class="tagline">ROI 已到「各自放量线」（保本线 ×{_n(d['meta'].get('growFactor'), 1.25):.2f}）的 SKU，才是增量池</span></h2>
   <p class="hint">按 30% 加预算试探，加完盯 3 天 ROI 是否守住。保本线只是不亏钱，放量线以上加投才划算。</p>
   <div class="tblwrap short"><table><thead><tr>
-    <th class="l noSort">商品</th><th data-num="1">近周花费</th><th data-num="1">ROI</th>
+    <th class="l noSort">商品</th><th data-num="1">本期花费</th><th data-num="1">ROI</th>
     <th data-num="1">保本ROI</th><th data-num="1">放量线</th><th data-num="1">毛利/件</th>
     <th data-num="1">建议加投</th><th class="l noSort">动作</th>
   </tr></thead><tbody>{grow_rows or '<tr><td colspan="8" class="l">暂无明显高效商品</td></tr>'}</tbody></table></div>
@@ -1310,22 +2105,64 @@ UI_CSS = """
 .rangebar a{color:var(--primary);font-size:12.5px;text-decoration:none;margin-left:6px;font-weight:500}
 .rangebar a:hover{text-decoration:underline}
 @media(max-width:760px){.rangebar{gap:9px}.rangebar .sep{display:none}}
+/* 快车 SOP 体检 */
+.sopgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}
+.sopcard{border:1px solid var(--hair);border-radius:var(--r-md);background:var(--canvas);padding:14px 16px}
+.sophd{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:14px;color:var(--ink);
+  padding-bottom:9px;border-bottom:1px solid var(--hair);margin-bottom:10px}
+.sophd .mini{margin-left:auto}
+.sopv{display:inline-block;border-radius:9999px;padding:2px 9px;font-size:11.5px;font-weight:600;line-height:1.6}
+.sopv.ok{background:var(--greenbg);color:var(--greenink)}
+.sopv.warn{background:var(--amberbg);color:var(--amberink)}
+.sopv.bad{background:var(--redbg);color:var(--redink)}
+.sopv.info{background:var(--surface-card);color:var(--muted)}
+.sopmetrics{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted);margin-bottom:9px}
+.sopmetrics b{color:var(--ink);font-variant-numeric:tabular-nums}
+.sopchecks{display:grid;gap:6px;margin-top:8px}
+.sopitem{border-top:1px dashed var(--hair);padding-top:6px;font-size:12.5px;line-height:1.65;color:var(--body)}
+.sopitem:first-child{border-top:0;padding-top:0}
+.sopitem>b{display:inline-block;min-width:56px;font-size:11.5px}
+.sopitem>b.ok{color:var(--greenink)} .sopitem>b.warn{color:var(--amberink)}
+.sopitem>b.bad{color:var(--redink)} .sopitem>b.info{color:var(--muted)}
+.sopitem .sopk{font-weight:600;color:var(--strong);margin-left:4px}
+.sopitem .sopact{color:var(--muted);margin-top:1px}
+/* 行业大盘：按账号切换 */
+.indtabs{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+.indtab{border:1px solid var(--hair);background:var(--canvas);color:var(--muted);
+  border-radius:999px;padding:6px 13px;font-size:12.5px;font-weight:600;cursor:pointer;
+  font-family:inherit;line-height:1.4;display:inline-flex;align-items:center;gap:6px}
+.indtab:hover{border-color:var(--primary);color:var(--primary)}
+.indtab.active{background:var(--primary);border-color:var(--primary);color:var(--on-primary)}
+.indtab .indmeta{font-size:10.5px;font-weight:400;color:var(--muted2)}
+.indtab.active .indmeta{color:rgba(255,255,255,.78)}
+.indacct{display:none}
+.indacct.active{display:block}
+@media(max-width:760px){.indtab{font-size:12px;padding:5px 10px}}
 """
 
 
+def _data_accs(d) -> list:
+    """只含有数据的账号。
+
+    d["accounts"] 现在按「配置里的全部账号」给（没抓数的也占一行，避免看着像丢账号），
+    但图表系列、筛选项、口径文案只该算有数据的那些 —— 否则会多出几条 0 线。
+    """
+    return [a for a in d.get("accounts", []) if a.get("hasData", True)]
+
+
 def _acct_scope(d) -> str:
-    labels = [a["label"] for a in d.get("accounts", [])]
+    labels = [a["label"] for a in _data_accs(d)]
     if len(labels) == 2:
         return "两账号"
     if len(labels) == 1:
         return labels[0]
-    return "、".join(labels)
+    return "、".join(labels) or "全部账号"
 
 
 def _source_note(d) -> str:
     """当某些窗口的账号总额退化为智能投放口径时提醒一下。"""
     bad = []
-    for a in d.get("accounts", []):
+    for a in _data_accs(d):
         srcs = {a["totals"][k].get("source") for k in a["totals"] if a["totals"][k].get("source")}
         if srcs and srcs != {"概览"}:
             bad.append(f'{a["label"]}：{"/".join(sorted(srcs))}')
@@ -1393,23 +2230,70 @@ def _cost_block(d) -> str:
     return '<div class="warnbox">' + '<br>'.join(parts) + '</div>'
 
 
-def _coverage_notice(d) -> str:
+def _coverage_gaps(d, only_label: str = "") -> list[str]:
+    """所选区间里每个账号缺了哪些天（按数据源分开说）。
+
+    广告＝jzt_campaign（花费/成交），商智＝sz_product（店铺成交/净利）。
+    两者缺一个都会让页面数字偏低，必须分开报 —— 以前只看广告，
+    商智缺半个月也不报警（「雪莲果商智成交偏低」就是这么漏掉的）。
+    """
     cov = (d.get("meta") or {}).get("coverage") or {}
-    bad = []
+    out = []
     for a in d.get("accounts", []):
-        per = cov.get(a["key"]) or {}
-        wk = per.get("w2") or {}
-        if wk and not wk.get("complete"):
-            bad.append(f'{a["label"]} 所选区间仅 {wk.get("got")}/{wk.get("want")} 天有数据')
-    if not bad:
+        if only_label and a["label"] != only_label:
+            continue
+        if not a.get("hasData", True):
+            out.append(f'<b>{_e(a["label"])}</b>：该区间无任何数据（未抓取）')
+            continue
+        t = (a.get("totals") or {}).get("w2") or {}
+        if not _n(t.get("cost")) and not _n(t.get("szAmt")):
+            continue                     # 这号本区间没花费也没商智成交，缺天不影响任何数字
+        wk = (cov.get(a["key"]) or {}).get("w2") or {}
+        srcs = wk.get("sources") or {}
+        bad = []
+        for name in ("广告", "商智"):
+            info = srcs.get(name) or {}
+            if info and not info.get("complete"):
+                bad.append(f'{name}缺 {_e(info.get("missing") or "全部")}')
+        if bad:
+            out.append(f'<b>{_e(a["label"])}</b>：' + "、".join(bad))
+    return out
+
+
+def _coverage_gap_text(d) -> str:
+    """纯文本缺口，给表头 title 用（HTML 标签放不进 tooltip）。"""
+    cov = (d.get("meta") or {}).get("coverage") or {}
+    parts = []
+    for a in d.get("accounts", []):
+        if not a.get("hasData", True):
+            parts.append(f'{a["label"]}该区间无任何数据')
+            continue
+        t = (a.get("totals") or {}).get("w2") or {}
+        if not _n(t.get("cost")) and not _n(t.get("szAmt")):
+            continue
+        srcs = ((cov.get(a["key"]) or {}).get("w2") or {}).get("sources") or {}
+        for name in ("广告", "商智"):
+            info = srcs.get(name) or {}
+            if info and not info.get("complete"):
+                parts.append(f'{a["label"]}{name}缺 {info.get("missing") or "全部"}')
+    return "；".join(parts)
+
+
+def _coverage_notice(d) -> str:
+    gaps = _coverage_gaps(d)
+    if not gaps:
         return ""
-    return ('<div class="covbox"><b>数据不完整</b>：' + "；".join(_e(x) for x in bad) +
-            '。未覆盖的日期按 0 计入，可能低估区间表现 —— 可在控制台补抓这些日期。</div>')
+    return ('<div class="covbox"><b>数据不完整 —— 未覆盖的日期按 0 计入，本页花费/成交会偏低</b><br>'
+            + "；".join(gaps) +
+            '<br><span style="color:var(--muted)">补抓：在控制台「立即抓取」选对应区间，或执行 '
+            '<code>docker exec jd-roi python -m jd_roi.scrape_day 起 止 --account=账号 '
+            '--kinds=sz_product,sz_flow,jzt_campaign</code></span></div>')
 
 
 # ---------------------------------------------------------------- 组装
 TABS = [("p-ov", "① 总结"), ("p-sku", "② 商品ROI"), ("p-adj", "③ 调整复盘"),
-        ("p-plan", "④ 计划明细"), ("p-word", "⑤ 搜索词诊断"), ("p-act", "⑥ 行动清单")]
+        ("p-plan", "④ 计划明细"), ("p-word", "⑤ 搜索词诊断"), ("p-sop", "⑥ 快车SOP体检"),
+        ("p-act", "⑦ 行动清单"), ("p-ind", "⑧ 行业大盘")]
 
 
 _ECHARTS_CACHE: dict = {"src": None}
@@ -1491,7 +2375,7 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
     <span class="aimeta">当前区间（{_e(start)} ~ {_e(end)}）暂无 AI 解读</span>
     <button class="aibtn" onclick="genAi(this, '{_e(start)}', '{_e(end)}', '{_e(keys)}')">生成本区间解读</button>
   </div>
-  <div class="aidisc">每晚自动任务会**贴着本地已抓取的数据**生成 AI 解读（套用《京东快车底层逻辑》方法论）；
+  <div class="aidisc">每晚自动任务会**贴着本地已抓取的数据**生成 AI 解读（套用《京东快车底层逻辑》+《1小时吃透快车》官方课程知识库）；
 也可点按钮即时生成（约 1~2 分钟）。</div>
 </div>"""
 
@@ -1526,6 +2410,64 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
         for x in (a.get("diagnosis") or []))
     diag = (f'<details class="aidt"{opn}><summary>诊断（套方法论，{len(a.get("diagnosis") or [])} 条）</summary>'
             f'{diags}</details>' if diags else "")
+
+    # 课程 SOP 体检（playbook_audit）：逐计划列出课程硬规则检查结果
+    def _sop_t(v):
+        if v in ("达标", "有提价空间", "可放大"):
+            return "ok"
+        if v in ("超限", "已超保本", "建议收缩"):
+            return "bad"
+        if v in ("不足", "需处理", "不可用", "过频", "接近保本", "需改造"):
+            return "warn"
+        return "info"
+
+    sop_cards = []
+    for x in (a.get("playbook_audit") or []):
+        cs = "".join(
+            f'<div class="b"><span class="sopv {_sop_t(c.get("status"))}">{_e(str(c.get("status") or ""))}</span> '
+            f'<b>{_e(str(c.get("item") or ""))}</b>：{_e(str(c.get("evidence") or ""))}'
+            f'<div class="sopact">→ {_e(str(c.get("action") or ""))}</div></div>'
+            for c in (x.get("checks") or []))
+        sop_cards.append(
+            f'<div class="aip"><div class="t">{_e(str(x.get("name") or ""))}'
+            f'（{_e(str(x.get("campaignId") or ""))}） · {_e(str(x.get("stage") or ""))} → '
+            f'<span class="sopv {_sop_t(x.get("conclusion"))}">{_e(str(x.get("conclusion") or ""))}</span></div>'
+            f'{cs}</div>')
+    sop_block = (f'<details class="aidt"{opn}><summary>快车 SOP 体检（课程硬规则，'
+                 f'{len(sop_cards)} 个计划）</summary>{"".join(sop_cards)}</details>'
+                 if sop_cards else "")
+
+    # 质量分四构成
+    q_cards = []
+    for x in (a.get("quality_diagnosis") or []):
+        items = "".join(
+            f'<div class="b"><b>{_e(str(it.get("part") or ""))}</b>'
+            f'<span class="sopv {_sop_t(str(it.get("level") or ""))}">{_e(str(it.get("level") or ""))}</span> '
+            f'{_e(str(it.get("evidence") or ""))}'
+            f'<div class="sopact">→ {_e(str(it.get("action") or ""))}</div></div>'
+            for it in (x.get("items") or []))
+        q_cards.append(f'<div class="aip"><div class="t">{_e(str(x.get("name") or ""))}'
+                       f'（{_e(str(x.get("campaignId") or ""))}）</div>{items}'
+                       + (f'<div class="b"><b>小结：</b>{_e(str(x.get("summary") or ""))}</div>'
+                          if x.get("summary") else "") + '</div>')
+    q_block = (f'<details class="aidt"><summary>质量分四构成诊断（{len(q_cards)} 个计划）</summary>'
+               f'{"".join(q_cards)}</details>' if q_cards else "")
+
+    # 出价 / 保本 CPC 空间
+    bid_rows = "".join(
+        f'<tr><td class="l"><b>{_e(str(x.get("name") or ""))}</b>'
+        f'<div class="sid">{_e(str(x.get("campaignId") or ""))}</div></td>'
+        f'<td class="mono">¥{_num(x.get("current_cpc"), 2)}</td>'
+        f'<td class="mono">¥{_num(x.get("breakeven_cpc"), 2)}</td>'
+        f'<td class="l"><span class="sopv {_sop_t(x.get("headroom"))}">{_e(str(x.get("headroom") or ""))}</span></td>'
+        f'<td class="l">{_e(str(x.get("suggest") or ""))}</td></tr>'
+        for x in (a.get("bid_plan") or []))
+    bid_block = (f'<details class="aidt"><summary>出价与保本 CPC 空间（{len(a.get("bid_plan") or [])} 个计划）</summary>'
+                 f'<div class="tblwrap short"><table><thead><tr>'
+                 f'<th class="l noSort">计划</th><th data-num="1">实际CPC</th>'
+                 f'<th data-num="1">保本CPC</th><th class="l noSort">判断</th><th class="l noSort">动作</th>'
+                 f'</tr></thead><tbody>{bid_rows}</tbody></table></div></details>'
+                 if bid_rows else "")
 
     reads = "".join(f'<li><b>{_e(str(x.get("account")))}</b>：{_e(str(x.get("read")))}</li>'
                     for x in (a.get("account_reads") or []))
@@ -1607,6 +2549,25 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
     kw_block = (f'<details class="aidt"><summary>词级建议（候选，需人工确认 · {len(kws)} 个计划）</summary>'
                 f'{"".join(kws)}</details>' if kws else "")
 
+    # 行业大盘：AI 对本店 vs 行业、地域、关键词、热词等的观察与待审建议
+    inds = []
+    for x in (a.get("industry_advice") or []):
+        if not isinstance(x, dict):
+            continue
+        pr = tpri.get(str(x.get("priority") or ""), "l2")
+        bits = [f'<div class="t"><span class="aipri {pr}">{_e(str(x.get("priority") or "中"))}</span>'
+                f'{_e(str(x.get("topic") or "行业观察"))}</div>',
+                f'<div class="b"><b>发现：</b>{_e(str(x.get("finding") or ""))}</div>']
+        if x.get("benchmark"):
+            bits.append(f'<div class="b"><b>行业基准：</b>{_e(str(x.get("benchmark")))}</div>')
+        if x.get("evidence"):
+            bits.append(f'<div class="b"><b>依据：</b>{_e(str(x.get("evidence")))}</div>')
+        bits.append(f'<div class="b"><b>建议：</b>{_e(str(x.get("suggest") or ""))}</div>')
+        inds.append('<div class="aip">' + "".join(bits) + '</div>')
+    ind_block = (f'<details class="aidt"{opn}><summary>行业大盘观察与建议'
+                 f'（{len(inds)} 条 · 本店 vs 行业/地域/关键词）</summary>{"".join(inds)}</details>'
+                 if inds else "")
+
     ra = a.get("reallocation") or {}
     ra_block = ""
     if ra.get("logic"):
@@ -1641,8 +2602,9 @@ def _ai_block(ai, d, link: bool = True, default_open: bool = False) -> str:
         f'（{len(a.get("account_reads") or [])} 账号 / {len(a.get("sequence") or [])} 步）</summary>'
         f'{_mid_inner}</details>' if _mid_has else "")
 
-    return (f'<div class="aicard">{head}{hd}{hl}{diag}{mid_block}{dp_block}{tgt_block}{dt}{kw_block}'
-            f'<div class="aidisc">AI 套用《京东快车底层逻辑》方法论生成，<b>仅供参考</b>；'
+    return (f'<div class="aicard">{head}{hd}{hl}{diag}{sop_block}{q_block}{bid_block}'
+            f'{mid_block}{dp_block}{tgt_block}{dt}{kw_block}{ind_block}'
+            f'<div class="aidisc">AI 套用《京东快车底层逻辑》+《1小时吃透快车》官方课程知识库生成，<b>仅供参考</b>；'
             f'算数与口径由规则层代码保证，执行前请人工复核。'
             + (f'　<a href="/ai?start={_e(start)}&end={_e(end)}&accounts={_e(keys)}">'
                f'打开 AI 分析台（可追问）→</a>' if link else '') + '</div></div>')
@@ -1667,12 +2629,543 @@ function genAi(btn, start, end, keys){
 }
 """
 
+# 行业大盘补齐的「补完自动刷新」：只轮询、且仅在⑧行业大盘页签且用户没在输入时才刷新。
+# 以前用 <meta http-equiv="refresh" content="20"> 无条件整页刷新，用户正在搜索框里打字、
+# 或者正在看别的页签，20 秒一到页面就被刷掉（输入和滚动位置全丢）。
+IND_JS = """
+(function(){
+  var TIMER=null, TRIES=0, MAX=60, SAW=false;   // 8s x 60 ≈ 8 分钟还没补完就不再等它
+  function typing(){
+    var a=document.activeElement;
+    return !!(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+  }
+  function onIndTab(){
+    var p=document.getElementById('p-ind');
+    return !!(p && p.classList.contains('active'));
+  }
+  function stop(){ if(TIMER){ clearInterval(TIMER); TIMER=null; } }
+  function tick(){
+    fetch('/api/industry/status').then(function(r){ return r.json(); }).then(function(j){
+      TRIES++;
+      if(j && j.running){ SAW=true; }
+      else{
+        stop();
+        // 只刷新「亲眼看到它在跑、然后跑完了」的情况：如果切过来时任务早就结束，
+        // 就不该把用户从行业大盘页刷回默认页签。
+        if(SAW && window.__IND_PENDING && onIndTab() && !typing()) location.reload();
+        return;
+      }
+      if(TRIES>=MAX) stop();               // 补不上（比如该账号接口一直报错）就别死等
+    }).catch(function(){ if(++TRIES>=8) stop(); });
+  }
+  function start(){
+    if(!window.__IND_PENDING || TIMER) return;
+    TIMER=setInterval(tick, 8000); tick();
+  }
+  var prev=window.showTab;
+  if(typeof prev==='function'){
+    window.showTab=function(id, el){
+      prev.apply(this, arguments);
+      if(id==='p-ind') start();            // 只有真的切到行业大盘才开始轮询
+    };
+  }
+  if(onIndTab()) start();
+})();
+"""
+
+
+# ---------------------------------------------------------------- 页面：行业大盘
+def _ind_cell(v, num: bool = False) -> str:
+    # 容忍历史写法 ((显示值, 原始值), True)：表头已经带 num，单元格这里只取内层
+    if (isinstance(v, tuple) and len(v) == 2 and isinstance(v[1], bool)
+            and isinstance(v[0], tuple)):
+        v = v[0]
+    if isinstance(v, tuple):
+        disp, raw = v
+    else:
+        disp, raw = v, v
+    cls = "mono" if num else "l"
+    dv = f' data-v="{_e(raw)}"' if num else ""
+    return f'<td class="{cls}"{dv}>{_e(disp)}</td>'
+
+
+def _ind_table(headers, rows) -> str:
+    if not rows:
+        return '<p class="hint">该板块本区间没有数据。</p>'
+    ths = "".join(
+        f'<th class="{"mono" if num else "l"}" data-num="{1 if num else 0}">{_e(h)}</th>'
+        for h, num in headers)
+    body = "".join(
+        "<tr>" + "".join(_ind_cell(c, num) for c, (_h, num) in zip(row, headers)) + "</tr>"
+        for row in rows)
+    return (f'<div class="tblwrap short"><table><thead><tr>{ths}</tr></thead>'
+            f'<tbody>{body}</tbody></table></div>')
+
+
+def _industry_pending(ind: dict) -> bool:
+    """后台任务是否正在补**本页还缺的账号**（别为其它区间/账号白刷新页面）。"""
+    st = ind.get("status") or {}
+    need = {str(k) for k in (ind.get("missing") or [])}
+    if not st.get("running") or not need:
+        return False
+    active = {str(k) for k in (st.get("accounts") or [])}
+    for q in st.get("queued") or []:
+        active.update(str(k) for k in (q.get("accounts") or []))
+    return bool(need & active)
+
+
+def _industry_ai_block(ai) -> str:
+    """AI 对行业大盘的观察、总结与建议（没有 AI 解读时明确说明）。"""
+    a = (ai or {}).get("advice") or {}
+    items = [x for x in (a.get("industry_advice") or []) if isinstance(x, dict)]
+    if not items:
+        return ('<div class="card"><h2>AI 行业总结与建议</h2>'
+                '<p class="hint">本区间暂无 AI 行业解读。在①总结页点「生成本区间解读」，'
+                '模型会结合行业基准、地域与关键词缺口给出待审建议；下面的规则层建议始终可用。</p></div>')
+    pri = {"高": "l1", "中": "l2", "低": "l3"}
+    cards = []
+    for x in items:
+        p = pri.get(str(x.get("priority") or ""), "l2")
+        bits = [f'<div class="t"><span class="aipri {p}">{_e(x.get("priority") or "中")}</span>'
+                f'{_e(x.get("topic") or "行业观察")}</div>',
+                f'<div class="b"><b>发现：</b>{_e(x.get("finding") or "")}</div>']
+        if x.get("benchmark"):
+            bits.append(f'<div class="b"><b>行业基准：</b>{_e(x.get("benchmark"))}</div>')
+        if x.get("evidence"):
+            bits.append(f'<div class="b"><b>依据：</b>{_e(x.get("evidence"))}</div>')
+        bits.append(f'<div class="b"><b>建议：</b>{_e(x.get("suggest") or "")}</div>')
+        cards.append('<div class="aip">' + "".join(bits) + '</div>')
+    return ('<div class="card"><h2>AI 行业总结与建议 '
+            '<span class="tagline">只依据本地缓存，待人工审阅</span></h2>'
+            + "".join(cards) + '</div>')
+
+
+def _page_industry_all(d, ai=None) -> str:
+    ind = d.get("industry") or {}
+    meta = d.get("meta") or {}
+    rng = ind.get("range") or meta.get("range") or {}
+    start, end = _e(rng.get("start") or ""), _e(rng.get("end") or "")
+    keys = ",".join(str(a.get("key") or "") for a in (meta.get("accounts") or []))
+    st = ind.get("status") or {}
+    refresh = (f'<form method="post" style="display:inline" '
+               f'action="/api/industry/refresh?start={start}&end={end}&accounts={_e(keys)}">'
+               f'<button class="btn sec mini" type="submit">重新抓取行业大盘</button></form>')
+    status_html = ""
+    if _industry_pending(ind):
+        status_html = (f'<div class="note"><b>正在自动补齐行业大盘</b>：'
+                       f'{_e(st.get("done") or 0)}/{_e(st.get("total") or 0)} 个账号，'
+                       f'{_e(st.get("message") or "")}。页面每 20 秒自动刷新，补齐后本页直接出表。</div>')
+    elif ind.get("missing"):
+        retry = ind.get("retryLater") or []
+        labels = {str(a.get("key")): str(a.get("label") or a.get("key"))
+                  for a in (meta.get("accounts") or [])}
+        retry_txt = ""
+        if retry:
+            retry_txt = ("其中 " + "、".join(_e(labels.get(str(k), str(k))) for k in retry)
+                         + " 本次补齐失败，30 分钟内不自动重试；")
+        status_html = (f'<div class="warnbox">本区间还缺 {len(ind.get("missing") or [])} 个账号的行业大盘缓存；'
+                       + retry_txt
+                       + '自动补齐未在运行，可点「重新抓取行业大盘」强制重试。</div>')
+    if st.get("error"):
+        status_html += f'<div class="warnbox">上次补齐有失败：{_e(st.get("error"))}</div>'
+    head = (f'<div class="card"><h2>行业大盘观察 <span class="tagline">{start} ~ {end}</span></h2>'
+            f'<p class="hint">{_e(ind.get("caliber") or "")}</p>'
+            f'<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px">{refresh}'
+            f'<a class="btn ghost mini" href="/cache?kind=industry">缓存管理</a></div>'
+            f'{status_html}</div>')
+    if not ind.get("enabled", True):
+        return head + '<div class="card"><p class="hint">行业大盘功能已关闭（JD_INDUSTRY=0）。</p></div>'
+    facts = ind.get("accounts") or []
+    if not facts:
+        return (head + '<div class="card"><h2>本区间还没有行业大盘数据</h2>'
+                '<p class="hint">报表会先读本地缓存；缺数据时后台自动补齐，不需要去别的页面手动抓。'
+                '若自动补齐被关闭或登录态正在被别的任务占用，点上面的「重新抓取行业大盘」即可。</p></div>')
+
+    n_unc_region = sum(len(a.get("uncovered_regions") or []) for a in facts)
+    n_unc_word = sum(len(a.get("uncovered_words") or []) for a in facts)
+    n_word_gap = sum(len(a.get("word_gaps") or []) for a in facts)
+    kpis = "".join([
+        _kpi("已接入行业大盘账号", f"{len(facts)} / {len(meta.get('accounts') or [])}",
+             "按账号 + 区间命中本地缓存"),
+        _kpi("行业高潜地域未覆盖", str(n_unc_region), "来自行业展现 TOP8 与本店地域定向的差集"),
+        _kpi("行业热词未覆盖", str(n_unc_word), "本店 w2 词库里没有出现过的行业热词"),
+        _kpi("本店落后行业词", str(n_word_gap), "CTR / 转化率 / ROI 至少一项明显落后"),
+    ])
+
+    compare_rows = []
+    for a in facts:
+        s = a.get("self_vs_industry") or {}
+        compare_rows.append([
+            (a.get("label") or a.get("account"), False),
+            (a.get("category") or "—", False),
+            ((f'{_n(s.get("own_ctr")):.2f}%', s.get("own_ctr")), True),
+            ((f'{_n(s.get("industry_ctr")):.2f}%', s.get("industry_ctr")), True),
+            ((f'{_n(s.get("ctr_gap_pp")):+.2f}pp', s.get("ctr_gap_pp")), True),
+            ((f'{_n(s.get("own_cvr")):.2f}%', s.get("own_cvr")), True),
+            ((f'{_n(s.get("industry_cvr")):.2f}%', s.get("industry_cvr")), True),
+            ((f'{_n(s.get("cvr_gap_pp")):+.2f}pp', s.get("cvr_gap_pp")), True),
+            ((f'{_n(s.get("cart_gap_pp")):+.2f}pp', s.get("cart_gap_pp")), True),
+            ((f'¥{_money(s.get("own_cost"))}', s.get("own_cost")), True),
+            ((f'{_n(s.get("own_roi")):.2f}', s.get("own_roi")), True),
+        ])
+    compare = _ind_table(
+        [("账号", False), ("三级类目", False), ("本店CTR", True), ("行业CTR", True), ("CTR差", True),
+         ("本店转化率", True), ("行业转化率", True), ("转化率差", True), ("加购率差", True),
+         ("本店花费", True), ("本店ROI", True)], compare_rows)
+
+    obs = "".join(f'<li>{_e(x)}</li>' for x in (ind.get("observations") or [])[:12])
+    pri = {"高": "l1", "中": "l2", "低": "l3"}
+    sugg = "".join(
+        f'<div class="aip"><div class="t"><span class="aipri {pri.get(str(s.get("priority") or ""), "l2")}">'
+        f'{_e(s.get("priority") or "中")}</span>{_e(s.get("label") or s.get("account") or "")} · '
+        f'{_e(s.get("topic") or "")}</div><div class="b">{_e(s.get("text") or "")}</div></div>'
+        for s in (ind.get("suggestions") or [])[:16])
+
+    blocks = []
+    tables = ind.get("tables") or {}
+    for a in facts:
+        key = a.get("account")
+        label, cat = _e(a.get("label") or key), _e(a.get("category") or "")
+        t = tables.get(key) or {}
+        regions = t.get("regions") or []
+        reg_rows = [[(r.get("mappedAreaName") or "—", False),
+                     ((f'{_n(r.get("impressionsPercentage")):.2f}%', r.get("impressionsPercentage")), True),
+                     ((f'{_n(r.get("orderPercentage")):.2f}%', r.get("orderPercentage")), True),
+                     ((f'{_n(r.get("ctr")):.2f}%', r.get("ctr")), True),
+                     ((f'{_n(r.get("cvs")):.2f}%', r.get("cvs")), True),
+                     (r.get("impressionRank") or "", True), (r.get("orderRank") or "", True)]
+                    for r in regions[:12]]
+        kw_rows = [[(r.get("keyWord") or "—", False),
+                    ((f'{_n(r.get("impressionExponent")):,.0f}', r.get("impressionExponent")), True),
+                    ((f'{_n(r.get("clickExponent")):,.0f}', r.get("clickExponent")), True),
+                    ((f'{_n(r.get("ctr")):.2f}%', r.get("ctr")), True),
+                    ((f'{_n(r.get("cvs")):.2f}%', r.get("cvs")), True),
+                    ((f'¥{_num(r.get("kwImpressionBid"))}', r.get("kwImpressionBid")), True)]
+                   for r in (t.get("keywords") or [])[:20]]
+        comp_rows = []
+        for r in (t.get("compete") or [])[:20]:
+            s, i = r.get("self") or {}, r.get("industry") or {}
+            comp_rows.append([
+                (r.get("keyWord") or "—", False),
+                ((f'{_n(s.get("roi")):.2f}', s.get("roi")), True),
+                ((f'{_n(s.get("ctr")):.2f}%', s.get("ctr")), True),
+                ((f'{_n(i.get("ctr")):.2f}%', i.get("ctr")), True),
+                ((f'{_n(s.get("cvs")):.2f}%', s.get("cvs")), True),
+                ((f'{_n(i.get("cvs")):.2f}%', i.get("cvs")), True),
+                ((f'¥{_num(s.get("cpc"))}', s.get("cpc")), True),
+                ((f'¥{_num(s.get("kwImpressionBid"))}', s.get("kwImpressionBid")), True),
+                ((f'¥{_num(i.get("kwImpressionBid"))}', i.get("kwImpressionBid")), True),
+            ])
+        word_rows = []
+        for tag, rows in (("热词", t.get("hotWords") or []),
+                          ("飙升词", t.get("soaringWords") or []),
+                          ("新词", t.get("newWords") or []),
+                          ("品牌词", t.get("brandWords") or [])):
+            for r in rows[:8]:
+                word_rows.append([
+                    (tag, False), (r.get("keyWord") or "—", False),
+                    (r.get("keyWordRank") or "", True),
+                    ((f'{_n(r.get("searchExponent")):,.0f}', r.get("searchExponent")), True),
+                    ((f'{_n(r.get("riseRate")):+.2f}%' if r.get("riseRate") is not None else "—",
+                      r.get("riseRate") or 0), True),
+                    ((f'{_n(r.get("kwCompetitiveness")):,.2f}', r.get("kwCompetitiveness")), True),
+                ])
+        brand_rows = [[(b.get("no") or "", True), (b.get("name") or "—", False),
+                       ((f'{_n(b.get("ctr")):.2f}%', b.get("ctr")), True),
+                       ((f'{_n(b.get("cvs")):.2f}%', b.get("cvs")), True),
+                       ("本店" if int(_n(b.get("selfBrandFlag"))) == 1 else "", False)]
+                      for b in (t.get("brands") or [])[:10]]
+        cust = t.get("customer") or {}
+        ci, cs = cust.get("industry") or {}, cust.get("self") or {}
+        cust_rows = [
+            [("行业新客占比", False), ((f'{_n(ci.get("newCustomerCntPercentage")):.2f}%',
+                                    ci.get("newCustomerCntPercentage")), True),
+             ((f'¥{_num(ci.get("newCustomerCost"))}', ci.get("newCustomerCost")), True),
+             ((f'{_n(ci.get("oldCustomerCntPercentage")):.2f}%',
+               ci.get("oldCustomerCntPercentage")), True)],
+            [("本店新客占比", False), ((f'{_n(cs.get("newCustomerCntPercentage")):.2f}%',
+                                    cs.get("newCustomerCntPercentage")), True),
+             ((f'¥{_num(cs.get("newCustomerCost"))}', cs.get("newCustomerCost")), True),
+             ((f'{_n(cs.get("oldCustomerCntPercentage")):.2f}%',
+               cs.get("oldCustomerCntPercentage")), True)],
+        ]
+        blocks.append(f"""
+<div class="card"><h2>{label} · 地域分析 <span class="tagline">{cat} · 行业展现 TOP12</span></h2>
+  <p class="hint">地域看板不含直投数据；「覆盖率」是本店地域定向花费与行业高潜地域的对照，仅供选地域时用。</p>
+  {_ind_table([("省份", False), ("展现占比", True), ("成交占比", True), ("点击率", True),
+               ("转化率", True), ("展现排名", True), ("成交排名", True)], reg_rows)}
+</div>
+<div class="card"><h2>{label} · 行业关键词榜</h2>
+  <p class="hint">展现/点击为指数；「参考出价」是行业侧 kwImpressionBid，不等于本店 CPC。</p>
+  {_ind_table([("关键词", False), ("展现指数", True), ("点击指数", True), ("点击率", True),
+               ("转化率", True), ("行业参考出价", True)], kw_rows)}
+</div>
+<div class="card"><h2>{label} · 本店 vs 行业词效率</h2>
+  {_ind_table([("关键词", False), ("本店ROI", True), ("本店CTR", True), ("行业CTR", True),
+               ("本店转化率", True), ("行业转化率", True), ("本店CPC", True),
+               ("本店出价", True), ("行业参考出价", True)], comp_rows)}
+</div>
+<div class="card"><h2>{label} · 热词 / 飙升词 / 新词 / 品牌词</h2>
+  {_ind_table([("类型", False), ("词", False), ("排名", True), ("搜索指数", True),
+               ("涨幅", True), ("竞争度", True)], word_rows)}
+</div>
+<div class="card"><h2>{label} · 品牌榜与新客结构</h2>
+  {_ind_table([("排名", True), ("品牌", False), ("点击率", True), ("转化率", True), ("标记", False)], brand_rows)}
+  <div style="height:12px"></div>
+  {_ind_table([("口径", False), ("新客占比", True), ("新客成本", True), ("老客占比", True)], cust_rows)}
+</div>""")
+
+    return (head + f'<div class="grid g3">{kpis}</div>'
+            + '<div class="card"><h2>本店 vs 行业（只看比率，指数不与金额相加）</h2>'
+            + compare + '</div>'
+            + '<div class="card"><h2>行业大盘观察</h2><ul class="sum">' + obs + '</ul></div>'
+            + '<div class="card"><h2>行业趋势（分日指数）</h2>' + _chart_html("chIndustryTrend") + '</div>'
+            + '<div class="card"><h2>行业时段分布（点击指数）</h2>' + _chart_html("chIndustryHour") + '</div>'
+            + "".join(blocks)
+            + '<div class="card"><h2>规则层建议（代码按事实算好）</h2>' + sugg + '</div>'
+            + _industry_ai_block(ai))
+
+
+def page_industry(d, ai=None) -> str:
+    ind = d.get("industry") or {}
+    meta = d.get("meta") or {}
+    rng = ind.get("range") or meta.get("range") or {}
+    start, end = _e(rng.get("start") or ""), _e(rng.get("end") or "")
+    keys = ",".join(str(a.get("key") or "") for a in (meta.get("accounts") or []))
+    st = ind.get("status") or {}
+    refresh = (f'<form method="post" style="display:inline" '
+               f'action="/api/industry/refresh?start={start}&end={end}&accounts={_e(keys)}">'
+               f'<button class="btn sec mini" type="submit">重新抓取行业大盘</button></form>')
+    status_html = ""
+    if _industry_pending(ind):
+        status_html = (f'<div class="note"><b>正在自动补齐行业大盘</b>：'
+                       f'{_e(st.get("done") or 0)}/{_e(st.get("total") or 0)} 个账号，'
+                       f'{_e(st.get("message") or "")}。页面每 20 秒自动刷新，补齐后本页直接出表。</div>')
+    elif ind.get("missing"):
+        retry = ind.get("retryLater") or []
+        labels = {str(a.get("key")): str(a.get("label") or a.get("key"))
+                  for a in (meta.get("accounts") or [])}
+        retry_txt = ""
+        if retry:
+            retry_txt = ("其中 " + "、".join(_e(labels.get(str(k), str(k))) for k in retry)
+                         + " 本次补齐失败，30 分钟内不自动重试；")
+        status_html = (f'<div class="warnbox">本区间还缺 {len(ind.get("missing") or [])} 个账号的行业大盘缓存；'
+                       + retry_txt
+                       + '自动补齐未在运行，可点「重新抓取行业大盘」强制重试。</div>')
+    if st.get("error"):
+        status_html += f'<div class="warnbox">上次补齐有失败：{_e(st.get("error"))}</div>'
+    head = (f'<div class="card"><h2>行业大盘观察 <span class="tagline">{start} ~ {end}</span></h2>'
+            f'<p class="hint">{_e(ind.get("caliber") or "")}</p>'
+            f'<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px">{refresh}'
+            f'<a class="btn ghost mini" href="/cache?kind=industry">缓存管理</a></div>'
+            f'{status_html}</div>')
+    if not ind.get("enabled", True):
+        return head + '<div class="card"><p class="hint">行业大盘功能已关闭（JD_INDUSTRY=0）。</p></div>'
+    facts = ind.get("accounts") or []
+    if not facts:
+        return (head + '<div class="card"><h2>本区间还没有行业大盘数据</h2>'
+                '<p class="hint">报表会先读本地缓存；缺数据时后台自动补齐，不需要去别的页面手动抓。'
+                '若自动补齐被关闭或登录态正在被别的任务占用，点上面的「重新抓取行业大盘」即可。</p></div>')
+
+    tables = ind.get("tables") or {}
+    all_sugg = ind.get("suggestions") or []
+    pri = {"高": "l1", "中": "l2", "低": "l3"}
+
+    def _money_cell(v):
+        if v is None or v == "":
+            return ("—", 0)
+        return (f'¥{_num(v)}', _n(v))
+
+    def _kw_table(acts: list) -> str:
+        if not acts:
+            return '<p class="hint">本账号暂无可匹配的行业词动作。</p>'
+        rows = []
+        for x in acts:
+            rows.append([
+                (x.get("word") or "—", False),
+                (x.get("status") or "", False),
+                ("/".join(x.get("sources") or []), False),
+                ((f'{_n(x.get("own_roi")):.2f}', x.get("own_roi")), True),
+                ((f'{_n(x.get("own_cvr")):.2f}%', x.get("own_cvr")), True),
+                ((f'{_n(x.get("industry_cvr")):.2f}%', x.get("industry_cvr")), True),
+                _money_cell(x.get("current_bid")),
+                _money_cell(x.get("suggest_bid")),
+                (x.get("action") or "", False),
+            ])
+        return _ind_table([("词", False), ("状态", False), ("行业信号", False), ("本店ROI", True),
+                            ("本店转化率", True), ("行业转化率", True), ("当前出价", True),
+                            ("建议出价", True), ("动作", False)], rows)
+
+    tabs, sections = [], []
+    for idx, a in enumerate(facts):
+        key = str(a.get("account") or "")
+        label = _e(a.get("label") or key)
+        cat = _e(a.get("category") or "")
+        t = tables.get(key) or {}
+        s = a.get("self_vs_industry") or {}
+        acts = a.get("keyword_actions") or []
+        ksum = a.get("keyword_summary") or {}
+        cat_html = f'<span class="indmeta">{cat}</span>' if cat else ""
+        tabs.append(f'<button type="button" class="indtab{" active" if idx == 0 else ""}" '
+                    f'data-ind="{_e(key)}" onclick="indShow(this.dataset.ind,this)">'
+                    f'{label}{cat_html}</button>')
+
+        kpis = "".join([
+            _kpi("本店花费", f'¥{_money(s.get("own_cost"))}', "行业大盘缓存命中"),
+            _kpi("本店 / 行业 CTR", f'{_n(s.get("own_ctr")):.2f}% / {_n(s.get("industry_ctr")):.2f}%',
+                 f'{_n(s.get("ctr_gap_pp")):+.2f}pp'),
+            _kpi("本店 / 行业转化率",
+                 f'{_n(s.get("own_cvr")):.2f}% / {_n(s.get("industry_cvr")):.2f}%',
+                 f'{_n(s.get("cvr_gap_pp")):+.2f}pp'),
+            _kpi("关键词出价动作", str(len(acts)),
+                 f'已投 {ksum.get("invested", 0)} / 未投 {ksum.get("uncovered", 0)}'),
+        ])
+
+        compare = _ind_table(
+            [("三级类目", False), ("本店CTR", True), ("行业CTR", True), ("CTR差", True),
+             ("本店转化率", True), ("行业转化率", True), ("转化率差", True), ("加购率差", True),
+             ("本店花费", True), ("本店ROI", True)],
+            [[(a.get("category") or "—", False),
+              ((f'{_n(s.get("own_ctr")):.2f}%', s.get("own_ctr")), True),
+              ((f'{_n(s.get("industry_ctr")):.2f}%', s.get("industry_ctr")), True),
+              ((f'{_n(s.get("ctr_gap_pp")):+.2f}pp', s.get("ctr_gap_pp")), True),
+              ((f'{_n(s.get("own_cvr")):.2f}%', s.get("own_cvr")), True),
+              ((f'{_n(s.get("industry_cvr")):.2f}%', s.get("industry_cvr")), True),
+              ((f'{_n(s.get("cvr_gap_pp")):+.2f}pp', s.get("cvr_gap_pp")), True),
+              ((f'{_n(s.get("cart_gap_pp")):+.2f}pp', s.get("cart_gap_pp")), True),
+              ((f'¥{_money(s.get("own_cost"))}', s.get("own_cost")), True),
+              ((f'{_n(s.get("own_roi")):.2f}', s.get("own_roi")), True)]])
+        obs = "".join(f'<li>{_e(x)}</li>' for x in (a.get("observations") or []))
+        obs_html = f'<ul class="sum">{obs}</ul>' if obs else '<p class="hint">本账号暂无行业观察。</p>'
+        sugg = "".join(
+            f'<div class="aip"><div class="t"><span class="aipri {pri.get(str(x.get("priority") or ""), "l2")}">'
+            f'{_e(x.get("priority") or "中")}</span>{_e(x.get("topic") or "")}</div>'
+            f'<div class="b">{_e(x.get("text") or "")}</div></div>'
+            for x in all_sugg if x.get("account") == key)
+        sugg_html = sugg or '<p class="hint">本账号暂无可执行规则建议。</p>'
+
+        regions = t.get("regions") or []
+        reg_rows = [[(r.get("mappedAreaName") or "—", False),
+                     ((f'{_n(r.get("impressionsPercentage")):.2f}%', r.get("impressionsPercentage")), True),
+                     ((f'{_n(r.get("orderPercentage")):.2f}%', r.get("orderPercentage")), True),
+                     ((f'{_n(r.get("ctr")):.2f}%', r.get("ctr")), True),
+                     ((f'{_n(r.get("cvs")):.2f}%', r.get("cvs")), True),
+                     (r.get("impressionRank") or "", True), (r.get("orderRank") or "", True)]
+                    for r in regions[:12]]
+        kw_rows = [[(r.get("keyWord") or "—", False),
+                    ((f'{_n(r.get("impressionExponent")):,.0f}', r.get("impressionExponent")), True),
+                    ((f'{_n(r.get("clickExponent")):,.0f}', r.get("clickExponent")), True),
+                    ((f'{_n(r.get("ctr")):.2f}%', r.get("ctr")), True),
+                    ((f'{_n(r.get("cvs")):.2f}%', r.get("cvs")), True),
+                    ((f'¥{_num(r.get("kwImpressionBid"))}', r.get("kwImpressionBid")), True)]
+                   for r in (t.get("keywords") or [])[:20]]
+        comp_rows = []
+        for r in (t.get("compete") or [])[:20]:
+            cs, ci = r.get("self") or {}, r.get("industry") or {}
+            comp_rows.append([
+                (r.get("keyWord") or "—", False),
+                ((f'{_n(cs.get("roi")):.2f}', cs.get("roi")), True),
+                ((f'{_n(cs.get("ctr")):.2f}%', cs.get("ctr")), True),
+                ((f'{_n(ci.get("ctr")):.2f}%', ci.get("ctr")), True),
+                ((f'{_n(cs.get("cvs")):.2f}%', cs.get("cvs")), True),
+                ((f'{_n(ci.get("cvs")):.2f}%', ci.get("cvs")), True),
+                ((f'¥{_num(cs.get("cpc"))}', cs.get("cpc")), True),
+                ((f'¥{_num(cs.get("kwImpressionBid"))}', cs.get("kwImpressionBid")), True),
+                ((f'¥{_num(ci.get("kwImpressionBid"))}', ci.get("kwImpressionBid")), True),
+            ])
+        word_rows = []
+        for tag, rows in (("热词", t.get("hotWords") or []),
+                          ("飙升词", t.get("soaringWords") or []),
+                          ("新词", t.get("newWords") or []),
+                          ("品牌词", t.get("brandWords") or [])):
+            for r in rows[:8]:
+                word_rows.append([
+                    (tag, False), (r.get("keyWord") or "—", False),
+                    (r.get("keyWordRank") or "", True),
+                    ((f'{_n(r.get("searchExponent")):,.0f}', r.get("searchExponent")), True),
+                    ((f'{_n(r.get("riseRate")):+.2f}%' if r.get("riseRate") is not None else "—",
+                      r.get("riseRate") or 0), True),
+                    ((f'{_n(r.get("kwCompetitiveness")):,.2f}', r.get("kwCompetitiveness")), True),
+                ])
+        brand_rows = [[(b.get("no") or "", True), (b.get("name") or "—", False),
+                       ((f'{_n(b.get("ctr")):.2f}%', b.get("ctr")), True),
+                       ((f'{_n(b.get("cvs")):.2f}%', b.get("cvs")), True),
+                       ("本店" if int(_n(b.get("selfBrandFlag"))) == 1 else "", False)]
+                      for b in (t.get("brands") or [])[:10]]
+        cust = t.get("customer") or {}
+        ci, cs = cust.get("industry") or {}, cust.get("self") or {}
+        cust_rows = [
+            [("行业新客占比", False), ((f'{_n(ci.get("newCustomerCntPercentage")):.2f}%',
+                                    ci.get("newCustomerCntPercentage")), True),
+             ((f'¥{_num(ci.get("newCustomerCost"))}', ci.get("newCustomerCost")), True),
+             ((f'{_n(ci.get("oldCustomerCntPercentage")):.2f}%',
+               ci.get("oldCustomerCntPercentage")), True)],
+            [("本店新客占比", False), ((f'{_n(cs.get("newCustomerCntPercentage")):.2f}%',
+                                    cs.get("newCustomerCntPercentage")), True),
+             ((f'¥{_num(cs.get("newCustomerCost"))}', cs.get("newCustomerCost")), True),
+             ((f'{_n(cs.get("oldCustomerCntPercentage")):.2f}%',
+               cs.get("oldCustomerCntPercentage")), True)],
+        ]
+
+        sections.append(f"""
+<div class="indacct{' active' if idx == 0 else ''}" data-ind="{_e(key)}">
+  <div class="grid g3">{kpis}</div>
+  <div class="card"><h2>{label} · 关键词出价建议
+    <span class="tagline">结合本店该词 ROI / 转化率 / 当前出价</span></h2>
+    <p class="hint">优先看「已投」：行业榜单只给信号，出价用本店真实 ROI 与保本线判断；
+      「未投」给的是小预算起测价，不是直接抢头部。</p>
+    {_kw_table(acts)}
+  </div>
+  <div class="card"><h2>{label} · 本店 vs 行业（只看比率，指数不与金额相加）</h2>{compare}</div>
+  <div class="card"><h2>{label} · 行业大盘观察</h2>{obs_html}</div>
+  <div class="card"><h2>{label} · 行业趋势（分日指数）</h2>{_chart_html(f"chIndTrend{idx}")}</div>
+  <div class="card"><h2>{label} · 行业时段分布（点击指数）</h2>{_chart_html(f"chIndHour{idx}")}</div>
+  <div class="card"><h2>{label} · 地域分析 <span class="tagline">{cat} · 行业展现 TOP12</span></h2>
+    <p class="hint">地域看板不含直投数据；「覆盖率」是本店地域定向花费与行业高潜地域的对照，仅供选地域时用。</p>
+    {_ind_table([("省份", False), ("展现占比", True), ("成交占比", True), ("点击率", True),
+                 ("转化率", True), ("展现排名", True), ("成交排名", True)], reg_rows)}
+  </div>
+  <div class="card"><h2>{label} · 行业关键词榜</h2>
+    <p class="hint">展现/点击为指数；「参考出价」是行业侧 kwImpressionBid，不等于本店 CPC。</p>
+    {_ind_table([("关键词", False), ("展现指数", True), ("点击指数", True), ("点击率", True),
+                 ("转化率", True), ("行业参考出价", True)], kw_rows)}
+  </div>
+  <div class="card"><h2>{label} · 本店 vs 行业词效率</h2>
+    {_ind_table([("关键词", False), ("本店ROI", True), ("本店CTR", True), ("行业CTR", True),
+                 ("本店转化率", True), ("行业转化率", True), ("本店CPC", True),
+                 ("本店出价", True), ("行业参考出价", True)], comp_rows)}
+  </div>
+  <div class="card"><h2>{label} · 热词 / 飙升词 / 新词 / 品牌词</h2>
+    {_ind_table([("类型", False), ("词", False), ("排名", True), ("搜索指数", True),
+                 ("涨幅", True), ("竞争度", True)], word_rows)}
+  </div>
+  <div class="card"><h2>{label} · 品牌榜与新客结构</h2>
+    {_ind_table([("排名", True), ("品牌", False), ("点击率", True), ("转化率", True), ("标记", False)], brand_rows)}
+    <div style="height:12px"></div>
+    {_ind_table([("口径", False), ("新客占比", True), ("新客成本", True), ("老客占比", True)], cust_rows)}
+  </div>
+  <div class="card"><h2>{label} · 规则层建议（代码按事实算好）</h2>{sugg_html}</div>
+</div>""")
+
+    switcher = (f'<div class="card"><h2>按账号查看 <span class="tagline">'
+                f'已接入 {len(facts)} / {len(meta.get("accounts") or [])} 个账号</span></h2>'
+                '<p class="hint">切换账号只查看该账号的行业对比、关键词出价建议与地域，不再把所有账号纵向罗列。</p>'
+                f'<div class="indtabs">{"".join(tabs)}</div></div>')
+    return head + '<div class="indwrap">' + switcher + "".join(sections) + '</div>' + _industry_ai_block(ai)
+
 
 def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 × 按商品 × 调整复盘",
            ai=None) -> str:
     charts = build_charts(d)
     chart_json = json.dumps(charts, ensure_ascii=False).replace("</", "<\\/")
+    sku_chart_json = json.dumps(sku_chart_payload(d), ensure_ascii=False).replace("</", "<\\/")
     echarts_src = _echarts_src()
+    ind = d.get("industry") or {}
+    # 行业大盘补齐时**不能**再用 <meta http-equiv="refresh">：那是整页定时刷新，
+    # 会把用户正在输入的搜索框、滚动位置一起刷掉（表现为「打字几秒后页面自己刷新」）。
+    # 改成 JS 轮询 + 三重条件：正在看⑧行业大盘、没在输入框里、补齐任务真的结束了才刷新。
+    ind_pending = _industry_pending(ind)
+    refresh_meta = ""
     tabs = "".join(
         f'<div class="tab{" active" if i == 0 else ""}" onclick="showTab(\'{cid}\',this)">{_e(label)}</div>'
         for i, (cid, label) in enumerate(TABS))
@@ -1683,7 +3176,9 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
         ("p-adj", page_adj(d)),
         ("p-plan", page_plan(d)),
         ("p-word", page_word(d)),
+        ("p-sop", page_playbook(d)),
         ("p-act", page_action(d)),
+        ("p-ind", page_industry(d, ai)),
     ]
     body = "".join(
         f'<section class="page{" active" if i == 0 else ""}" id="{cid}">{html}</section>'
@@ -1692,6 +3187,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+{refresh_meta}
 <title>{_e(title)}</title>
 <style>{CSS}{UI_CSS}{AI_CSS}</style>{echarts_src}</head>
 <body>
@@ -1711,7 +3207,8 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
 </div></header>
 <div class="wrap">{_coverage_notice(d)}{body}
   <div class="foot">
-    数据来源：京准通（概览 / 智能投放 / 快车关键词 / 操作日志）+ 商智（商品明细 / 流量概况）。<br>
+    数据来源：京准通（概览 / 智能投放 / 快车关键词 / 操作日志 / 行业大盘）+ 商智（商品明细 / 流量概况）。<br>
+    行业大盘为按三级类目汇总的<b>指数化</b>口径，只用于比率对比，不与本店金额相加。<br>
     「保本ROI」「毛利/件」「预估净利」：已接入的 SKU 用 ERP 每件<b>到手结算价</b>与货款/运费/包材/人工逐件算，
     分母用商智<b>前台件单价</b>（消费者实付，与京准通 ROI 同口径）；
     未接入（标 <b>*</b>）仍按全店 Excel 成本结构推算 —— 均为投放决策参考，不是财务对账数据。<br>
@@ -1721,6 +3218,9 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
 <script>{JS}</script>
 <script>{AI_JS}</script>
 <script>window.__CHARTS={chart_json};</script>
+<script>window.__SKUCHART={sku_chart_json};</script>
+<script>window.__IND_PENDING = {'true' if ind_pending else 'false'};</script>
+<script>{IND_JS}</script>
 </body></html>"""
 
 

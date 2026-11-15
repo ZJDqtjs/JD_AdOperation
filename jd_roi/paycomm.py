@@ -295,6 +295,78 @@ def fetch_creative_rows(page, start: str, end: str, account_id: int,
     return rows
 
 
+def fetch_kw_creative_sku_by_ad(page, page_size: int = 200) -> dict:
+    """推广管理创意列表 → {adId: skuId}。
+
+    创意报表（base/ad/list）部分创意的落地页是店铺页/活动页，解析不出 SKU；
+    推广管理这边每条创意直接带 skuId，用 adId 对回去就能补齐（已删计划补不了）。
+    """
+    out: dict[int, int] = {}
+    pno = 1
+    while pno <= 10:
+        payload = {"page": pno, "pageSize": page_size, "status": "", "filters": [],
+                   "creativeType": [], "obys": "",
+                   "startDay": settings.today().isoformat(),
+                   "endDay": settings.today().isoformat(), "clickOrOrderCaliber": 0,
+                   "clickOrOrderDay": 15, "giftFlag": 0, "orderStatusCategory": 1,
+                   "customColumns": ["campaignName", "skuId", "url"],
+                   "campaignId": "", "groupId": "", "putType": "", "requestFrom": 0}
+        try:
+            d = _post_atoms(page, MSA_AD_API, payload)
+        except Exception:  # noqa: BLE001
+            break
+        data = d.get("data") or {}
+        rows: list[dict] = []
+        for key in ("msaNormalAdReport", "msaSmartAdReport"):
+            rows.extend(((data.get(key) or {}).get("data") or []))
+        for r in rows:
+            try:
+                ad, sku = int(r.get("adId") or 0), int(r.get("skuId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ad and sku > 0:
+                out[ad] = sku
+        if len(rows) < page_size:
+            break
+        pno += 1
+        _sleep(DELAY_PAGE)
+    return out
+
+
+def fetch_creative_daily(page, start: str, end: str, account_id: int,
+                         page_size: int = 200) -> list[dict]:
+    """快车创意报表**按天**取：一次请求覆盖整个区间，每行带 date + cost + 落地页 SKU。
+
+    关键词计划的花费只有创意维度才分得开（一个计划推多个 SKU）；isDaily=True 时
+    响应行里带 `date`（如 20261105），可以本地按天拆开存进按天库。
+    行上的 `skuId` 由 sku_from_creative 从落地页补（报表本身没有 skuId 字段）。
+    """
+    rows: list[dict] = []
+    pno = 1
+    while pno <= 30:
+        payload = {
+            "isDaily": True, "startDay": start, "endDay": end,
+            "clickOrOrderCaliber": 0, "clickOrOrderDay": 30, "giftFlag": 0,
+            "orderStatusCategory": 1, "filters": [], "pinIds": [int(account_id)],
+            "creativeTypes": [], "deliveryType": 0,
+            "columns": ["cost", "clicks", "impressions", "totalOrderCnt", "totalOrderSum"],
+            "obys": "cost|desc", "page": pno, "pageSize": page_size,
+        }
+        d = _post_report(page, AD_LIST_API, payload)
+        batch = ((d.get("data") or {}).get("datas") or [])
+        for r in batch:
+            # 关键词创意（campaignType=2）和同一批计划里的「商品定向」创意（如 28）都要解析：
+            # 后者的花费在账号总额里、却不在关键词报表里，不解析就只能永远算未归因
+            if not r.get("skuId"):
+                r["skuId"] = sku_from_creative(r)
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        pno += 1
+        _sleep(DELAY_PAGE)
+    return rows
+
+
 def list_goods(page, start: str, end: str, page_size: int = 100) -> list[dict]:
     rows: list[dict] = []
     idx = 1
@@ -778,28 +850,35 @@ def fetch_spend(page, start: str, end: str, account_id: int | None = None) -> di
         page.wait_for_timeout(6000)
     except Exception:  # noqa: BLE001
         pass
-    jst = jst_fetch(page, "sku", start, end)
+    # 每一路都单独兜错：某个产品线没开通/没权限（-301/-203）时，其余几路照样要出数，
+    # 不能因为一个报表没权限就把整次查询打挂（例：蛇吞象蔬菜只投全站智能推广，报表中心不可用）
+    src_errors: dict[str, str] = {}
+    jst: dict = {"rows": []}
+    try:
+        jst = jst_fetch(page, "sku", start, end)
+    except Exception as exc:  # noqa: BLE001
+        src_errors["智能投放"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     _sleep(DELAY_PAGE)
 
     creatives: list[dict] = []
     try:
         creatives = fetch_creative_rows(page, start, end, account_id)
-    except Exception:  # noqa: BLE001
-        creatives = []
+    except Exception as exc:  # noqa: BLE001
+        src_errors["关键词"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     _sleep(DELAY_PAGE)
 
     plans: list[dict] = []
     try:
         plans = fetch_msa_plans(page, start, end, account_id)
-    except Exception:  # noqa: BLE001
-        plans = []
+    except Exception as exc:  # noqa: BLE001
+        src_errors["计划级报表"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     _sleep(DELAY_PAGE)
 
     swa: list[dict] = []
     try:
         swa = fetch_swa_plans(page, start, end)
-    except Exception:  # noqa: BLE001
-        swa = []
+    except Exception as exc:  # noqa: BLE001
+        src_errors["全站营销"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     _sleep(DELAY_PAGE)
 
     # 推广管理页：关键词创意直接给 skuId；全站营销计划给「实际投放 SKU」
@@ -827,14 +906,141 @@ def fetch_spend(page, start: str, end: str, account_id: int | None = None) -> di
     except Exception:  # noqa: BLE001
         shop_delivery = {}
 
-    out = allocate(jst.get("rows") or [], creatives, plans, camps.get("rows") or [], swa,
-                   kw_skus=kw_skus, swa_delivery=swa_delivery, shop_delivery=shop_delivery)
+    out = allocate(jst.get("rows") or [], creatives, plans, camps.get("rows") or [],
+                   swa, kw_skus=kw_skus, swa_delivery=swa_delivery,
+                   shop_delivery=shop_delivery)
     ext = camps.get("ext") or {}
     try:
         out["totals"]["campaignTotal"] = round(float(ext.get("cost") or 0), 2)
     except (TypeError, ValueError):
         out["totals"]["campaignTotal"] = None
+    if src_errors:
+        out["totals"]["sourceErrors"] = src_errors
+        out["sourceErrors"] = src_errors
     return out
+
+
+# ================================================================ 全部账号
+CPS_ADD = ("payCommAmount", "preCommAmount", "clicks", "uv", "orderCnt", "orderGmv",
+           "payOrderCnt", "fiOrderCnt", "fiOrderGmv", "orderUserCnt")
+SPEND_ADD = ("jztCost", "jztJstCost", "jztShopCost", "jztKwCost", "jztSwaCost")
+
+
+def merge_all_blocks(blocks: dict[str, dict], mode: str, start: str, end: str) -> dict | None:
+    """把各账号的本地缓存合成「全部账号（总览）」。
+
+    - 花费/佣金等**可加字段相加**：一个 SKU 的花费只记在投放账号，不会重复；
+    - CPS 的比率列：预估佣金比例、下单转化率按合并后的金额重算；
+      付款佣金比例、ROI 各店口径不同（付款金额/花费分母拿不到），置空并在 warnings 里说明。
+    """
+    blocks = {k: v for k, v in (blocks or {}).items() if v}
+    if not blocks:
+        return None
+    labels = [v.get("accountLabel") or k for k, v in blocks.items()]
+    if mode == "spend":
+        agg: dict[int, dict] = {}
+        unattr: dict[str, dict] = {}
+        warnings: list[str] = []
+        for acc, d in blocks.items():
+            for r in d.get("rows") or []:
+                try:
+                    sid = int(r.get("skuId"))
+                except (TypeError, ValueError):
+                    continue
+                cur = agg.setdefault(sid, {"skuId": sid,
+                                           "itemName": r.get("itemName") or "",
+                                           "category": r.get("category") or "",
+                                           "jztJstCost": 0.0, "jztShopCost": 0.0,
+                                           "jztKwCost": 0.0, "jztSwaCost": 0.0,
+                                           "jztCost": 0.0})
+                for k in SPEND_ADD:
+                    cur[k] += float(r.get(k) or 0)
+                if not cur["itemName"]:
+                    cur["itemName"] = r.get("itemName") or ""
+                if not cur["category"]:
+                    cur["category"] = r.get("category") or ""
+            for u in (d.get("spend") or {}).get("unattrRows") or []:
+                key = str(u.get("key") or "other")
+                slot = unattr.setdefault(key, {"key": key, "name": u.get("name") or "未归因",
+                                               "cost": 0.0})
+                slot["cost"] += float(u.get("cost") or 0)
+            for w in (d.get("spend") or {}).get("warnings") or []:
+                if w not in warnings:
+                    warnings.append(w)
+        rows = []
+        for r in agg.values():
+            for k in SPEND_ADD:
+                r[k] = round(r[k], 2)
+            rows.append(r)
+        rows.sort(key=lambda r: -float(r.get("jztCost") or 0))
+        unattr_rows = sorted(({"key": k, "name": v["name"], "cost": round(v["cost"], 2)}
+                              for k, v in unattr.items() if abs(v["cost"]) >= 0.01),
+                             key=lambda x: -x["cost"])
+        # 未归因行（负 SKU）在表里也占一行，但合计里只算一次：按正 SKU 求和 + 未归因
+        pos = [r for r in rows if int(r.get("skuId") or 0) > 0]
+        totals = {k: round(sum(float(r.get(k) or 0) for r in pos), 2) for k in SPEND_ADD}
+        totals["unattr"] = round(sum(u["cost"] for u in unattr_rows), 2)
+        totals["skuCount"] = len(pos)
+        totals["total"] = round(totals["jztCost"] + totals["unattr"], 2)
+        spend = {"totals": totals, "unattrRows": unattr_rows, "warnings": warnings,
+                 "hints": {}}
+    else:
+        agg: dict[int, dict] = {}
+        daily: dict[str, dict] = {}
+        for acc, d in blocks.items():
+            for r in d.get("rows") or []:
+                try:
+                    sid = int(r.get("skuId"))
+                except (TypeError, ValueError):
+                    continue
+                cur = agg.setdefault(sid, {"skuId": sid, "itemName": r.get("itemName") or "",
+                                           "category": r.get("category") or "",
+                                           **{k: 0.0 for k in CPS_ADD}})
+                for k in CPS_ADD:
+                    cur[k] += float(r.get(k) or 0)
+                if not cur["itemName"]:
+                    cur["itemName"] = r.get("itemName") or ""
+            for day in d.get("daily") or []:
+                key = str(day.get("date") or "")
+                slot = daily.setdefault(key, {"date": key, "payCommAmount": 0.0,
+                                              "preCommAmount": 0.0, "clicks": 0,
+                                              "orderCnt": 0, "orderGmv": 0.0,
+                                              "fiOrderCnt": 0, "fiOrderGmv": 0.0, "roi": None})
+                for k in ("payCommAmount", "preCommAmount", "orderGmv", "fiOrderGmv"):
+                    slot[k] += float(day.get(k) or 0)
+                for k in ("clicks", "orderCnt", "fiOrderCnt"):
+                    slot[k] += int(day.get(k) or 0)
+        rows = []
+        for r in agg.values():
+            for k in CPS_ADD:
+                r[k] = (int(round(r[k])) if k in ("clicks", "uv", "orderCnt", "payOrderCnt",
+                                                  "fiOrderCnt", "orderUserCnt")
+                        else round(r[k], 2))
+            gmv = float(r["orderGmv"])
+            # 口径明确的两个比率才重算，付款佣金比例 / ROI 各店算法不同 → 留空
+            r["preCommRate"] = round(r["preCommAmount"] / gmv * 100, 2) if gmv else None
+            r["orderCvr"] = (round(r["orderCnt"] / r["uv"] * 100, 2)
+                             if r.get("uv") else None)
+            r["payCommRate"] = None
+            r["roi"] = None
+            rows.append(r)
+        rows.sort(key=lambda r: -float(r.get("payCommAmount") or 0))
+        daily_rows = [v for v in daily.values() if v.get("date")]
+        for v in daily_rows:
+            for k in ("payCommAmount", "preCommAmount", "orderGmv", "fiOrderGmv"):
+                v[k] = round(v[k], 2)
+        daily_rows.sort(key=lambda d: d["date"])
+    payload = {"jobId": f"all-{mode}-{start}_{end}", "mode": mode, "account": "all",
+               "accountLabel": "全部账号", "start": start, "end": end, "rows": rows,
+               "accounts": list(blocks.keys()), "accountLabels": labels,
+               "finishedAt": settings.now_iso()}
+    if mode == "spend":
+        payload["spend"] = spend
+    else:
+        payload["daily"] = daily_rows
+        payload["warnings"] = ["「全部账号」视图里 付款佣金比例 / ROI 不合并"
+                               "（各店分母口径不同），请看单个账号的表。"]
+    return payload
 
 
 # ================================================================ Excel
@@ -1151,6 +1357,13 @@ class PayCommRunner:
         if with_rows and data:
             state["rows"] = data.get("rows") or []
             state["mode"] = self.mode
+            # 「全部账号」部分命中：结果里带 partial / 缺失账号，前端先照出已有部分，
+            # 后台补抓继续跑，抓完再整体刷新一次
+            if data.get("partial"):
+                state["partial"] = True
+                state["missing"] = data.get("missing") or []
+            if data.get("warnings"):
+                state["warnings"] = data["warnings"]
             if self.mode == "cps":
                 state["daily"] = data.get("daily") or []
                 state["totalPay"] = round(sum((float(r.get("payCommAmount") or 0))
@@ -1159,7 +1372,100 @@ class PayCommRunner:
                 state["spend"] = data.get("spend") or {}
         return state
 
+    def all_payload(self, start: str, end: str, allow_missing: bool = False) -> dict | None:
+        """只用本地缓存拼「全部账号」。
+
+        allow_missing=False：所有账号都要有缓存，否则返回 None（交给 run_all 去补抓）；
+        allow_missing=True：缺的账号跳过，并在 warnings 里点名（有的账号确实没有这块数据）。
+        """
+        blocks: dict[str, dict] = {}
+        missing: list[str] = []
+        for a in settings.ACCOUNTS:
+            try:
+                d = self.cached_result(a["key"], start, end)
+            except Exception:  # noqa: BLE001
+                d = None
+            if d is None:
+                missing.append(a["key"])
+            else:
+                blocks[a["key"]] = d
+        if missing and not allow_missing:
+            return None
+        payload = merge_all_blocks(blocks, self.mode, start, end)
+        if payload:
+            payload["missing"] = missing
+            if missing:
+                labels = [settings.get_account(k).get("label") or k for k in missing]
+                payload.setdefault("warnings", []).append(
+                    f"以下账号没有该区间的{MODES[self.mode][2]}缓存，已跳过："
+                    f"{'、'.join(labels)}（可切到该账号单独抓一次）")
+        return payload
+
+    def run_all_background(self, start: str, end: str, note: str = "") -> dict:
+        """「全部账号」：逐账号读缓存，缺的就抓，最后合并成一张总览。"""
+        start, end = norm_range(start, end)
+        with self._lock:
+            if self._state.get("running"):
+                return {"ok": False, "error": f"已有{MODES[self.mode][2]}任务在运行，请等它结束"}
+            job_id = time.strftime("%Y%m%d%H%M%S") + "-" + self.mode + "-all"
+            self._cancel.clear()
+            self._state.update({
+                "running": True, "jobId": job_id, "account": "all", "range": [start, end],
+                "total": 0, "done": 0, "message": note or "正在检查各账号缓存…", "error": None,
+                "startedAt": settings.now_iso(), "finishedAt": None, "cancelled": False,
+                "cached": False,
+            })
+        t = threading.Thread(target=self._work_all, args=(job_id, start, end),
+                             name=f"paycomm-{self.mode}-all", daemon=True)
+        self._thread = t
+        t.start()
+        return {"ok": True, "jobId": job_id, "account": "all", "start": start, "end": end}
+
+    def _work_all(self, job_id: str, start: str, end: str) -> None:
+        try:
+            accs = list(settings.ACCOUNTS)
+            labels = {a["key"]: (a.get("label") or a["key"]) for a in accs}
+            keys = [a["key"] for a in accs]
+            for i, key in enumerate(keys, 1):
+                if self._cancel.is_set():
+                    break
+                if self.cached_result(key, start, end) is not None:
+                    self._set(running=True, account="all", jobId=job_id,
+                              message=f"[{i}/{len(keys)}] {labels.get(key, key)}：命中本地缓存")
+                    continue
+                self._set(running=True, account="all", jobId=job_id,
+                          message=f"[{i}/{len(keys)}] {labels.get(key, key)}：本地没有缓存，开始抓取…")
+                try:
+                    self._work(f"{job_id}-{key}", key, start, end)
+                except Exception as exc:  # noqa: BLE001
+                    self._set(running=True, account="all", jobId=job_id,
+                              message=f"{labels.get(key, key)} 抓取失败（{type(exc).__name__}），"
+                                      f"已跳过")
+                self._set(running=True, account="all", jobId=job_id)
+            if self._cancel.is_set():
+                self._set(running=False, cancelled=True, jobId=job_id, account="all",
+                          message="已取消，未生成总览", error=None)
+                return
+            payload = self.all_payload(start, end, allow_missing=True)
+            if not payload:
+                raise RuntimeError("各账号都没有该区间的可用缓存，无法合并总览")
+            payload["jobId"] = job_id
+            self._results[job_id] = payload
+            skip = len(payload.get("missing") or [])
+            self._set(running=False, cancelled=False, jobId=job_id, account="all",
+                      range=[start, end], cached=False, error=None,
+                      total=len(payload["rows"]), done=len(payload["rows"]),
+                      finishedAt=settings.now_iso(),
+                      message=(f"完成：全部账号 {len(payload['rows'])} 个 SKU，"
+                               f"{len(payload.get('accounts') or [])} 个账号的缓存已合并"
+                               + (f"（{skip} 个账号没有该区间数据，已跳过）" if skip else "")))
+        except Exception as exc:  # noqa: BLE001
+            self._set(running=False, error=f"{type(exc).__name__}: {exc}",
+                      finishedAt=settings.now_iso(), message=f"失败：{exc}")
+
     def run_background(self, account: str, start: str, end: str, note: str = "") -> dict:
+        if str(account).lower() == "all":
+            return self.run_all_background(start, end, note=note)
         start, end = norm_range(start, end)
         key = settings.get_account(account)["key"]
         with self._lock:
@@ -1191,7 +1497,9 @@ class PayCommRunner:
                dim: str = "sku") -> tuple[bytes, str] | None:
         """取结果的 Excel：优先按 (账号, 区间) 找缓存文件，其次内存 / jobId。"""
         data = None
-        if account and start and end:
+        if str(account or "").lower() == "all" and start and end:
+            data = self.all_payload(start, end)
+        if account and start and end and data is None:
             try:
                 data = self.cached_result(account, start, end)
             except Exception:  # noqa: BLE001
@@ -1236,7 +1544,7 @@ class PayCommRunner:
             data = json.loads(fp.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             return None
-        if not data.get("rows"):
+        if not data.get("rows") and not data.get("noSpend"):
             return None
         if self.mode == "spend" and int(data.get("schema") or 1) < SPEND_SCHEMA:
             # 旧口径（无全站营销、漏已删计划）当缓存未命中：文件保留不删，重抓一次即可
@@ -1570,7 +1878,16 @@ class PayCommRunner:
                              col: u.get("cost") or 0.0,
                              "jztCost": u.get("cost") or 0.0})
             rows.sort(key=lambda r: (r.get("jztCost") or -1), reverse=True)
-            say(f"京准通花费已取到 {len(rows)} 个 SKU", total=len(rows), done=len(rows))
+            errs = spend.get("sourceErrors") or {}
+            if errs:
+                spend["warnings"] = [
+                    f"{name} 取数失败（{msg}）——这一路按 0 计，其余几路正常；"
+                    f"常见原因：该账号没开通这个产品线/报表，或接口临时返回 -301"
+                    for name, msg in errs.items()]
+                say(f"京准通花费已取到 {len(rows)} 个 SKU"
+                    f"（{len(errs)} 路接口失败，已按 0 计）", total=len(rows), done=len(rows))
+            else:
+                say(f"京准通花费已取到 {len(rows)} 个 SKU", total=len(rows), done=len(rows))
             extra["spend"] = spend
         else:
             say("正在读取商品列表…")
@@ -1642,8 +1959,18 @@ class PayCommRunner:
                           message=f"已取消，未写入缓存（本次已取 {len(rows)} 个 SKU 作废）",
                           error=None)
                 return
+            # 0 花费不是错误：有些账号整月没投广告（例如只靠自然流量），
+            # 这时也要写一份「空表」缓存，页面显示 0，而不是每次查询都报错重抓。
+            no_spend = False
             if not rows:
-                raise RuntimeError("没有抓到任何 SKU 数据")
+                if self.mode == "spend":
+                    zero = abs(float((spend.get("totals") or {}).get("total") or 0)) < 0.01
+                else:
+                    zero = abs(sum(float(d.get("payCommAmount") or 0) for d in daily)) < 0.01
+                if zero:
+                    no_spend = True        # 该账号本来就没有这块花费：写空表，不当错误
+                else:
+                    raise RuntimeError("没有抓到任何 SKU 数据")
 
             sort_key = "jztCost" if self.mode == "spend" else "payCommAmount"
             rows.sort(key=lambda r: (r.get(sort_key) if r.get(sort_key) is not None else -1),
@@ -1651,7 +1978,7 @@ class PayCommRunner:
             label = settings.get_account(account).get("label") or account
 
             payload = {"jobId": job_id, "mode": self.mode, "account": account,
-                       "schema": SPEND_SCHEMA,
+                       "schema": SPEND_SCHEMA, "noSpend": no_spend,
                        "accountLabel": label, "start": start, "end": end, "rows": rows,
                        "finishedAt": settings.now_iso()}
             if self.mode == "spend":
@@ -1673,10 +2000,12 @@ class PayCommRunner:
             else:
                 total_pay = round(sum((float(r.get("payCommAmount") or 0)) for r in rows), 2)
                 detail = f"付款佣金合计 {total_pay:,.2f} 元"
+            done_msg = (f"完成：该区间没有任何花费数据（0 元），已写入本地缓存"
+                        if no_spend else
+                        f"完成：{len(rows)} 个 SKU，{detail}（已写入本地缓存）")
             self._set(running=False, cancelled=False, cached=False,
                       finishedAt=settings.now_iso(), total=len(rows), done=len(rows),
-                      message=f"完成：{len(rows)} 个 SKU，{detail}（已写入本地缓存）",
-                      error=None)
+                      message=done_msg, error=None)
         except Exception as exc:  # noqa: BLE001
             self._set(running=False, error=f"{type(exc).__name__}: {exc}",
                       finishedAt=settings.now_iso(), message=f"失败：{exc}")
@@ -1687,16 +2016,23 @@ def fetch_into_cache(page, mode: str, account: str, start: str, end: str,
     """借一个已打开的京准通页面，同步抓某区间花费并写成与「花费一览」相同的缓存文件。
 
     「月度利润分析」发现花费缓存缺失时直接调用它补齐，用户不必再去别的页面手动抓一次。
-    返回落盘的 payload；一个 SKU 都没抓到（该区间确实没有花费）则返回 None、不写盘。
+    返回落盘的 payload；京准通花费为 0 时写一份「空表」缓存（noSpend），
+    CPS 一个 SKU 都没抓到则返回 None、不写盘。
     """
     start, end = norm_range(start, end)
     key = settings.get_account(account)["key"]
     runner = PayCommRunner(mode)
     rows, extra = runner._collect(page, key, start, end, on_progress)
+    no_spend = False
     if not rows:
-        return None
+        spend = extra.get("spend") or {}
+        if mode == "spend" and abs(float((spend.get("totals") or {}).get("total") or 0)) < 0.01:
+            no_spend = True
+        else:
+            return None
     job_id = time.strftime("%Y%m%d%H%M%S") + "-" + mode + "-" + key
     payload = {"jobId": job_id, "mode": mode, "account": key, "schema": SPEND_SCHEMA,
+               "noSpend": no_spend,
                "accountLabel": settings.get_account(key).get("label") or key,
                "start": start, "end": end, "rows": rows,
                "finishedAt": settings.now_iso(), "autoFilled": True}

@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 
 from playwright.sync_api import BrowserContext
@@ -24,10 +25,12 @@ def _has_login_cookie(context: BrowserContext) -> bool:
 def main() -> int:
     account, _ = config.parse_account(sys.argv[1:])
     acc = config.get_account(account)
+    wait_sec = max(int(os.getenv("JD_LOGIN_WAIT_SEC", "180") or 180), 30)
     print("=" * 70)
-    print(f"京东扫码登录  ——  账号 [{acc.get('label')}] ({acc.get('key')})")
+    print(f"京东扫码 / 账号密码登录  ——  账号 [{acc.get('label')}] ({acc.get('key')})")
     print("=" * 70)
-    print("即将打开浏览器窗口，请在【3分钟内】用手机京东App扫码登录。")
+    print(f"即将打开浏览器窗口，请在这 {wait_sec // 60 or 1} 分钟内完成登录"
+          "（手机京东App扫码，或输账号密码并拖动滑块）。")
     print("登录成功后脚本会自动保存登录态并关闭浏览器。\n", flush=True)
 
     pw, context = launch_persistent(headless=False, account=account)
@@ -37,7 +40,7 @@ def main() -> int:
         print(f"已打开登录门户: {page.url}", flush=True)
         print("请在此窗口扫码或输入账号密码登录。\n", flush=True)
 
-        deadline_ms = 180_000
+        deadline_ms = wait_sec * 1000
         waited = 0
         step = 3000
         logged_in = False

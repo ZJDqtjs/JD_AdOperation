@@ -19,7 +19,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from . import config, settings, store
+from . import config, industry, settings, store
 
 # ---------------- 窗口定义 ----------------
 # 报表固定展示 3 期：w2 = 用户所选区间，w1/w0 = 等长的前两期（用于环比与趋势）
@@ -351,6 +351,8 @@ def _load_accounts(windows=None, accounts=None):
                 "sku": dstore.load_window(k, "jst_sku", s, e),
                 "sw": dstore.load_window(k, "jst_searchword", s, e),
                 "kw": dstore.load_window(k, "kw", s, e),
+                # 关键词创意按天（报表中心创意报表，带落地页 SKU）：SKU 表按它归因关键词花费
+                "kwad": dstore.load_window(k, "kw_ad", s, e),
                 "sz": _sz_rows(dstore.load_window(k, "sz_product", s, e)),
                 "flow": dstore.load_window(k, "sz_flow", s, e),
                 # 分时（列表行「趋势」）：只有夜间抓取时抓的「昨天」那天有数据
@@ -433,9 +435,34 @@ def type_split(accts):
 
 
 # ---------------- 按 SKU 交叉（跨账号合并广告 + 分店铺商智）----------------
+_SPU_MAP_CACHE: dict = {}
+
+
+def spu_sku_maps(accts) -> dict:
+    """{账号: {spuId: {"skus": [...], "names": {...}}}}：全站智能推广 SPU 下的**生效 SKU**。
+
+    153 计划按 SPU 投放，计划行上的 spuId 不是 skuId；SPU 下没被拉黑的 SKU 都在投，
+    所以 SPU 级花费要在这些 SKU 之间平分。映射由按天抓取时调
+    /dspad/smartmax/forbidden/list 落盘（data/<账号>/spu_skus.json）。
+    """
+    out = {}
+    for a in accts:
+        k = a["key"]
+        if k not in _SPU_MAP_CACHE:
+            blob = _load("spu_skus", k) or {}
+            _SPU_MAP_CACHE[k] = {
+                str(spu): {"skus": [str(x) for x in (v.get("skus") or [])],
+                           "names": {str(x): nm for x, nm in (v.get("names") or {}).items()}}
+                for spu, v in (blob.get("map") or {}).items()}
+        out[k] = _SPU_MAP_CACHE[k]
+    return out
+
+
 def sku_rows(accts, model, costs=None):
     costs = costs or {}
     units = settings.costs_unit_map()
+    spumap = spu_sku_maps(accts)
+    kwCost = {wk: defaultdict(float) for wk in WKEYS}   # 已归因的关键词花费（按 SKU）
     aggAd = {wk: defaultdict(lambda: {"cost": 0.0, "amt": 0.0, "ord": 0, "imp": 0,
                                       "clk": 0, "cart": 0, "byAcct": {}, "plans": set()})
              for wk in WKEYS}
@@ -465,23 +492,56 @@ def sku_rows(accts, model, costs=None):
                     ac["plans"].add(r["campaignName"])
                     t["plans"].add(r["campaignName"])
                     t["fromJst"] = True
-            # 全站智能推广（campaignType=153）不在智能投放报表里，但它自带 spuId=商智SKU，
-            # 用「一计划=一商品」的方式补进来，避免漏掉这部分花费
+            # 全站智能推广（campaignType=153）是按 **SPU** 投的：计划行上的 spuId 不是 skuId。
+            # 以前直接把它当 skuId 记账，等于把整个 SPU 的钱都算到「id 恰好等于 spuId」的那一个
+            # SKU 上（葫芦 SPU 只算了中果）。正确做法：SPU 下没被拉黑的 SKU 都在投，
+            # 花费在这些生效 SKU 之间平分（尾差给最后一个），黑名单里的不参与。
             for r in (w["jzt"] or {}).get("rows", []):
                 if _i(r.get("campaignType")) != 153:
                     continue
-                sid = str(r.get("spuId") or r.get("childProNo") or "").strip()
-                if not sid or sid == "0":
+                spu = str(r.get("spuId") or r.get("childProNo") or "").strip()
+                if not spu or spu == "0":
+                    continue
+                info = (spumap.get(k) or {}).get(spu) or {}
+                skus = [str(x) for x in (info.get("skus") or [])] or [spu]
+                c, am, o = _f(r.get("cost")), _f(r.get("totalOrderSum")), _i(r.get("totalOrderCnt"))
+                imp, clk, cart = (_i(r.get("impressions")), _i(r.get("clicks")),
+                                  _i(r.get("totalCartCnt")))
+                n = len(skus)
+                for i, sid in enumerate(skus):
+                    last = (i == n - 1)
+                    cc = round(c - round(c / n, 2) * (n - 1), 2) if last else round(c / n, 2)
+                    aa = round(am - round(am / n, 2) * (n - 1), 2) if last else round(am / n, 2)
+                    oo = o - int(o / n) * (n - 1) if last else int(o / n)
+                    t = aggAd[wk][sid]
+                    t["cost"] += cc
+                    t["amt"] += aa
+                    t["ord"] += oo
+                    t["imp"] += int(imp / n)
+                    t["clk"] += int(clk / n)
+                    t["cart"] += int(cart / n)
+                    t["fromPlan"] = True
+                    ac = t["byAcct"].setdefault(k, {"cost": 0.0, "amt": 0.0, "ord": 0, "plans": set()})
+                    ac["cost"] += cc
+                    ac["amt"] += aa
+                    ac["ord"] += oo
+                    if r.get("campaignName"):
+                        ac["plans"].add(r["campaignName"])
+                        t["plans"].add(r["campaignName"])
+            # 关键词计划：kw 报表只有「计划 + 词」，行里没有 skuId；创意报表（kw_ad）按创意
+            # 带落地页 SKU 和花费，这里直接按 SKU 加总。一个计划推多个 SKU 也能分开算；
+            # 解析不到 SKU 的创意不摊分，留在 meta.kwSpend「未归因」。
+            for r in (w["kwad"] or {}).get("rows", []):
+                sid = str(r.get("skuId") or "").strip()
+                if not sid or sid in ("0", "None") or not _f(r.get("cost")):
                     continue
                 t = aggAd[wk][sid]
                 c, am, o = _f(r.get("cost")), _f(r.get("totalOrderSum")), _i(r.get("totalOrderCnt"))
                 t["cost"] += c
                 t["amt"] += am
                 t["ord"] += o
-                t["imp"] += _i(r.get("impressions"))
-                t["clk"] += _i(r.get("clicks"))
-                t["cart"] += _i(r.get("totalCartCnt"))
-                t["fromPlan"] = True
+                t["fromKw"] = True
+                kwCost[wk][sid] += c
                 ac = t["byAcct"].setdefault(k, {"cost": 0.0, "amt": 0.0, "ord": 0, "plans": set()})
                 ac["cost"] += c
                 ac["amt"] += am
@@ -604,13 +664,32 @@ def sku_rows(accts, model, costs=None):
                           "amt": round(v["amt"], 2), "ord": v["ord"],
                           "roi": round(v["amt"] / v["cost"], 2) if v["cost"] else 0.0,
                           "plans": sorted(v["plans"])}
+        # 分账号 × 分窗口明细：SKU 图要能在卡片里切账号（而不是只能看服务器端
+        # 预先切好的「前 15 个」），所以把每个账号每个窗口的花费/成交/商智成交一起下发。
+        # shops 是该 SKU 在各店铺（账号）的商智成交额，渗透率按账号算时才分得开。
+        byAcctWins = {}
+        for wk in WKEYS:
+            shops = ((szMap[wk].get(sid) or {}).get("shops") or {})
+            for ak, v in ((aggAd[wk].get(sid) or {}).get("byAcct") or {}).items():
+                ac_cost, ac_amt = _f(v.get("cost")), _f(v.get("amt"))
+                ac_sz = _f(shops.get(ak))
+                ac_share = round(ac_amt / ac_sz * 100, 1) if ac_sz else None
+                byAcctWins.setdefault(ak, {})[wk] = {
+                    "cost": round(ac_cost, 2), "amt": round(ac_amt, 2),
+                    "ord": int(v.get("ord") or 0),
+                    "roi": round(ac_amt / ac_cost, 2) if ac_cost else 0.0,
+                    "szAmt": round(ac_sz, 2),
+                    "adShare": ac_share if (ac_share is not None and ac_share <= 110) else None,
+                }
         rows.append({
             "skuId": sid, "name": name, "img": szInfo.get("img"), "url": szInfo.get("url"),
             "aov": round(aovRef, 2), "margin": cost["margin"], "breakeven": cost["breakeven"],
             "grossPerOrder": cost["grossPerOrder"],
             "unitPrice": unit_price or round(aovRef, 2), "growLine": cost.get("growLine") or 0.0,
             "costSource": cost.get("costSource") or "store", "costParams": cost,
-            "wins": per, "est": est, "byAccount": byAcct,
+            "wins": per, "est": est, "byAccount": byAcct, "byAcctWins": byAcctWins,
+            # 已归因的关键词花费（快车关键词计划按创意 SKU 归到本商品的那部分）
+            "kwCost": {wk: round(kwCost[wk].get(sid, 0.0), 2) for wk in WKEYS},
             "shops": {labelOf.get(k2, k2): round(v, 2) for k2, v in (szInfo.get("shops") or {}).items()},
             "adAccounts": sorted((aggAd["w1"].get(sid, {}).get("byAcct") or {}).keys()),
             "fromPlan": bool((aggAd["w1"].get(sid) or aggAd["w2"].get(sid) or aggAd["w0"].get(sid) or {}).get("fromPlan")),
@@ -635,6 +714,27 @@ def sku_rows(accts, model, costs=None):
             no_ad.append(e)
     no_ad.sort(key=lambda x: -x["szAmt"])
     return rows, no_ad[:20]
+
+
+def _kw_spend_block(accts, skus) -> dict:
+    """关键词花费的归因体检：账号里关键词花了多少 / SKU 表认领了多少 / 差多少。
+
+    差额 = 未归因，通常是：一个关键词计划推多个 SKU（不摊分）、计划已删或已下线
+    （创意接口里查不到）、或该账号还没跑过抓取（没有 kw_sku_map）。
+    """
+    out = {}
+    for wk in WKEYS:
+        tot = 0.0
+        for a in accts:
+            for r in ((a["ds"]["wins"][wk].get("kw") or {}).get("rows") or []):
+                tot += _f(r.get("cost"))
+        attr = sum(_f((s.get("kwCost") or {}).get(wk)) for s in skus)
+        # 创意报表含已删除计划，可能比「关键词」报表略大；口径上取两者较大值，
+        # 否则会出现「已归因 > 总额」这种自相矛盾的展示
+        tot = max(tot, attr)
+        out[wk] = {"total": round(tot, 2), "attributed": round(attr, 2),
+                   "unattr": round(max(tot - attr, 0.0), 2)}
+    return out
 
 
 def _cost_coverage(skus: list, costs: dict) -> dict:
@@ -720,6 +820,7 @@ def plan_rows(accts, model, skus=None):
     而不是全店一条线；SKU 里查不到的部分才落回全店毛利率。返回 (out, beOfPlan)。"""
     marginOf = {s["skuId"]: _f(s.get("margin")) for s in (skus or [])}
     srcOf = {s["skuId"]: (s.get("costSource") or "store") for s in (skus or [])}
+    spumap = spu_sku_maps(accts)
     skuAmt = defaultdict(dict)        # (account, campaignId) -> {skuId: 成交额}
     planBe = {}
     out = []
@@ -737,10 +838,17 @@ def plan_rows(accts, model, skus=None):
                 if _i(r.get("campaignType")) != 153:
                     continue
                 cid = str(r.get("campaignId"))
-                sid = str(r.get("spuId") or r.get("childProNo") or "").strip()
-                if sid and sid != "0":
+                spu = str(r.get("spuId") or r.get("childProNo") or "").strip()
+                if not spu or spu == "0":
+                    continue
+                # 与 sku_rows 一致：SPU 级成交按生效 SKU 平分，否则计划保本线会只按 spuId
+                # 那一个 SKU 的毛利率算
+                info = (spumap.get(k) or {}).get(spu) or {}
+                members = [str(x) for x in (info.get("skus") or [])] or [spu]
+                amt = _f(r.get("totalOrderSum")) / len(members)
+                for sid in members:
                     e = skuAmt[(k, cid)].setdefault(sid, 0.0)
-                    skuAmt[(k, cid)][sid] = e + _f(r.get("totalOrderSum"))
+                    skuAmt[(k, cid)][sid] = e + amt
             for r in (w["jzt"] or {}).get("rows", []):
                 cid = str(r.get("campaignId"))
                 e = ids.setdefault(cid, {"campaignId": cid, "name": r.get("campaignName"),
@@ -1128,17 +1236,55 @@ def _judge(op, before, after, plan):
     return "待观察", f"调整后 ROI {before['roi']} → {after['roi']}"
 
 
+# 覆盖检查要看的数据源：广告（京准通概览）决定花费/成交，商智决定店铺成交与净利。
+# 以前只看 jzt_campaign，商智缺了半个月却不报警（雪莲果那类"商智总成交偏低"就是这么漏掉的）。
+COV_SOURCES = [("广告", "jzt_campaign"), ("商智", "sz_product")]
+
+
+def _compress_days(days: list[str]) -> str:
+    """['2026-10-01'…'2026-10-16'] → '10-01~10-16'；零散天用顿号连。"""
+    if not days:
+        return ""
+    ds = sorted(days)
+    spans: list[list[str]] = []
+    for d in ds:
+        if spans and (_plus_day(spans[-1][1]) == d):
+            spans[-1][1] = d
+        else:
+            spans.append([d, d])
+    parts = []
+    for a, b in spans:
+        parts.append(f"{a[5:]}~{b[5:]}" if a != b else a[5:])
+    return "、".join(parts)
+
+
+def _plus_day(day: str) -> str:
+    try:
+        return (_dt.date.fromisoformat(day) + _dt.timedelta(days=1)).isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
 def _coverage_block(active, wins):
-    """每个窗口实际有几天数据 —— 用于提示「区间里有空洞」。"""
+    """每个窗口、每个数据源实际有几天数据 —— 用于提示「区间里有空洞」。"""
     from . import dailystore as dstore
     out = {}
     for a in active:
         per = {}
         for wk, s, e, _lab in wins:
-            want = len(dstore.day_span(s, e))
-            jzt = dstore.load_window(a["key"], "jzt_campaign", s, e)
-            got = len(jzt.get("days", [])) if jzt else 0
-            per[wk] = {"want": want, "got": got, "complete": got >= want}
+            span = dstore.day_span(s, e)
+            want = len(span)
+            src = {}
+            for name, kind in COV_SOURCES:
+                w = dstore.load_window(a["key"], kind, s, e)
+                days = set((w or {}).get("days") or [])
+                miss = [d for d in span if d not in days]
+                src[name] = {"want": want, "got": len(span) - len(miss),
+                             "complete": not miss,
+                             "missing": _compress_days(miss)}
+            got = src["广告"]["got"]
+            per[wk] = {"want": want, "got": got, "complete": got >= want,
+                       "sources": src}
         out[a["key"]] = per
     return out
 
@@ -1525,8 +1671,9 @@ def build(start=None, end=None, windows=None, accounts=None):
     # 用它替代「全店一条线」做汇总文案，才不会把高毛利 SKU 的花费算成打平
     beBlend, marginBlend = blended_breakeven(
         [{"amt": s["wins"]["w1"]["amt"], "margin": s["margin"]} for s in skus])
+    kwSpend = _kw_spend_block(active, skus)
 
-    return {
+    out = {
         "meta": {
             "windows": [{"key": w[0], "start": w[1], "end": w[2], "label": w[3]} for w in wins],
             "range": {"start": win2[1], "end": win2[2]},
@@ -1536,14 +1683,19 @@ def build(start=None, end=None, windows=None, accounts=None):
             "growFactor": GROW_FACTOR,
             "costSource": dict(settings.COSTS_SOURCE or {}),
             "costCoverage": _cost_coverage(skus, costs),
+            "kwSpend": kwSpend,
             "costUpdatedAt": costs.get("updatedAt") or "",
             "caliber": ("广告=京准通概览(点击15天/成交订单口径)；智能投放=智能投放报表；"
                         "商智=各店铺成交口径；商智客单价为真实值，产品成本按 Excel 成本率等比推算"),
-            "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"]} for a in active],
+            "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"]} for a in accts],
             "generatedAt": settings.now_str("%Y-%m-%d %H:%M"),
         },
+        # 账号列表按「配置里的全部账号」给，不再只给有数据的：新增/新登录的账号在
+        # 抓数之前不该从报表里整行消失（原来会，看着就像"只有两个号"）。
+        # 无数据账号的 totals 用空结构，页面照常出一行 0，可一眼看出是没抓数。
         "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"],
-                      "totals": totals[a["key"]]} for a in active],
+                      "hasData": a["hasData"],
+                      "totals": totals.get(a["key"]) or account_totals(a)} for a in accts],
         "plans": plans,
         "skus": skus,
         "noAd": no_ad,
@@ -1560,6 +1712,11 @@ def build(start=None, end=None, windows=None, accounts=None):
         "runtime": {"generatedAt": settings.now_str("%Y-%m-%d %H:%M:%S")},
         "advice": advice,
     }
+    # 行业大盘只读本地缓存；自动补齐由 webapp 在渲染报表前起后台任务，
+    # 这里绝不在分析过程中请求京东，保证 /api/analysis、夜间任务、测试都可离线跑。
+    out["meta"]["caliber"] += "；行业大盘=京准通数据中心指数化口径（只对比率，不与金额相加）"
+    out["industry"] = industry.collect(out)
+    return out
 
 
 def analyze(start=None, end=None, accounts=None, out_path=None):
