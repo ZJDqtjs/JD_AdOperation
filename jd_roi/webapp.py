@@ -3050,11 +3050,65 @@ function load(acc, s, e){
         msg('已读取本地商智明细（未请求京东）。点任意商品看逐日价格曲线。');
       }
       render(); kpis(); cover();
+      loadRt(acc);
       loadSnap(acc);
       history.replaceState(null, '', location.pathname + '?account=' + encodeURIComponent(acc)
         + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e));
     })
-    .catch(function(err){ msg('读取失败：' + err, true); loadSnap(acc); });
+    .catch(function(err){ msg('读取失败：' + err, true); loadRt(acc); loadSnap(acc); });
+}
+
+/* 今日实时：商智 realtime 口径（今天 00:00 到此刻，对比昨天同一时刻） */
+function loadRt(acc){
+  var m = $('pwRtMsg'), box = $('pwRtBody');
+  if(!m || !box) return;
+  m.textContent = '读取今日实时…';
+  box.innerHTML = '';
+  fetch('/api/price/realtime?account=' + encodeURIComponent(acc || $('pwAcc').value),
+        {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ m.textContent = j.error || '今天还没有实时数据'; return; }
+      var diff = '';
+      var a = num(j.avgPrice), b = num(j.cmpAvgPrice);
+      if(a !== null && b){
+        var p = (a - b) / b * 100;
+        var cls = p > 0.05 ? 'up' : (p < -0.05 ? 'down' : 'flat');
+        diff = '（昨日同刻 ' + money(b) + '，<span class="' + cls + '">'
+             + (p > 0 ? '↑' : (p < 0 ? '↓' : '·')) + ' ' + fx(Math.abs(p), 2) + '%</span>）';
+      }
+      m.innerHTML = '截至 <b>' + esc(j.at || '—') + '</b>'
+        + '　成交 <b>' + cnt(j.qty) + '</b> 件 / ' + money(j.amt)
+        + '　全店均价 <b>' + money(j.avgPrice) + '</b>' + diff
+        + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>';
+      var list = (j.rows || []).filter(function(r){
+        var n = num(r.changePct);
+        return n !== null && Math.abs(n) >= 2 && num(r.qty) >= 3;
+      });
+      list.sort(function(a2, b2){
+        return Math.abs(num(b2.changePct)) - Math.abs(num(a2.changePct));
+      });
+      list = list.slice(0, 5);
+      if(!list.length){
+        box.innerHTML = '<div class="pwsub">今天还没有「变动 ≥2% 且 ≥3 件」的 SKU。</div>';
+        return;
+      }
+      box.innerHTML = '<div class="tblwrap short" style="margin-top:10px"><table><thead><tr>'
+        + '<th class="l noSort">商品（今天变动最大的 ' + list.length + ' 个）</th>'
+        + '<th class="n noSort">今日前台价</th><th class="n noSort">昨日同刻</th>'
+        + '<th class="n noSort">变动</th><th class="n noSort">今日件数</th></tr></thead><tbody>'
+        + list.map(function(r){
+            return '<tr class="pwrow" data-sku="' + esc(r.skuId)
+              + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
+              + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">'
+              + esc(r.itemName || r.skuId) + '</div>'
+              + '<div class="id">' + esc(r.skuId) + '</div></td>'
+              + '<td>' + money(r.price) + '</td><td>' + money(r.cmpPrice) + '</td>'
+              + '<td>' + pctCell(r.changePct, '') + '</td><td>' + cnt(r.qty) + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    })
+    .catch(function(){ m.textContent = '读取今日实时失败'; });
 }
 
 /* 夜间自动核算：每天凌晨抓完数据后由服务端算好落盘，这里只读结果做摘要 */
@@ -3149,6 +3203,37 @@ window.PW = {
     window.PW.pick(tr);
   },
   render: render,
+  /* 立刻抓一次今日实时（只抓商智这一个报表） */
+  rtFetch: function(){
+    var m = $('pwRtMsg');
+    if(m) m.textContent = '正在抓取今日实时（需要浏览器登录态，约 1 分钟）…';
+    fetch('/api/price/realtime/fetch', {method:'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){ if(m) m.textContent = '刷新失败：' + (j.error || ''); return; }
+        (function wait(n){
+          if(n <= 0){ if(m) m.textContent = '刷新超时，稍后再试一次'; return; }
+          setTimeout(function(){
+            fetch('/api/run/status', {cache:'no-store'})
+              .then(function(r){ return r.json(); })
+              .then(function(s){
+                if(s.active){
+                  if(m) m.textContent = '刷新中：' + (s.progress || '');
+                  wait(n - 1);
+                  return;
+                }
+                if(s.error){
+                  if(m) m.textContent = '刷新失败：' + String(s.error).slice(0, 160);
+                  return;
+                }
+                loadRt($('pwAcc').value);
+              })
+              .catch(function(){ wait(n - 1); });
+          }, 3000);
+        })(40);
+      })
+      .catch(function(err){ if(m) m.textContent = '刷新失败：' + err; });
+  },
   /* 按本地现有数据立刻重算一次核算（补完商智后不用等夜里） */
   snapRun: function(){
     var m = $('pwAutoMsg');
@@ -3282,6 +3367,14 @@ def price_page(request: Request):
   <div class="pwcover" id="pwCover"></div>
 </div>
 
+<div class="card" id="pwRtCard" style="margin-top:18px">
+  <h2>今日实时 <span class="tagline">商智实时口径 · 对比昨天同一时刻</span>
+    <button class="btn sec mini" style="margin-left:auto" onclick="PW.rtFetch()"
+            title="立刻抓一次今天的商智实时商品明细（只抓这一个报表）">刷新今日实时</button></h2>
+  <div class="hint" id="pwRtMsg" style="margin-bottom:0">读取今日实时…</div>
+  <div id="pwRtBody"></div>
+</div>
+
 <div class="card" id="pwAutoCard" style="margin-top:18px">
   <h2>夜间自动核算 <span class="tagline">每天凌晨抓完昨天数据后自动生成</span>
     <button class="btn sec mini" style="margin-left:auto" onclick="PW.snapRun()"
@@ -3327,6 +3420,10 @@ def price_page(request: Request):
      因为商智 T+1 只出一半、T+2~T+3 才定稿，每次会把最近 3 个有数据的日子一起重算覆盖。
      凌晨抓「昨天」时商智常常还没出数（0 行），白天 08:00~23:00 会每小时自动只补商智，
      补到就立刻重算，任务日志里能看到「商智补抓」「前台价已核算 &lt;日期&gt;」。</p>
+  <p><b>今日实时</b>：商智「商品明细 → 实时」能给当天 00:00 到此刻的按 SKU 成交，
+     页面白天每 30 分钟自动刷新一次（也可点「刷新今日实时」）。因为今天还没结束，
+     对比用的是<b>昨天同一时刻</b>而不是昨天全天，避免「今天只过了一半」的误判；
+     数字会随白天继续成交变化，只看趋势，不要当成最终价。</p>
 </div>
 
 </div>
@@ -3383,6 +3480,40 @@ def api_price_snapshot_run(account: str | None = None):
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return {"ok": True, "done": done,
             "errors": [x for x in done if x.get("error")]}
+
+
+@app.get("/api/price/realtime")
+def api_price_realtime(account: str | None = None):
+    """今日实时前台价（商智 realtime 口径，对比昨天同一时刻），读本地快照。"""
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = account or settings.MAIN_ACCOUNT
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    snap = pricewatch.realtime_snapshot(acc)
+    if not snap:
+        return JSONResponse(
+            {"ok": False, "empty": True,
+             "error": "今天还没有实时数据：白天每 "
+                      f"{max(settings.SZ_RT_INTERVAL // 60, 1)} 分钟自动刷新一次，"
+                      "也可点右上角「刷新今日实时」"},
+            headers={"Cache-Control": "no-store"})
+    return JSONResponse({"ok": True, **snap}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/price/realtime/fetch")
+def api_price_realtime_fetch(account: str | None = None):
+    """立刻抓一次今日实时商品明细（只抓 sz_product_rt，需要浏览器登录态）。"""
+    accs = [settings.get_account(account)] if account else settings.ACCOUNTS
+    info = scrape_day.lock_info()
+    if info.get("locked") and info.get("alive"):
+        return {"ok": False, "error": "正在执行其它抓取任务，等它结束再刷新"}
+    today = ds.today().isoformat()
+    try:
+        return scrape_day.run_background(accs, today, today, force=True,
+                                         kinds=["sz_product_rt"],
+                                         name="sz-realtime", trigger="manual")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
 
 
 @app.post("/api/price/backfill")
@@ -5168,18 +5299,35 @@ def _after_sz_retry(summary: dict) -> None:
 
 
 def _sz_retry_loop() -> None:
-    """白天补商智：只在 08:00~23:00、两次尝试至少间隔 1 小时、且确实还有 0 行天才发请求。
+    """白天维护商智数据（只在 08:00~23:00，且没有别的任务在跑时）：
 
-    请求量很小（每个账号 sz_product + sz_flow 各一次），不走整轮夜间抓取，
-    避免为了一个空天把京准通那堆报表重抓一遍。
+    ① 今日实时：按 SZ_RT_INTERVAL 刷新 sz_product_rt，前台价页「今日实时」卡片用；
+    ② 0 行天补抓：凌晨抓「昨天」时商智常还没出数，补上后重算前台价。
     """
     while True:
         time.sleep(300)
         try:
-            if not settings.SZ_RETRY_ENABLED:
+            if not (settings.SZ_RETRY_ENABLED or settings.SZ_RT_ENABLED):
                 continue
             now = dt_now()
             if not (settings.SZ_RETRY_START_HOUR <= now.hour <= settings.SZ_RETRY_END_HOUR):
+                continue
+            if scrape_day.is_running():
+                continue
+            # ① 今日实时（每账号 1 个请求）
+            if (settings.SZ_RT_ENABLED
+                    and time.time() - _sz_retry_state.get("rt_at", 0.0)
+                    >= settings.SZ_RT_INTERVAL):
+                _sz_retry_state["rt_at"] = time.time()
+                today = ds.today().isoformat()
+                res = scrape_day.run_background(
+                    settings.ACCOUNTS, today, today, force=True, kinds=["sz_product_rt"],
+                    log=_log_progress, name="sz-realtime", trigger="schedule")
+                if not res.get("ok"):
+                    _log_progress(f"今日实时刷新未启动：{res.get('error')}")
+                continue          # 与下面的补抓分开跑，别抢同一把锁
+            # ② 0 行天补抓
+            if not settings.SZ_RETRY_ENABLED:
                 continue
             if time.time() - _sz_retry_state["last"] < settings.SZ_RETRY_INTERVAL:
                 continue

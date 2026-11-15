@@ -114,6 +114,27 @@ def _base(start, end, cstart, cend, brands, cates, extra=None):
     return p
 
 
+def realtime_payload(brands, cates, now=None):
+    """商智「商品明细 → 实时」的参数：今天 00:00 到此刻，对比昨天同一时刻。
+
+    页面上的「实时」就是这个口径（dateType=todayRealtime / interval=SECOND），
+    返回的每行还带 `##compareValue`（昨天同刻的值），可以算同刻价格对比。
+    """
+    import datetime as _dt
+
+    now = now or _dt.datetime.now()
+    d0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    y0 = d0 - _dt.timedelta(days=1)
+    ynow = now - _dt.timedelta(days=1)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return {
+        "realtime": True, "interval": "SECOND", "dateType": "todayRealtime",
+        "startDate": d0.strftime(fmt), "endDate": now.strftime(fmt),
+        "compareStartDate": y0.strftime(fmt), "compareEndDate": ynow.strftime(fmt),
+        "compareType": "hb", "bsBrand": brands, "bsCate3": cates, "channel": "all",
+    }
+
+
 def main() -> int:
     account, args = config.parse_account(sys.argv[1:])
     kind = args[0] if len(args) > 0 else "product"

@@ -34,6 +34,10 @@ KINDS = ["jzt_campaign", "jst_campaign", "jst_sku", "jst_searchword", "kw", "kw_
 # 「可选」数据源：不是每天都能/都需要抓（分时只在夜间随抓取跑一次、只抓昨天）。
 # `_day_complete` 判定「这天抓全了没」时会忽略它们，否则历史天永远算「不完整」。
 # kw_ad 是「关键词创意按天花费」（一次区间请求拆成多天），老数据的缺失不该让整天算未完成。
+#
+# 注意：当日实时快照（sz_product_rt）**故意不列在 KINDS 里**。它是「今天 00:00 到此刻」
+# 的口径，跟 day 参数无关；如果混进 KINDS，夜间 kinds=None 时会给区间里每一天都抓一遍，
+# 反而把每天的文件都写成今天的数据。它只由显式 kinds=["sz_product_rt"] 触发。
 OPTIONAL_KINDS = {"hourly", "kw_ad"}
 
 # 广告类报表可相加的字段

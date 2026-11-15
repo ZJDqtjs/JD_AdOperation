@@ -187,6 +187,10 @@ SZ_RETRY_START_HOUR = _env_int("JD_SZ_RETRY_START_HOUR", 8)
 SZ_RETRY_END_HOUR = _env_int("JD_SZ_RETRY_END_HOUR", 23)
 SZ_RETRY_INTERVAL = _env_int("JD_SZ_RETRY_INTERVAL", 3600)      # 秒
 SZ_RETRY_LOOKBACK = _env_int("JD_SZ_RETRY_LOOKBACK", 3)         # 只看最近几天
+# 今日实时：商智「商品明细 → 实时」能拿到当天 00:00 到此刻（按 SKU），
+# 白天按这个间隔刷新一次，前台价页「今日实时」卡片用它（每账号 1 个请求）。
+SZ_RT_ENABLED = _env_bool("JD_SZ_RT", True)
+SZ_RT_INTERVAL = _env_int("JD_SZ_RT_INTERVAL", 1800)            # 秒（默认 30 分钟）
 
 # ---------------- 抓取 ----------------
 HEADLESS = _env_bool("JD_HEADLESS", True)

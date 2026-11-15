@@ -28,7 +28,8 @@ from .browser import has_login, launch_profile, session_ok
 from .scrape_jst_report import API as JST_API, COLS_ACCOUNT, COLS_SW
 from .scrape_jzt import CAMPAIGN_API, CUSTOM_COLUMNS
 from .scrape_keyword import COLUMNS as KW_COLS, KEYWORD_API
-from .scrape_sz import INDICATORS, SzSession, URL_CORE, URL_FLOWSRC, URL_PRODUCT, _base
+from .scrape_sz import (INDICATORS, SzSession, URL_CORE, URL_FLOWSRC, URL_PRODUCT,
+                        _base, realtime_payload)
 from .scrape_target import fetch_area_days, fetch_crowd_days
 from .scrape_trend import fetch_hourly_day
 
@@ -559,7 +560,8 @@ class SzFetcher:
             except Exception:  # noqa: BLE001
                 pass
         page = self.context.new_page()
-        s = SzSession(page, self.kind)
+        # rt（当天实时）用的也是商品明细页，只是参数换成 todayRealtime
+        s = SzSession(page, "flow" if self.kind == "flow" else "product")
         s.capture(wait_ms=settings.SZ_CAPTURE_WAIT)
         self.page, self.sess = page, s
         return s
@@ -581,6 +583,16 @@ class SzFetcher:
                     if code == 0 and data:
                         return {"core": data, "source": (src.get("body") or {}).get("data") or [],
                                 "rawCode": 0, "dateStart": day, "dateEnd": day}
+                elif self.kind == "rt":
+                    d = s.post(URL_PRODUCT, dict(realtime_payload(s.brands, s.cates),
+                                                 proType="sku", indicators=INDICATORS,
+                                                 onlyAttention=False))
+                    code = (d.get("header") or {}).get("code")
+                    rows = (d.get("body") or {}).get("data") or []
+                    if code == 0 and rows:
+                        return {"rows": rows, "code": code, "realtime": True,
+                                "at": settings.now_str("%H:%M:%S"),
+                                "dateStart": day, "dateEnd": day}
                 else:
                     d = s.post(URL_PRODUCT, dict(base, proType="sku", indicators=INDICATORS,
                                                  onlyAttention=False))
@@ -595,6 +607,9 @@ class SzFetcher:
         # 三天都拿不到：返回空，但仍落盘（避免每次重抓）
         if self.kind == "flow":
             return {"core": [], "source": [], "rawCode": -1, "dateStart": day, "dateEnd": day}
+        if self.kind == "rt":
+            return {"rows": [], "code": -1, "realtime": True,
+                    "at": settings.now_str("%H:%M:%S"), "dateStart": day, "dateEnd": day}
         return {"rows": [], "code": -1, "dateStart": day, "dateEnd": day}
 
     def close(self):
@@ -850,14 +865,15 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                             acc_sum["errors"].append(f"hourly@{day}: {exc}")
                             log(f"[{label}] 分时 {day} 失败：{exc}")
 
-                    for kind in ("sz_product", "sz_flow"):
+                    for kind in ("sz_product", "sz_flow", "sz_product_rt"):
                         if kind not in kinds:
                             continue
                         # 最近 N 天的商智一律重抓（成交在回补），老天才按「有数据就跳过」
                         if not force and day not in sz_recent and _has_good_day(key, day, kind):
                             continue
                         if kind not in sz:
-                            sz[kind] = SzFetcher(context, "flow" if kind == "sz_flow" else "product")
+                            sz[kind] = SzFetcher(context, {
+                                "sz_flow": "flow", "sz_product_rt": "rt"}.get(kind, "product"))
                         try:
                             payload = sz[kind].fetch(day)
                             # 三次都失败时 fetch() 会返回空 rows/core；此时绝不能覆盖已有的好数据

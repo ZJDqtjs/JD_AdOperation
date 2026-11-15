@@ -242,6 +242,62 @@ def latest_snapshot(account: str):
         return None
 
 
+# ---------------------------------------------------------------- 今日实时
+# 商智「商品明细 → 实时」能拿当天 00:00 到此刻、且每行带 `##compareValue`
+# （昨天同一时刻的值）。用这两个数算前台价再对比，就是同刻口径 —— 不受
+# 「今天才过了一半」影响，比拿今天的均价去比昨天全天要靠谱。
+def realtime_snapshot(account: str, day: str | None = None):
+    """读今天（或指定日）的 sz_product_rt 快照，算逐 SKU 前台价与昨日同刻对比。"""
+    day = ds.norm_day(day or ds.today())
+    payload = ds.load_day(account, day, "sz_product_rt")
+    if not payload:
+        return None
+    rows = []
+    for r in payload.get("rows") or []:
+        if r.get("$summary"):
+            continue
+        sid = str(r.get("sku_id") or "").strip()
+        if not sid or sid == "合计":
+            continue
+        amt = _f(r.get(SZ_AMT))
+        qty = _f(r.get(SZ_QTY))
+        camt = _f(r.get(SZ_AMT + "##compareValue"))
+        cqty = _f(r.get(SZ_QTY + "##compareValue"))
+        price = _price(amt, qty)
+        if price is None:
+            continue
+        cmp_price = _price(camt, cqty)
+        rows.append({
+            "skuId": sid, "itemName": r.get("name") or "",
+            "price": price, "cmpPrice": cmp_price,
+            "changePct": _pct(price, cmp_price),
+            "amt": round(amt, 2), "qty": int(qty),
+            "cmpAmt": round(camt, 2), "cmpQty": int(cqty),
+        })
+    if not rows:
+        return None
+    amt = sum(x["amt"] for x in rows)
+    qty = sum(x["qty"] for x in rows)
+    camt = sum(x["cmpAmt"] for x in rows)
+    cqty = sum(x["cmpQty"] for x in rows)
+    up = sum(1 for x in rows if (x["changePct"] or 0) > 0.5)
+    down = sum(1 for x in rows if (x["changePct"] or 0) < -0.5)
+    return {
+        "account": account,
+        "label": settings.get_account(account).get("label") or account,
+        "day": day,
+        "at": payload.get("at") or "",
+        "generatedAt": settings.now_iso(),
+        "skuCount": len(rows),
+        "up": up, "down": down,
+        "amt": round(amt, 2), "qty": int(qty),
+        "cmpAmt": round(camt, 2), "cmpQty": int(cqty),
+        "avgPrice": _price(amt, qty),
+        "cmpAvgPrice": _price(camt, cqty),
+        "rows": rows,
+    }
+
+
 def run_nightly(accounts=None, days_back: int = 3, log=None) -> list:
     """夜间抓取成功后调用：核算最近几个「有商智数据」的日前台价并落盘。
 
