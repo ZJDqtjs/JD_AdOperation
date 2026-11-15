@@ -3300,7 +3300,8 @@ def price_page(request: Request):
   <p><b>夜间自动核算</b>：每天凌晨抓完昨天的商智数据后，服务端会把那一天的逐 SKU 前台价
      （以及相对各自上一个有价日的变动）算好存一份，就是顶部「夜间自动核算」卡片；
      因为商智 T+1 只出一半、T+2~T+3 才定稿，每次会把最近 3 个有数据的日子一起重算覆盖。
-     任务日志里能看到「前台价已核算 &lt;日期&gt;」。</p>
+     凌晨抓「昨天」时商智常常还没出数（0 行），白天 08:00~23:00 会每小时自动只补商智，
+     补到就立刻重算，任务日志里能看到「商智补抓」「前台价已核算 &lt;日期&gt;」。</p>
 </div>
 
 </div>
@@ -5089,6 +5090,60 @@ def _scheduler_tick():
 _sched_lock = threading.Lock()
 _sched_state = {}
 
+# 商智「昨天」的商品明细在凌晨 1 点还没出数（接口成功但 0 行），
+# 而夜间任务只跑一次 → 前台价会一直停在两天前。这里白天定时只补商智。
+_sz_retry_state = {"last": 0.0}
+
+
+def _sz_retry_days() -> list:
+    """最近几天里「商智商品明细还没文件 / 0 行」的天（不算今天）。"""
+    today = _today()
+    out = set()
+    for a in settings.ACCOUNTS:
+        for i in range(1, max(settings.SZ_RETRY_LOOKBACK, 1) + 1):
+            day = (today - dt.timedelta(days=i)).isoformat()
+            if ds.payload_rows(ds.load_day(a["key"], day, "sz_product")) == 0:
+                out.add(day)
+    return sorted(out)
+
+
+def _after_sz_retry(summary: dict) -> None:
+    """补到商智数据后重算一次前台价（页面「夜间自动核算」卡片跟着更新）。"""
+    if summary.get("cancelled"):
+        return
+    _price_snapshot()
+
+
+def _sz_retry_loop() -> None:
+    """白天补商智：只在 08:00~23:00、两次尝试至少间隔 1 小时、且确实还有 0 行天才发请求。
+
+    请求量很小（每个账号 sz_product + sz_flow 各一次），不走整轮夜间抓取，
+    避免为了一个空天把京准通那堆报表重抓一遍。
+    """
+    while True:
+        time.sleep(300)
+        try:
+            if not settings.SZ_RETRY_ENABLED:
+                continue
+            now = dt_now()
+            if not (settings.SZ_RETRY_START_HOUR <= now.hour <= settings.SZ_RETRY_END_HOUR):
+                continue
+            if time.time() - _sz_retry_state["last"] < settings.SZ_RETRY_INTERVAL:
+                continue
+            days = _sz_retry_days()
+            if not days:
+                continue
+            _sz_retry_state["last"] = time.time()
+            _log_progress(f"商智补抓：{days[0]} ~ {days[-1]} 仍是 0 行，只补商智商品/流量")
+            res = scrape_day.run_background(
+                settings.ACCOUNTS, days[0], days[-1], kinds=["sz_product", "sz_flow"],
+                log=_log_progress, name="sz-retry", trigger="schedule",
+                after=_after_sz_retry)
+            if not res.get("ok"):
+                _log_progress(f"商智补抓未启动：{res.get('error')}")
+        except Exception as exc:  # noqa: BLE001
+            _log_progress(f"商智补抓异常：{type(exc).__name__}: {exc}")
+
 
 @app.on_event("startup")
 def _startup():
@@ -5115,6 +5170,11 @@ def _startup():
                   f"（{settings.TZ}）｜今天实际 { _t.strftime('%H:%M') }", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[webapp] 调度启动失败：{exc}", flush=True)
+        if settings.SZ_RETRY_ENABLED:
+            threading.Thread(target=_sz_retry_loop, name="sz-retry", daemon=True).start()
+            print("[webapp] 商智补抓已启动：白天每 "
+                  f"{max(settings.SZ_RETRY_INTERVAL // 60, 1)} 分钟检查一次「0 行天」",
+                  flush=True)
     if settings.RUN_ON_START:
         rng = scrape_day.catchup_range()
         if rng is not None:

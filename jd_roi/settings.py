@@ -180,6 +180,13 @@ REFRESH_DAYS = _env_int("JD_REFRESH_DAYS", 15)
 RUN_ON_START = _env_bool("JD_RUN_ON_START", True)
 # 停机后补数据的上限天数（防止一次补一年）
 MAX_BACKFILL_DAYS = _env_int("JD_MAX_BACKFILL_DAYS", 120)
+# 商智「昨天」的商品明细凌晨 1 点还没出，接口会「成功但 0 行」。白天定时只补商智：
+# 只在 08:00~23:00 之间、最近 3 天仍有 0 行天时尝试，两次尝试至少间隔 1 小时。
+SZ_RETRY_ENABLED = _env_bool("JD_SZ_RETRY", True)
+SZ_RETRY_START_HOUR = _env_int("JD_SZ_RETRY_START_HOUR", 8)
+SZ_RETRY_END_HOUR = _env_int("JD_SZ_RETRY_END_HOUR", 23)
+SZ_RETRY_INTERVAL = _env_int("JD_SZ_RETRY_INTERVAL", 3600)      # 秒
+SZ_RETRY_LOOKBACK = _env_int("JD_SZ_RETRY_LOOKBACK", 3)         # 只看最近几天
 
 # ---------------- 抓取 ----------------
 HEADLESS = _env_bool("JD_HEADLESS", True)
