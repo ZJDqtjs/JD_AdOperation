@@ -247,6 +247,7 @@ def run_nightly(accounts=None, days_back: int = 3, log=None) -> list:
 
     算的不只是最新一天：商智 T+1 只有一半、T+2~T+3 才定稿，夜里会回刷最近 15 天，
     所以把最近 3 个有数据的天一起重算覆盖，历史那两天会逐步修正成定稿值。
+    单天失败只跳过那一天，不影响其它账号/其它天（返回值里带 error）。
     """
     out = []
     for acc in (accounts or settings.ACCOUNTS):
@@ -256,8 +257,15 @@ def run_nightly(accounts=None, days_back: int = 3, log=None) -> list:
         days = [d for d in recent
                 if ds.payload_rows(ds.load_day(key, d, "sz_product")) > 0][-max(days_back, 1):]
         for day in days:
-            snap = snapshot(key, day)
-            save_snapshot(snap)
+            try:
+                snap = snapshot(key, day)
+                save_snapshot(snap)
+            except Exception as exc:  # noqa: BLE001  单天失败别拖垮整轮
+                if log:
+                    log(f"[{key}] 前台价核算失败 {day}：{type(exc).__name__}: {exc}")
+                out.append({"account": key, "label": key, "day": day,
+                            "error": f"{type(exc).__name__}: {exc}"})
+                continue
             if log:
                 log(f"[{snap['label']}] 前台价已核算 {day}：{snap['skuCount']} 个 SKU"
                     f"（涨 {snap['up']} / 跌 {snap['down']}）")

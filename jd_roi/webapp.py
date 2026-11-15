@@ -3038,7 +3038,8 @@ function load(acc, s, e){
   LAST = null; ROWS = []; DAYS = []; TOT = {}; clearDetail();
   $('pwKpis').style.display = 'none';
   fetch(API + '?account=' + encodeURIComponent(acc)
-        + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e))
+        + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e),
+        {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(j){
       if(!j.ok){ msg(j.error || '读取失败', true); loadSnap(acc); return; }
@@ -3062,7 +3063,8 @@ function loadSnap(acc){
   if(!m || !box) return;
   m.textContent = '读取最近一次夜间核算…';
   box.innerHTML = '';
-  fetch('/api/price/snapshot?account=' + encodeURIComponent(acc || $('pwAcc').value))
+  fetch('/api/price/snapshot?account=' + encodeURIComponent(acc || $('pwAcc').value),
+        {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(j){
       if(!j.ok){
@@ -3075,6 +3077,15 @@ function loadSnap(acc){
         + '　当日有成交 <b>' + cnt(j.skuCount) + '</b> 个 SKU'
         + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>'
         + '　当日均价 <b>' + money(j.avgPrice) + '</b>（成交 ' + cnt(j.qty) + ' 件）';
+      // 核算日落后于「昨天」时说明商智还没出数，避免以为核算没跑
+      var y = parseIso(INIT.today);
+      if(y){
+        y.setDate(y.getDate() - 1);
+        if(j.day < iso(y)){
+          m.innerHTML += '　<span class="flat">（' + iso(y)
+            + ' 的商智还没出数，白天会自动补抓后重算）</span>';
+        }
+      }
       var list = (j.rows || []).filter(function(r){
         var n = num(r.changeDodPct);
         return n !== null && Math.abs(n) >= 2 && num(r.qty) >= 5;
@@ -3138,6 +3149,18 @@ window.PW = {
     window.PW.pick(tr);
   },
   render: render,
+  /* 按本地现有数据立刻重算一次核算（补完商智后不用等夜里） */
+  snapRun: function(){
+    var m = $('pwAutoMsg');
+    if(m) m.textContent = '正在按本地数据重算…';
+    fetch('/api/price/snapshot/run', {method:'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){ if(m) m.textContent = '重算失败：' + (j.error || ''); return; }
+        loadSnap($('pwAcc').value);
+      })
+      .catch(function(err){ if(m) m.textContent = '重算失败：' + err; });
+  },
   sync: function(){
     if(!LAST) return;
     var days = (LAST.missingDays || []).concat(LAST.emptyDays || []).sort();
@@ -3260,7 +3283,9 @@ def price_page(request: Request):
 </div>
 
 <div class="card" id="pwAutoCard" style="margin-top:18px">
-  <h2>夜间自动核算 <span class="tagline">每天凌晨抓完昨天数据后自动生成</span></h2>
+  <h2>夜间自动核算 <span class="tagline">每天凌晨抓完昨天数据后自动生成</span>
+    <button class="btn sec mini" style="margin-left:auto" onclick="PW.snapRun()"
+            title="按本地现有数据立刻重算一次（补完商智后不用等夜里）">立即重算</button></h2>
   <div class="hint" id="pwAutoMsg" style="margin-bottom:0">读取最近一次夜间核算…</div>
   <div id="pwAutoBody"></div>
 </div>
@@ -3327,7 +3352,9 @@ def api_price(account: str | None = None, start: str = "", end: str = ""):
         return {"ok": False, "error": "日期格式应为 YYYY-MM-DD"}
     if len(span) > 400:
         return {"ok": False, "error": "区间最长 400 天，请缩小范围"}
-    return pricewatch.build(acc, span[0], span[-1])
+    # 价格会随着商智回补/补抓变化，别让浏览器缓存住上一次的结果
+    return JSONResponse(pricewatch.build(acc, span[0], span[-1]),
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/price/snapshot")
@@ -3339,10 +3366,23 @@ def api_price_snapshot(account: str | None = None):
         acc = settings.MAIN_ACCOUNT
     snap = pricewatch.latest_snapshot(acc)
     if not snap:
-        return {"ok": False, "empty": True,
-                "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）；"
-                         "下面价格表本身是现算的，可以先直接看"}
-    return {"ok": True, **snap}
+        return JSONResponse({"ok": False, "empty": True,
+                             "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）；"
+                                      "下面价格表本身是现算的，可以先直接看"},
+                            headers={"Cache-Control": "no-store"})
+    return JSONResponse({"ok": True, **snap}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/price/snapshot/run")
+def api_price_snapshot_run(account: str | None = None):
+    """立刻重算一次前台价核算（与夜间任务同一个函数），补完数据后不用等夜里。"""
+    accounts = [settings.get_account(account)] if account else settings.ACCOUNTS
+    try:
+        done = pricewatch.run_nightly(accounts, log=_log_progress)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "done": done,
+            "errors": [x for x in done if x.get("error")]}
 
 
 @app.post("/api/price/backfill")
@@ -4512,16 +4552,29 @@ def _ai_after_scrape(summary: dict) -> None:
 
 
 def _price_snapshot() -> None:
-    """核算前台价并落盘。单独 try 住：算价格失败不能连累 AI 解读 / 抓取结果。"""
+    """核算前台价并落盘。单独 try 住：算价格失败不能连累 AI 解读 / 抓取结果。
+
+    注意：这个回调跑在 `finish_task` 之后，任务日志（append_log）已经写不进去了，
+    所以同时 print 到容器日志 —— 否则夜里核算失败会完全看不到原因。
+    """
     try:
         done = pricewatch.run_nightly(settings.ACCOUNTS, log=_log_progress)
-        if done:
-            _log_progress("前台价核算完成：" + "；".join(
-                f"{x['label']} {x['day']} {x['skuCount']} 个 SKU" for x in done))
-        else:
-            _log_progress("前台价核算：没有可用的商智商品明细，跳过")
     except Exception as exc:  # noqa: BLE001
-        _log_progress(f"前台价核算失败：{type(exc).__name__}: {exc}")
+        text = f"前台价核算失败：{type(exc).__name__}: {exc}"
+        _log_progress(text)
+        print(f"[price] {text}", flush=True)
+        return
+    errs = [x for x in done if x.get("error")]
+    if done:
+        text = "前台价核算完成：" + "；".join(
+            f"{x.get('label') or x.get('account')} {x.get('day')} "
+            f"{x.get('skuCount', '—')} 个 SKU" for x in done if not x.get("error"))
+    else:
+        text = "前台价核算：没有可用的商智商品明细，跳过"
+    _log_progress(text)
+    print(f"[price] {text}", flush=True)
+    for x in errs:
+        print(f"[price] 失败 {x.get('account')} {x.get('day')}：{x.get('error')}", flush=True)
 
 
 def _after_scrape(summary: dict) -> None:
