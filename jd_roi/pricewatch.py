@@ -76,7 +76,7 @@ def build(account: str, start: str, end: str) -> dict:
     today = ds.today().isoformat()
     realtime_day = ""
 
-    def _merge(rows, day):
+    def _merge(rows, day, is_rt=False):
         for r in rows:
             if r.get("$summary"):
                 continue
@@ -99,6 +99,13 @@ def build(account: str, start: str, end: str) -> dict:
             cur["uv"] += _f(r.get(SZ_UV))
             cur["ord"] += _f(r.get(SZ_ORDN))
             e["byDay"][day] = cur
+            if is_rt:
+                # 昨天的同一时刻（商智 realtime 每行带回的 ##compareValue），
+                # 今天只过了一半，拿它跟昨天全天比会失真
+                cmp_ = e.get("rtCmp") or {"amt": 0.0, "qty": 0.0}
+                cmp_["amt"] += _f(r.get(SZ_AMT + "##compareValue"))
+                cmp_["qty"] += _f(r.get(SZ_QTY + "##compareValue"))
+                e["rtCmp"] = cmp_
 
     for day in days:
         kind = "sz_product_rt" if day == today else "sz_product"
@@ -112,7 +119,7 @@ def build(account: str, start: str, end: str) -> dict:
             if not rows:
                 continue
             any_rows = True
-            _merge(rows, day)
+            _merge(rows, day, day == today)
         if any_rows:
             data_days.append(day)
             if day == today:
@@ -146,12 +153,28 @@ def build(account: str, start: str, end: str) -> dict:
         prices = [p for _d, p in valid]
         last_day, last_price = valid[-1]
         first_day, first_price = valid[0]
-        prev_price = valid[-2][1] if len(valid) > 1 else None
+        # 「较上日」必须真的是上一天：
+        #  · 最新是今天（实时）→ 用商智给的同刻价（昨天 00:00~此刻），
+        #    今天只过了一半，跟昨天全天比会失真
+        #  · 否则 → 只有紧邻的上一天也有价才算；中间断档（那天 0 件）就不给涨跌幅，
+        #    只标注「上次有价 X」，避免把几天前的价格说成「上日」
+        prev_price, prev_day, prev_same_time = None, "", False
+        yday = (_date.fromisoformat(last_day) - _timedelta(days=1)).isoformat()
+        if last_day == realtime_day and e.get("rtCmp"):
+            cmp_price = _price(e["rtCmp"]["amt"], e["rtCmp"]["qty"])
+            if cmp_price is not None:
+                prev_price, prev_day, prev_same_time = cmp_price, yday, True
+        if prev_price is None and len(valid) > 1:
+            back_day, back_price = valid[-2]
+            prev_day = back_day
+            if back_day == yday:
+                prev_price = back_price
         row = {
             "skuId": e["skuId"], "itemName": e["itemName"],
             "img": e["img"], "url": e["url"],
             "priceLatest": last_price, "latestDay": last_day,
-            "pricePrev": prev_price,
+            "pricePrev": prev_price, "prevDay": prev_day,
+            "prevSameTime": prev_same_time,
             "changeDod": (round(last_price - prev_price, 2)
                           if prev_price is not None else None),
             "changeDodPct": _pct(last_price, prev_price),

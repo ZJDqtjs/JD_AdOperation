@@ -2742,6 +2742,9 @@ PRICE_CSS = """
 .pwsku .id{font-size:11px;color:var(--muted2);font-family:var(--mono)}
 .pwcur{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
 .pwrt{color:var(--primary);font-weight:600}
+.pwq{display:inline-block;width:11px;height:11px;line-height:11px;text-align:center;
+  font-size:8px;border-radius:50%;background:var(--hair);color:var(--muted2);
+  cursor:help;vertical-align:1px}
 .skulink{color:var(--muted2);text-decoration:none;border-bottom:1px dashed var(--hair)}
 .skulink:hover{color:var(--primary);border-bottom-color:var(--primary)}
 .pwrtlist{max-height:302px;overflow:auto;border:1px solid var(--hair);
@@ -2770,7 +2773,8 @@ var SORT = {k:'amt', d:-1};
 var COLS = [
   {k:'__item',  t:'商品',      l:1},
   {k:'priceLatest', t:'最新前台价'},
-  {k:'changeDodPct', t:'较上日'},
+  {k:'changeDodPct', t:'较上日',
+   hint:'真的是紧邻的上一天：今天对比昨天同一时刻；中间有 0 成交的天就不给涨跌幅'},
   {k:'changePct', t:'较区间初'},
   {k:'priceAvg', t:'区间均价'},
   {k:'__band',  t:'区间价带'},
@@ -2844,8 +2848,10 @@ function head(){
   var h = '<tr>';
   COLS.forEach(function(c){
     var mark = (SORT.k === c.k) ? (SORT.d<0 ? ' ↓' : ' ↑') : '';
-    h += '<th class="'+(c.l?'l ':'')+'noSort" data-key="'+c.k+'" onclick="PW.sort(\''+c.k+'\')">'
-       + esc(c.t) + mark + '</th>';
+    h += '<th class="'+(c.l?'l ':'')+'noSort" data-key="'+c.k+'"'
+       + (c.hint ? ' title="'+esc(c.hint)+'"' : '')
+       + ' onclick="PW.sort(\''+c.k+'\')">'
+       + esc(c.t) + (c.hint ? ' <span class="pwq">?</span>' : '') + mark + '</th>';
   });
   return h + '</tr>';
 }
@@ -2856,6 +2862,9 @@ function rowHtml(r){
   var dod = num(r.changeDod), chg = num(r.change);
   var dodExtra = dod===null ? '' : ((dod>0?'+':'')+fx(dod,2)+' 元');
   var chgExtra = chg===null ? '' : ((chg>0?'+':'')+fx(chg,2)+' 元');
+  var dodSub = r.prevSameTime ? 'vs 昨天同刻'
+             : (dod !== null ? 'vs ' + String(r.prevDay||'').slice(5)
+                             : (r.prevDay ? '上次有价 ' + String(r.prevDay).slice(5) : '仅 1 天有价'));
   return '<tr class="pwrow'+on+'" data-sku="'+esc(r.skuId)+'" onclick="PW.pick(this)">'
     + '<td class="l"><div class="pwsku">'+img
       + '<div><div class="nm" title="'+esc(r.itemName)+'">'+esc(r.itemName||'—')+'</div>'
@@ -2864,7 +2873,8 @@ function rowHtml(r){
       + '<div class="pwsub">'+esc(String(r.latestDay||'').slice(5))
       + (r.realtime ? ' <span class="pwrt">实时</span>' : '')
       + ' · '+cnt(r.priceDays)+'天有价</div></td>'
-    + '<td>'+pctCell(r.changeDodPct, dodExtra)+'</td>'
+    + '<td>'+pctCell(r.changeDodPct, dodExtra)
+      + '<div class="pwsub">'+esc(dodSub)+'</div></td>'
     + '<td>'+pctCell(r.changePct, chgExtra)+'</td>'
     + '<td>'+money(r.priceAvg)+'</td>'
     + '<td>'+money(r.priceMin)+'~'+money(r.priceMax)
