@@ -2742,6 +2742,8 @@ PRICE_CSS = """
 .pwsku .id{font-size:11px;color:var(--muted2);font-family:var(--mono)}
 .pwcur{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
 .pwrt{color:var(--primary);font-weight:600}
+.skulink{color:var(--muted2);text-decoration:none;border-bottom:1px dashed var(--hair)}
+.skulink:hover{color:var(--primary);border-bottom-color:var(--primary)}
 .pwrtlist{max-height:302px;overflow:auto;border:1px solid var(--hair);
   border-radius:var(--r-md);margin-top:10px}
 .pwrtlist thead th{position:sticky;top:0;z-index:2;background:var(--soft)}
@@ -2787,6 +2789,14 @@ function fx(v,dec){ var n=num(v); if(n===null) return '—';
   return n.toLocaleString('zh-CN',{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
 function money(v){ var n=num(v); return n===null?'—':('¥'+fx(n,2)); }
 function cnt(v){ var n=num(v); return n===null?'—':n.toLocaleString('zh-CN'); }
+/* SKU 编号 → 京东商品页；新标签打开，且不触发行点击（行点击是看曲线） */
+function skuLink(sid){
+  var s = String(sid == null ? '' : sid);
+  return '<a class="skulink" href="https://item.jd.com/' + esc(s) + '.html"'
+       + ' target="_blank" rel="noopener noreferrer"'
+       + ' onclick="event.stopPropagation()" title="在新标签打开京东商品页">'
+       + esc(s) + '</a>';
+}
 function msg(s,bad){ var el=$('pwMsg'); if(!el) return; el.textContent=s||'';
   el.style.color = bad ? 'var(--redink)' : 'var(--muted)'; }
 
@@ -2849,7 +2859,7 @@ function rowHtml(r){
   return '<tr class="pwrow'+on+'" data-sku="'+esc(r.skuId)+'" onclick="PW.pick(this)">'
     + '<td class="l"><div class="pwsku">'+img
       + '<div><div class="nm" title="'+esc(r.itemName)+'">'+esc(r.itemName||'—')+'</div>'
-      + '<div class="id">'+esc(r.skuId)+'</div></div></div></td>'
+      + '<div class="id">'+skuLink(r.skuId)+'</div></div></div></td>'
     + '<td><span class="pwcur">'+money(r.priceLatest)+'</span>'
       + '<div class="pwsub">'+esc(String(r.latestDay||'').slice(5))
       + (r.realtime ? ' <span class="pwrt">实时</span>' : '')
@@ -2965,7 +2975,7 @@ function cover(){
 function detail(r){
   $('pwDetail').style.display = '';
   $('pwDTitle').textContent = r.itemName || r.skuId;
-  $('pwDSub').innerHTML = 'SKU '+esc(r.skuId)
+  $('pwDSub').innerHTML = 'SKU '+skuLink(r.skuId)
     + '　最新 <b>'+money(r.priceLatest)+'</b>（'+esc(r.latestDay||'—')
     + (r.realtime ? ' 实时' : '') + '）'
     + '　区间均价 <b>'+money(r.priceAvg)+'</b>'
@@ -3117,7 +3127,7 @@ function loadRt(acc){
               + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
               + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">'
               + esc(r.itemName || r.skuId) + '</div>'
-              + '<div class="id">' + esc(r.skuId) + '</div></td>'
+              + '<div class="id">' + skuLink(r.skuId) + '</div></td>'
               + '<td>' + money(r.price) + '</td><td>' + money(r.cmpPrice) + '</td>'
               + '<td>' + pctCell(r.changePct, extra) + '</td><td>' + cnt(r.qty) + '</td></tr>';
           }).join('')
@@ -3188,7 +3198,7 @@ function loadSnap(acc){
         + list.map(function(r){
             return '<tr class="pwrow" data-sku="' + esc(r.skuId) + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
               + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">' + esc(r.itemName || r.skuId) + '</div>'
-              + '<div class="id">' + esc(r.skuId) + '</div></td>'
+              + '<div class="id">' + skuLink(r.skuId) + '</div></td>'
               + '<td>' + money(r.priceLatest) + '</td>'
               + '<td>' + money(r.pricePrev) + '</td>'
               + '<td>' + pctCell(r.changeDodPct, '') + '</td>'
