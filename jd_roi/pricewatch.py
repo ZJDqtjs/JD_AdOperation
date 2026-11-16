@@ -44,10 +44,27 @@ def _pct(cur, base):
     return round((cur - base) / base * 100, 2)
 
 
+def _keys(account: str) -> list:
+    """account='all' 表示全部账号（按 SKU 相加）；否则就是单个账号 key。"""
+    if str(account).lower() == "all":
+        return [a["key"] for a in settings.ACCOUNTS]
+    return [str(account)]
+
+
+def _label(account: str) -> str:
+    if str(account).lower() == "all":
+        return "全部账号（总览）"
+    return settings.get_account(account).get("label") or account
+
+
 def build(account: str, start: str, end: str) -> dict:
-    """区间内每个 SKU 的逐日前台价 + 区间汇总。"""
+    """区间内每个 SKU 的逐日前台价 + 区间汇总。
+
+    account 传 "all" 时按 SKU 合并全部账号：成交金额/件数相加，价格仍是 Σ金额÷Σ件数。
+    """
     start, end = ds.norm_day(start), ds.norm_day(end)
     days = ds.day_span(start, end)
+    keys = _keys(account)
 
     missing: list = []       # 这天没文件（从未抓过）
     empty: list = []         # 文件在但 0 行（抓早了 / 接口成功但空）
@@ -76,28 +93,35 @@ def build(account: str, start: str, end: str) -> dict:
                 e["img"] = r.get("img_src")
             if not e["url"] and r.get("pro_url"):
                 e["url"] = r.get("pro_url")
-            e["byDay"][day] = {"amt": _f(r.get(SZ_AMT)), "qty": _f(r.get(SZ_QTY)),
-                               "uv": _f(r.get(SZ_UV)), "ord": _f(r.get(SZ_ORDN))}
+            cur = e["byDay"].get(day) or {"amt": 0.0, "qty": 0.0, "uv": 0.0, "ord": 0.0}
+            cur["amt"] += _f(r.get(SZ_AMT))
+            cur["qty"] += _f(r.get(SZ_QTY))
+            cur["uv"] += _f(r.get(SZ_UV))
+            cur["ord"] += _f(r.get(SZ_ORDN))
+            e["byDay"][day] = cur
 
     for day in days:
-        if day == today:
-            payload = ds.load_day(account, day, "sz_product_rt")
-            rows = (payload or {}).get("rows") or []
-            if rows:
-                data_days.append(day)
+        kind = "sz_product_rt" if day == today else "sz_product"
+        any_file = any_rows = False
+        for key in keys:
+            payload = ds.load_day(key, day, kind)
+            if payload is None:
+                continue
+            any_file = True
+            rows = payload.get("rows") or []
+            if not rows:
+                continue
+            any_rows = True
+            _merge(rows, day)
+        if any_rows:
+            data_days.append(day)
+            if day == today:
                 realtime_day = day
-                _merge(rows, day)
-            continue
-        payload = ds.load_day(account, day, "sz_product")
-        if payload is None:
+        elif any_file:
+            if day != today:      # 今天文件在但 0 行：只是还没出数，不算空天
+                empty.append(day)
+        elif day != today:
             missing.append(day)
-            continue
-        rows = payload.get("rows") or []
-        if not rows:
-            empty.append(day)
-            continue
-        data_days.append(day)
-        _merge(rows, day)
 
     rows_out: list = []
     tot_amt = tot_qty = tot_uv = 0.0
@@ -152,6 +176,8 @@ def build(account: str, start: str, end: str) -> dict:
     return {
         "ok": True,
         "account": account,
+        "label": _label(account),
+        "accounts": keys,
         "start": start, "end": end,
         "days": days,
         "daysWithData": data_days,
@@ -266,32 +292,56 @@ def latest_snapshot(account: str):
 # （昨天同一时刻的值）。用这两个数算前台价再对比，就是同刻口径 —— 不受
 # 「今天才过了一半」影响，比拿今天的均价去比昨天全天要靠谱。
 def realtime_snapshot(account: str, day: str | None = None):
-    """读今天（或指定日）的 sz_product_rt 快照，算逐 SKU 前台价与昨日同刻对比。"""
+    """读今天（或指定日）的 sz_product_rt 快照，算逐 SKU 前台价与昨日同刻对比。
+
+    account="all" 时合并各账号：金额/件数相加，价格仍是 Σ金额÷Σ件数；
+    `at` 取各账号里最新的那个抓取时刻。
+    """
     day = ds.norm_day(day or ds.today())
-    payload = ds.load_day(account, day, "sz_product_rt")
-    if not payload:
+    merged: dict = {}
+    at = ""
+    used = []
+    for key in _keys(account):
+        payload = ds.load_day(key, day, "sz_product_rt")
+        if not payload:
+            continue
+        rows = payload.get("rows") or []
+        if not rows:
+            continue
+        used.append(key)
+        if (payload.get("at") or "") > at:
+            at = payload.get("at") or at
+        for r in rows:
+            if r.get("$summary"):
+                continue
+            sid = str(r.get("sku_id") or "").strip()
+            if not sid or sid == "合计":
+                continue
+            e = merged.get(sid)
+            if e is None:
+                e = {"skuId": sid, "itemName": r.get("name") or "",
+                     "amt": 0.0, "qty": 0.0, "cmpAmt": 0.0, "cmpQty": 0.0}
+                merged[sid] = e
+            if r.get("name"):
+                e["itemName"] = r.get("name")
+            e["amt"] += _f(r.get(SZ_AMT))
+            e["qty"] += _f(r.get(SZ_QTY))
+            e["cmpAmt"] += _f(r.get(SZ_AMT + "##compareValue"))
+            e["cmpQty"] += _f(r.get(SZ_QTY + "##compareValue"))
+    if not merged:
         return None
     rows = []
-    for r in payload.get("rows") or []:
-        if r.get("$summary"):
-            continue
-        sid = str(r.get("sku_id") or "").strip()
-        if not sid or sid == "合计":
-            continue
-        amt = _f(r.get(SZ_AMT))
-        qty = _f(r.get(SZ_QTY))
-        camt = _f(r.get(SZ_AMT + "##compareValue"))
-        cqty = _f(r.get(SZ_QTY + "##compareValue"))
-        price = _price(amt, qty)
+    for e in merged.values():
+        price = _price(e["amt"], e["qty"])
         if price is None:
             continue
-        cmp_price = _price(camt, cqty)
+        cmp_price = _price(e["cmpAmt"], e["cmpQty"])
         rows.append({
-            "skuId": sid, "itemName": r.get("name") or "",
+            "skuId": e["skuId"], "itemName": e["itemName"],
             "price": price, "cmpPrice": cmp_price,
             "changePct": _pct(price, cmp_price),
-            "amt": round(amt, 2), "qty": int(qty),
-            "cmpAmt": round(camt, 2), "cmpQty": int(cqty),
+            "amt": round(e["amt"], 2), "qty": int(e["qty"]),
+            "cmpAmt": round(e["cmpAmt"], 2), "cmpQty": int(e["cmpQty"]),
         })
     if not rows:
         return None
@@ -303,9 +353,10 @@ def realtime_snapshot(account: str, day: str | None = None):
     down = sum(1 for x in rows if (x["changePct"] or 0) < -0.5)
     return {
         "account": account,
-        "label": settings.get_account(account).get("label") or account,
+        "label": _label(account),
+        "accounts": used,
         "day": day,
-        "at": payload.get("at") or "",
+        "at": at,
         "generatedAt": settings.now_iso(),
         "skuCount": len(rows),
         "up": up, "down": down,

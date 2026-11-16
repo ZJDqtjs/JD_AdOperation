@@ -2742,6 +2742,9 @@ PRICE_CSS = """
 .pwsku .id{font-size:11px;color:var(--muted2);font-family:var(--mono)}
 .pwcur{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
 .pwrt{color:var(--primary);font-weight:600}
+.pwrtlist{max-height:302px;overflow:auto;border:1px solid var(--hair);
+  border-radius:var(--r-md);margin-top:10px}
+.pwrtlist thead th{position:sticky;top:0;z-index:2;background:var(--soft)}
 .pwsub{font-size:11px;color:var(--muted2);font-variant-numeric:tabular-nums;line-height:1.5;
   white-space:nowrap}
 .pwspark{width:118px;height:26px;display:block;margin-left:auto}
@@ -3086,34 +3089,37 @@ function loadRt(acc){
         diff = '（昨日同刻 ' + money(b) + '，<span class="' + cls + '">'
              + (p > 0 ? '↑' : (p < 0 ? '↓' : '·')) + ' ' + fx(Math.abs(p), 2) + '%</span>）';
       }
-      m.innerHTML = '截至 <b>' + esc(j.at || '—') + '</b>'
+      m.innerHTML = (j.account === 'all' ? '<b>全部账号</b>　' : '')
+        + '截至 <b>' + esc(j.at || '—') + '</b>'
         + '　成交 <b>' + cnt(j.qty) + '</b> 件 / ' + money(j.amt)
         + '　全店均价 <b>' + money(j.avgPrice) + '</b>' + diff
         + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>';
       var list = (j.rows || []).filter(function(r){
-        var n = num(r.changePct);
-        return n !== null && Math.abs(n) >= 2 && num(r.qty) >= 3;
+        var p = num(r.price), c = num(r.cmpPrice);
+        return p !== null && c !== null && Math.abs(p - c) > 1;
       });
       list.sort(function(a2, b2){
-        return Math.abs(num(b2.changePct)) - Math.abs(num(a2.changePct));
+        return Math.abs(num(b2.price) - num(b2.cmpPrice))
+             - Math.abs(num(a2.price) - num(a2.cmpPrice));
       });
-      list = list.slice(0, 5);
       if(!list.length){
-        box.innerHTML = '<div class="pwsub">今天还没有「变动 ≥2% 且 ≥3 件」的 SKU。</div>';
+        box.innerHTML = '<div class="pwsub">今天还没有「变动超过 ¥1」的 SKU。</div>';
         return;
       }
-      box.innerHTML = '<div class="tblwrap short" style="margin-top:10px"><table><thead><tr>'
-        + '<th class="l noSort">商品（今天变动最大的 ' + list.length + ' 个）</th>'
+      box.innerHTML = '<div class="pwrtlist"><table><thead><tr>'
+        + '<th class="l noSort">商品（变动超过 ¥1 的 ' + list.length + ' 个，按变动金额排序）</th>'
         + '<th class="n noSort">今日前台价</th><th class="n noSort">昨日同刻</th>'
         + '<th class="n noSort">变动</th><th class="n noSort">今日件数</th></tr></thead><tbody>'
         + list.map(function(r){
+            var d = num(r.price) - num(r.cmpPrice);
+            var extra = (d > 0 ? '+' : '') + fx(d, 2) + ' 元';
             return '<tr class="pwrow" data-sku="' + esc(r.skuId)
               + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
               + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">'
               + esc(r.itemName || r.skuId) + '</div>'
               + '<div class="id">' + esc(r.skuId) + '</div></td>'
               + '<td>' + money(r.price) + '</td><td>' + money(r.cmpPrice) + '</td>'
-              + '<td>' + pctCell(r.changePct, '') + '</td><td>' + cnt(r.qty) + '</td></tr>';
+              + '<td>' + pctCell(r.changePct, extra) + '</td><td>' + cnt(r.qty) + '</td></tr>';
           }).join('')
         + '</tbody></table></div>';
     })
@@ -3130,6 +3136,22 @@ function loadSnap(acc){
         {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(j){
+      if(j.ok && j.all){
+        // 全部账号：夜间核算是按账号分别算的，这里逐账号列出来
+        m.textContent = '全部账号：每个账号各自核算（不合并价格）';
+        box.innerHTML = '<div class="pwrtlist"><table><thead><tr>'
+          + '<th class="l noSort">账号</th><th class="n noSort">核算日</th>'
+          + '<th class="n noSort">有成交 SKU</th><th class="n noSort">涨 / 跌</th>'
+          + '<th class="n noSort">当日均价</th></tr></thead><tbody>'
+          + j.all.map(function(x){
+              return '<tr><td class="l"><b>' + esc(x.label || x.account) + '</b></td>'
+                + '<td>' + esc(x.day || '—') + '</td><td>' + cnt(x.skuCount) + '</td>'
+                + '<td><span class="up">' + cnt(x.up) + '</span> / <span class="down">'
+                + cnt(x.down) + '</span></td><td>' + money(x.avgPrice) + '</td></tr>';
+            }).join('')
+          + '</tbody></table></div>';
+        return;
+      }
       if(!j.ok){
         m.textContent = j.error || '还没有核算记录';
         return;
@@ -3318,7 +3340,7 @@ def price_page(request: Request):
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = q.get("account") or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     end = _today()
     start = end - dt.timedelta(days=29)
@@ -3330,7 +3352,8 @@ def price_page(request: Request):
                 start, end = s0, e0
         except ValueError:
             pass
-    opts = "".join(
+    opts = ('<option value="all"%s>全部账号（总览）</option>'
+            % (" selected" if acc == "all" else "")) + "".join(
         f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
         f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
     init = {"api": "/api/price", "account": acc, "today": _today().isoformat(),
@@ -3428,6 +3451,9 @@ def price_page(request: Request):
      因为商智 T+1 只出一半、T+2~T+3 才定稿，每次会把最近 3 个有数据的日子一起重算覆盖。
      凌晨抓「昨天」时商智常常还没出数（0 行），白天 08:00~23:00 会每小时自动只补商智，
      补到就立刻重算，任务日志里能看到「商智补抓」「前台价已核算 &lt;日期&gt;」。</p>
+  <p><b>全部账号</b>：按 SKU 合并各店 —— 成交金额 / 成交件数相加，价格仍是 Σ金额 ÷ Σ件数；
+     同一个 SKU 在多个店都有成交时合并成一行。「夜间自动核算」那张卡片按账号各列一行
+     （核算是按账号分别做的，不强行合并价格）。</p>
   <p><b>今天的价格</b>：表格里最新一行如果是今天，会标橙色「实时」、曲线横轴那天带 * ——
      那是商智实时快照（今天 00:00 到此刻，<b>未结算</b>），件数/金额白天还会继续涨；
      想排除今天只看到结算日，把「止」改成昨天即可。</p>
@@ -3449,7 +3475,7 @@ def api_price(account: str | None = None, start: str = "", end: str = ""):
     """某个账号某个区间内，每个 SKU 的逐日前台价与区间汇总（纯本地读）。"""
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = account or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     if not (start and end):
         e = _today()
@@ -3470,8 +3496,23 @@ def api_price_snapshot(account: str | None = None):
     """最近一次「夜间自动核算」结果（凌晨抓完数据后由 pricewatch.run_nightly 落盘）。"""
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = account or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
+    if str(acc).lower() == "all":
+        # 全部账号：夜间核算是按账号各算一份，这里列成一张表（不强行合并价格）
+        items = []
+        for a in settings.ACCOUNTS:
+            s = pricewatch.latest_snapshot(a["key"])
+            if s:
+                items.append({k: s.get(k) for k in
+                              ("account", "label", "day", "skuCount", "up", "down",
+                               "avgPrice", "generatedAt")})
+        if not items:
+            return JSONResponse({"ok": False, "empty": True,
+                                 "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）"},
+                                headers={"Cache-Control": "no-store"})
+        return JSONResponse({"ok": True, "all": items},
+                            headers={"Cache-Control": "no-store"})
     snap = pricewatch.latest_snapshot(acc)
     if not snap:
         return JSONResponse({"ok": False, "empty": True,
@@ -3498,7 +3539,7 @@ def api_price_realtime(account: str | None = None):
     """今日实时前台价（商智 realtime 口径，对比昨天同一时刻），读本地快照。"""
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = account or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     snap = pricewatch.realtime_snapshot(acc)
     if not snap:
@@ -3514,7 +3555,8 @@ def api_price_realtime(account: str | None = None):
 @app.post("/api/price/realtime/fetch")
 def api_price_realtime_fetch(account: str | None = None):
     """立刻抓一次今日实时商品明细（只抓 sz_product_rt，需要浏览器登录态）。"""
-    accs = [settings.get_account(account)] if account else settings.ACCOUNTS
+    accs = (settings.ACCOUNTS if not account or str(account).lower() == "all"
+            else [settings.get_account(account)])
     info = scrape_day.lock_info()
     if info.get("locked") and info.get("alive"):
         return {"ok": False, "error": "正在执行其它抓取任务，等它结束再刷新"}
