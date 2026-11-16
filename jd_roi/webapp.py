@@ -2741,6 +2741,7 @@ PRICE_CSS = """
   text-overflow:ellipsis;white-space:nowrap}
 .pwsku .id{font-size:11px;color:var(--muted2);font-family:var(--mono)}
 .pwcur{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+.pwrt{color:var(--primary);font-weight:600}
 .pwsub{font-size:11px;color:var(--muted2);font-variant-numeric:tabular-nums;line-height:1.5;
   white-space:nowrap}
 .pwspark{width:118px;height:26px;display:block;margin-left:auto}
@@ -2848,6 +2849,7 @@ function rowHtml(r){
       + '<div class="id">'+esc(r.skuId)+'</div></div></div></td>'
     + '<td><span class="pwcur">'+money(r.priceLatest)+'</span>'
       + '<div class="pwsub">'+esc(String(r.latestDay||'').slice(5))
+      + (r.realtime ? ' <span class="pwrt">实时</span>' : '')
       + ' · '+cnt(r.priceDays)+'天有价</div></td>'
     + '<td>'+pctCell(r.changeDodPct, dodExtra)+'</td>'
     + '<td>'+pctCell(r.changePct, chgExtra)+'</td>'
@@ -2937,6 +2939,9 @@ function cover(){
   var t = TOT || {}, bits = [];
   bits.push('区间 <b>'+esc(LAST.start)+' ~ '+esc(LAST.end)+'</b>');
   bits.push('商智明细已入库 <b>'+cnt(t.dataDays)+'</b>/'+cnt(t.rangeDays)+' 天');
+  if(LAST.realtimeDay){
+    bits.push('今天 <b>'+esc(String(LAST.realtimeDay).slice(5))+'</b> 用实时快照（未结算）');
+  }
   var miss = (LAST.missingDays || []), empty = (LAST.emptyDays || []);
   if(miss.length){
     bits.push('缺 <b>'+miss.length+'</b> 天未抓：'+esc(miss.slice(0,4).join('、'))
@@ -2958,7 +2963,8 @@ function detail(r){
   $('pwDetail').style.display = '';
   $('pwDTitle').textContent = r.itemName || r.skuId;
   $('pwDSub').innerHTML = 'SKU '+esc(r.skuId)
-    + '　最新 <b>'+money(r.priceLatest)+'</b>（'+esc(r.latestDay||'—')+'）'
+    + '　最新 <b>'+money(r.priceLatest)+'</b>（'+esc(r.latestDay||'—')
+    + (r.realtime ? ' 实时' : '') + '）'
     + '　区间均价 <b>'+money(r.priceAvg)+'</b>'
     + '　区间价带 '+money(r.priceMin)+' ~ '+money(r.priceMax)
     + '　成交 '+cnt(r.qty)+' 件 / '+money(r.amt)
@@ -2971,7 +2977,9 @@ function drawChart(r){
   var box = $('pwChart');
   if(!box || !window.echarts) return;
   if(!CH) CH = echarts.init(box);
-  var xs = DAYS.map(function(d){ return String(d).slice(5); });
+  var xs = DAYS.map(function(d){
+    return String(d).slice(5) + (LAST && d === LAST.realtimeDay ? '*' : '');
+  });
   CH.setOption({
     animationDuration: 260,
     grid:{left:58, right:58, top:34, bottom:36},
@@ -2988,7 +2996,8 @@ function drawChart(r){
     legend:{top:0, right:56, itemWidth:12, itemHeight:8,
       textStyle:{fontSize:11, color:'#6c6a64'}},
     xAxis:{type:'category', data:xs,
-      axisLabel:{fontSize:10, color:'#8e8b82'}, axisLine:{lineStyle:{color:'#e6dfd8'}},
+      axisLabel:{fontSize:10, color:'#8e8b82', showMaxLabel:true},
+      axisLine:{lineStyle:{color:'#e6dfd8'}},
       axisTick:{show:false}},
     yAxis:[
       {type:'value', name:'元/件', scale:true,
@@ -3275,14 +3284,13 @@ function iso(d){
 }
 window.PWQUICK = function(k){
   var t = parseIso(INIT.today) || new Date();
-  var end = new Date(t.getFullYear(), t.getMonth(), t.getDate()-1);   // 商智只到昨天
+  var end = new Date(t.getFullYear(), t.getMonth(), t.getDate());   // 含今天（有实时快照）
   var start;
   if(k === 'd7'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-6); }
   else if(k === 'd14'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-13); }
   else if(k === 'd30'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-29); }
   else if(k === 'month'){
-    if(t.getDate() === 1){ start = new Date(end.getTime()); }
-    else { start = new Date(t.getFullYear(), t.getMonth(), 1); }
+    start = new Date(t.getFullYear(), t.getMonth(), 1);
   }
   else if(k === 'lastmonth'){
     end = new Date(t.getFullYear(), t.getMonth(), 0);
@@ -3312,7 +3320,7 @@ def price_page(request: Request):
     acc = q.get("account") or settings.MAIN_ACCOUNT
     if acc not in keys:
         acc = settings.MAIN_ACCOUNT
-    end = _yesterday()
+    end = _today()
     start = end - dt.timedelta(days=29)
     if q.get("start") and q.get("end"):
         try:
@@ -3420,6 +3428,9 @@ def price_page(request: Request):
      因为商智 T+1 只出一半、T+2~T+3 才定稿，每次会把最近 3 个有数据的日子一起重算覆盖。
      凌晨抓「昨天」时商智常常还没出数（0 行），白天 08:00~23:00 会每小时自动只补商智，
      补到就立刻重算，任务日志里能看到「商智补抓」「前台价已核算 &lt;日期&gt;」。</p>
+  <p><b>今天的价格</b>：表格里最新一行如果是今天，会标橙色「实时」、曲线横轴那天带 * ——
+     那是商智实时快照（今天 00:00 到此刻，<b>未结算</b>），件数/金额白天还会继续涨；
+     想排除今天只看到结算日，把「止」改成昨天即可。</p>
   <p><b>今日实时</b>：商智「商品明细 → 实时」能给当天 00:00 到此刻的按 SKU 成交，
      页面白天每 30 分钟自动刷新一次（也可点「刷新今日实时」）。因为今天还没结束，
      对比用的是<b>昨天同一时刻</b>而不是昨天全天，避免「今天只过了一半」的误判；
@@ -3441,7 +3452,7 @@ def api_price(account: str | None = None, start: str = "", end: str = ""):
     if acc not in keys:
         acc = settings.MAIN_ACCOUNT
     if not (start and end):
-        e = _yesterday()
+        e = _today()
         start, end = (e - dt.timedelta(days=29)).isoformat(), e.isoformat()
     try:
         span = ds.day_span(start, end)

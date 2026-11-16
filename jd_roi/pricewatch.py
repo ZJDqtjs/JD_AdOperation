@@ -53,17 +53,13 @@ def build(account: str, start: str, end: str) -> dict:
     empty: list = []         # 文件在但 0 行（抓早了 / 接口成功但空）
     data_days: list = []     # 真正有商品明细的天
     per: dict = {}
+    # 今天还没结算：区间包含今天时，用「实时」快照（sz_product_rt）顶上，
+    # 这样表格里能直接看到今天到现在为止的前台价；拿不到就当「今天还没数据」，
+    # 不算「缺天」（那会让人以为漏抓）。
+    today = ds.today().isoformat()
+    realtime_day = ""
 
-    for day in days:
-        payload = ds.load_day(account, day, "sz_product")
-        if payload is None:
-            missing.append(day)
-            continue
-        rows = payload.get("rows") or []
-        if not rows:
-            empty.append(day)
-            continue
-        data_days.append(day)
+    def _merge(rows, day):
         for r in rows:
             if r.get("$summary"):
                 continue
@@ -82,6 +78,26 @@ def build(account: str, start: str, end: str) -> dict:
                 e["url"] = r.get("pro_url")
             e["byDay"][day] = {"amt": _f(r.get(SZ_AMT)), "qty": _f(r.get(SZ_QTY)),
                                "uv": _f(r.get(SZ_UV)), "ord": _f(r.get(SZ_ORDN))}
+
+    for day in days:
+        if day == today:
+            payload = ds.load_day(account, day, "sz_product_rt")
+            rows = (payload or {}).get("rows") or []
+            if rows:
+                data_days.append(day)
+                realtime_day = day
+                _merge(rows, day)
+            continue
+        payload = ds.load_day(account, day, "sz_product")
+        if payload is None:
+            missing.append(day)
+            continue
+        rows = payload.get("rows") or []
+        if not rows:
+            empty.append(day)
+            continue
+        data_days.append(day)
+        _merge(rows, day)
 
     rows_out: list = []
     tot_amt = tot_qty = tot_uv = 0.0
@@ -124,6 +140,8 @@ def build(account: str, start: str, end: str) -> dict:
             "amt": round(amt, 2), "qty": int(qty), "orders": int(orders),
             "uv": int(uv), "priceDays": len(prices),
             "spark": spark, "sparkQty": spark_qty,
+            # 这个 SKU 的「最新价」是不是今天还没结算的实时值
+            "realtime": bool(realtime_day) and last_day == realtime_day,
         }
         rows_out.append(row)
         tot_amt += amt
@@ -139,6 +157,7 @@ def build(account: str, start: str, end: str) -> dict:
         "daysWithData": data_days,
         "missingDays": missing,
         "emptyDays": empty,
+        "realtimeDay": realtime_day,
         "rows": rows_out,
         "totals": {
             "skuCount": len(rows_out),
