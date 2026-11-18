@@ -29,6 +29,10 @@ API：
     POST /api/ai/chat           对话框追问（后台线程，返回 jobId，**立即返回**）
     GET  /api/ai/stream         SSE：某 job 的 phase/reasoning/content/done 事件流（可续传）
     GET  /api/ai/jobs           最近 AI 任务快照（刷新后找回未完成生成）
+    GET  /api/compete           SKU 竞品/关键词分析缓存（前台价页右侧面板）
+    POST /api/compete/run       后台抓取某个 SKU 的同款/行业词/京东推词
+    GET  /api/compete/status    竞品抓取进度
+    POST /api/compete/ai        用现有 LLM 配置解读竞品与关键词数据
     GET  /api/tasks             任务中心：运行中 + 历史任务
     GET  /api/tasks/{id}        单个任务详情（含完整日志）
     POST /api/tasks/{id}/cancel 取消该任务（仅运行中的可取消）
@@ -55,9 +59,9 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse, Response, StreamingResponse)
 
-from . import (aijobs, ai_page, analyze2, analyze_ai, cashflow, config,
-               dailystore as ds, industry, paycomm, pricewatch, profit, report2,
-               scrape_day, settings)
+from . import (aijobs, ai_page, analyze2, analyze_ai, cashflow, compete, config,
+               dailystore as ds, industry, maobao, paycomm, pricewatch, profit,
+               report2, scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -2538,8 +2542,144 @@ function sort(k){
   else SORT = {k:k, d:(k==='itemName'||k==='skuId'||k==='category')?1:-1};
   render();
 }
+
+/* ---------------- 毛利诊断（京东毛保） ---------------- */
+function mbConf(){ return (INIT.maobao || {}); }
+function mbRules(){
+  var key = $('pfAcc').value;
+  return (mbConf().rules || {})[key] || null;
+}
+function mbTemp(r){
+  var C = mbConf(), sid = String(r.skuId == null ? '' : r.skuId);
+  if((C.skuTypes || {})[sid]) return C.skuTypes[sid];
+  var nm = String(r.itemName || ''), i;
+  for(i=0;i<(C.normalWords || []).length;i++){
+    if(nm.indexOf(C.normalWords[i]) >= 0) return 'normal';
+  }
+  for(i=0;i<(C.frozenWords || []).length;i++){
+    if(nm.indexOf(C.frozenWords[i]) >= 0) return 'frozen';
+  }
+  return 'normal';
+}
+function mbPct(v){
+  var n = num(v); if(n===null) return '—';
+  return (n*100).toFixed(2) + '%';
+}
+function mbGroupCard(g, rules){
+  var line = (rules && g.threshold!=null) ? mbPct(g.threshold) : '未配置';
+  var verdict;
+  if(!rules || g.threshold==null) verdict = '<span class="badge b-idle">未配置毛保线</span>';
+  else if(g.settle<=0) verdict = '<span class="badge b-idle">无结算数据</span>';
+  else if(g.triggered) verdict = '<span class="badge b-bad">触发毛保</span>';
+  else verdict = '<span class="badge b-ok">达标</span>';
+  return '<div class="card" style="margin-top:0">'
+    + '<h2 style="margin:0 0 10px;font-size:16px">'+esc(g.label)
+      + ' <span class="tagline">毛保线 '+esc(line)+'</span> '+verdict+'</h2>'
+    + '<div class="tm" style="margin:0">'
+      + '<span>成交件数 <b>'+fmt(g.qty,'int')+'</b></span>'
+      + '<span>前台成交额 <b>¥'+fmt(g.sale,'money')+'</b></span>'
+      + '<span>结算采购额 <b>¥'+fmt(g.settle,'money')+'</b></span>'
+      + '<span>京东毛利额 <b>¥'+fmt(g.profit,'money')+'</b></span>'
+      + '<span>京东毛利率 <b>'+mbPct(g.margin)+'</b></span>'
+      + (rules && g.triggered ? '<span>需补利润 <b style="color:var(--redink)">¥'+fmt(g.shortfall,'money')+'</b></span>' : '')
+    + '</div></div>';
+}
+function mbTable(groups){
+  var rows = [];
+  groups.forEach(function(g){ g.items.forEach(function(it){ rows.push(it); }); });
+  if(!rows.length) return '<div class="hint" style="padding:12px 0">没有可用于测算的 SKU：需要同时有平均前台价与扣点后采购价。</div>';
+  var h = '<div class="tblwrap long" style="margin-top:14px"><table><thead><tr>'
+    + '<th class="l noSort">温层</th><th class="l noSort">SKU</th><th class="l noSort">商品名称</th>'
+    + '<th class="n noSort">成交件数</th><th class="n noSort">平均前台价</th><th class="n noSort">扣点后采购价</th>'
+    + '<th class="n noSort">京东毛利/件</th><th class="n noSort">京东毛利额</th><th class="n noSort">结算采购额</th>'
+    + '<th class="n noSort">毛利率</th></tr></thead><tbody>';
+  rows.forEach(function(it){
+    h += '<tr><td class="l">'+(it.temp==='frozen'?'冷冻':'常温')+'</td>'
+      + '<td class="l"><b>'+esc(it.skuId)+'</b></td>'
+      + '<td class="l nm" title="'+esc(it.itemName)+'">'+esc(it.itemName||'—')+'</td>'
+      + '<td class="n">'+fmt(it.qty,'int')+'</td>'
+      + '<td class="n">¥'+fmt(it.frontPrice,'money')+'</td>'
+      + '<td class="n">¥'+fmt(it.supply,'money')+'</td>'
+      + '<td class="n">¥'+fmt(it.unitProfit,'money')+'</td>'
+      + '<td class="n">¥'+fmt(it.profit,'money')+'</td>'
+      + '<td class="n">¥'+fmt(it.settle,'money')+'</td>'
+      + '<td class="n">'+mbPct(it.margin)+'</td></tr>';
+  });
+  return h+'</tbody></table></div>';
+}
+function maobao(){
+  if(!ROWS.length){ msg('先查询出利润明细，再做毛利诊断','bad'); return; }
+  var acc = $('pfAcc').value;
+  if(acc === 'all'){ msg('毛利诊断按账号结算，请先选择具体账号（例如雨润禾）','bad'); return; }
+  var rules = mbRules();
+  var groups = {
+    frozen:{temp:'frozen',label:'冷冻品',qty:0,sale:0,settle:0,profit:0,items:[]},
+    normal:{temp:'normal',label:'常温品',qty:0,sale:0,settle:0,profit:0,items:[]}
+  };
+  var skipped = [];
+  ROWS.forEach(function(r){
+    var qty = num(r.qty) || 0, front = num(r.frontPrice) || 0, supply = num(r.supply) || 0;
+    if(qty <= 0) return;
+    if(front <= 0 || supply <= 0){ skipped.push(r); return; }
+    var t = mbTemp(r);
+    var sale = qty*front, settle = qty*supply, profit = sale - settle;
+    var it = {skuId:r.skuId, itemName:r.itemName||'', temp:t, qty:qty,
+              frontPrice:front, supply:supply, unitProfit:front-supply,
+              sale:sale, settle:settle, profit:profit,
+              margin: settle>0 ? profit/settle : null};
+    var g = groups[t];
+    g.qty += qty; g.sale += sale; g.settle += settle; g.profit += profit; g.items.push(it);
+  });
+  ['frozen','normal'].forEach(function(k){
+    var g = groups[k];
+    g.margin = g.settle>0 ? g.profit/g.settle : null;
+    g.threshold = rules ? rules[k] : null;
+    g.triggered = !!(rules && g.threshold!=null && g.margin!=null && g.margin < g.threshold);
+    g.shortfall = g.triggered ? Math.max(0, g.threshold*g.settle - g.profit) : 0;
+    g.items.sort(function(a,b){ return b.profit - a.profit; });
+  });
+  var tot = {qty:0, sale:0, settle:0, profit:0};
+  ['frozen','normal'].forEach(function(k){
+    var g = groups[k];
+    tot.qty += g.qty; tot.sale += g.sale; tot.settle += g.settle; tot.profit += g.profit;
+  });
+  tot.margin = tot.settle>0 ? tot.profit/tot.settle : null;
+  var shortfall = groups.frozen.shortfall + groups.normal.shortfall;
+
+  var accLabel = (INIT.labels || {})[acc] || acc;
+  $('mbMeta').textContent = accLabel + ' · ' + $('pfStart').value + ' ~ ' + $('pfEnd').value;
+  var warn = '';
+  if(!rules){
+    warn = '<div class="warn" style="margin:0 0 14px">当前账号「'+esc(accLabel)+'」没有配置毛保线，下面只测算京东毛利，不判定触发。'
+      + '已配置：雨润禾（常温 &lt; 10%、冷冻 &lt; 18%）。</div>';
+  } else if(skipped.length){
+    warn = '<div class="warn" style="margin:0 0 14px">'+skipped.length+' 个 SKU 缺平均前台价或扣点后采购价，未计入测算：'
+      + skipped.slice(0,5).map(function(r){ return esc(r.skuId)+' '+esc(String(r.itemName||'').slice(0,16)); }).join('、')
+      + (skipped.length>5?' 等':'') + '。可先点「只更新 ERP 成本」再试。</div>';
+  }
+  $('mbBody').innerHTML = warn
+    + '<div class="grid g2">'+mbGroupCard(groups.frozen,rules)+mbGroupCard(groups.normal,rules)+'</div>'
+    + '<div class="tm" style="margin-top:14px"><span>合计：成交 <b>'+fmt(tot.qty,'int')+'</b> 件</span>'
+      + '<span>前台成交额 <b>¥'+fmt(tot.sale,'money')+'</b></span>'
+      + '<span>结算采购额 <b>¥'+fmt(tot.settle,'money')+'</b></span>'
+      + '<span>京东毛利额 <b>¥'+fmt(tot.profit,'money')+'</b></span>'
+      + '<span>京东毛利率 <b>'+mbPct(tot.margin)+'</b></span>'
+      + '<span>触发补差合计 <b>¥'+fmt(shortfall,'money')+'</b></span></div>'
+    + mbTable([groups.frozen, groups.normal])
+    + '<div class="note" style="margin-top:16px">'
+      + '<p><b>口径</b>：平均前台价取利润行；扣点后采购价 = ERP 到手结算价 supply。'
+      + '京东毛利/件 = 平均前台价 − 扣点后采购价；毛利率 = 京东毛利合计 ÷ 结算给我们的扣点后采购价合计。</p>'
+      + '<p><b>毛保</b>：雨润禾常温品低于 10%、冷冻品低于 18% 触发。'
+      + '需补利润 = 毛保线 × 结算采购额 − 实际毛利额，即京东要补到毛保线还差的利润。</p>'
+      + '<p><b>温层判定</b>：已登记 SKU 按登记表；未登记的按商品名关键词（冷冻/速冻/解冻/薯条/什锦/杂菜/毛豆/青豆/纳豆 → 冷冻，'
+      + '冻干 → 常温），都没有按常温。</p></div>';
+  $('mbModal').classList.add('open');
+  msg('毛利诊断：' + accLabel + '，触发补差 ¥' + fmt(shortfall,'money'));
+}
+function closeMaobao(){ var m = $('mbModal'); if(m) m.classList.remove('open'); }
 window.PF = {run:run, refetch:refetch, exp:exp, expView:expView, dim:dim, sort:sort,
-             render:render, switchAcc:switchAcc, reprice:reprice, quick:quick};
+             render:render, switchAcc:switchAcc, reprice:reprice, quick:quick,
+             maobao:maobao, closeMaobao:closeMaobao};
 function boot(){
   poll();
   // 从「缓存管理」点「查看」带区间打开：自动查一次，有缓存就直接秒出
@@ -2581,7 +2721,8 @@ def profit_page(request: Request):
             "auto": bool(q.get("start") and q.get("end")),
             "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
-            "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
+            "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"],
+            "maobao": maobao.page_rules(settings.ACCOUNTS)}
     quick_html = _quick_html("PF")
     today_iso = _today().isoformat()
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -2628,7 +2769,11 @@ def profit_page(request: Request):
 <div class="grid g4" id="pfKpis" style="display:none;margin-top:18px"></div>
 
 <div class="card" id="pfTableCard" style="display:none">
-  <h2><span id="pfTableTitle">SKU 明细</span> <span class="tagline">点表头可换排序</span></h2>
+  <h2><span id="pfTableTitle">SKU 明细</span> <span class="tagline">点表头可换排序</span>
+    <button class="btn sec mini" id="pfMaobao" onclick="PF.maobao()"
+            style="margin-left:12px"
+            title="按「平均前台价 − 扣点后采购价」测算京东毛利，判断是否触发毛保">毛利诊断</button>
+  </h2>
   <div class="toolbar">
     <span class="tabs" style="margin:0 12px 8px 0">
       <button type="button" class="tab active" id="pfDimSku" onclick="PF.dim('sku')">按 SKU</button>
@@ -2645,6 +2790,17 @@ def profit_page(request: Request):
 
 <div class="note" id="pfNotes" style="display:none;margin-top:16px"></div>
 
+<div class="modal" id="mbModal" onclick="if(event.target===this)PF.closeMaobao()">
+  <div class="modal-card" style="max-width:1120px">
+    <div class="modal-head">
+      <h2>毛利诊断 · 京东毛保测算</h2>
+      <span class="hint" id="mbMeta" style="margin:0"></span>
+      <button class="btn sec mini" onclick="PF.closeMaobao()">关闭</button>
+    </div>
+    <div class="modal-body" id="mbBody"></div>
+  </div>
+</div>
+
 <div class="note" style="margin-top:18px">
   <p><b>到手金额</b> = 商智成交件数 × ERP「到手结算价 supply」（京东结算给我们的每件金额，已扣点）。</p>
   <p><b>毛利</b> = 成交件数 × 「毛利/件」= 到手结算价 − 货款 − 运费 − 包材 − 人工（<b>未扣广告</b>），
@@ -2658,6 +2814,9 @@ def profit_page(request: Request):
      这里也能看到件数与毛利（悬停可看「成交账号」）。两个账号的商智都没有它时，才是 0 件数、毛利 0 的纯花费行。</p>
   <p>注意：同一个 SKU 若两个账号都在投，会同时出现在两张表里且各自带全额成交，跨账号相加会重复计成交与毛利，
      按账号单独看才准。</p>
+  <p><b>毛利诊断</b>（「SKU 明细」右侧按钮）：京东毛利 = 平均前台价 − 扣点后采购价，
+     毛利率 = 京东毛利合计 ÷ 结算给我们的扣点后采购价合计。雨润禾账号常温品低于 10%、冷冻品低于 18% 触发毛保，
+     诊断里给出触发温层与需补利润（= 毛保线 × 结算采购额 − 实际毛利额）。</p>
 </div>
 
 </div>
@@ -2993,7 +3152,10 @@ function detail(r){
     + '　成交 '+cnt(r.qty)+' 件 / '+money(r.amt)
     + '　访客 '+cnt(r.uv);
   drawChart(r);
-  $('pwDetail').scrollIntoView({behavior:'smooth', block:'nearest'});
+  // 宽屏时右侧面板与价格表并排，别把页面滚到下方图表、把面板挤出视口
+  if(window.innerWidth <= 1280){
+    $('pwDetail').scrollIntoView({behavior:'smooth', block:'nearest'});
+  }
 }
 
 function drawChart(r){
@@ -3242,6 +3404,7 @@ window.PW = {
       all[i].className = 'pwrow' + (all[i].getAttribute('data-sku') === String(sid) ? ' on' : '');
     }
     detail(r);
+    if(window.CMP) CMP.show(r.skuId, r.itemName, r.priceLatest);
   },
   /* 夜间核算摘要里点某个 SKU：滚到主表并打开它的曲线 */
   pickSku: function(sid){
@@ -3350,6 +3513,295 @@ window.PW.run();
 """
 
 
+# ---------------------------------------------------------------- 竞品与关键词面板
+COMPETE_CSS = """
+.pwSplit{display:grid;grid-template-columns:minmax(0,1fr) minmax(360px,430px);gap:18px;
+  align-items:start}
+.pwSplit.collapsed{grid-template-columns:minmax(0,1fr)}
+.pwSplit.collapsed #cmpPanel{display:none}
+.pwSplit #pwTableCard{min-width:0}
+#cmpPanel{margin-top:18px;position:sticky;top:75px;max-height:calc(100vh - 87px);overflow:auto}
+@media(max-width:1280px){
+  .pwSplit{grid-template-columns:1fr}
+  #cmpPanel{position:static;max-height:none}
+}
+.cmp h2{margin-bottom:6px}
+.cmp h3{margin:16px 0 8px;font-size:14px;font-weight:600;color:var(--ink);
+  display:flex;align-items:center;gap:8px}
+.cmp h3 .tagline{margin-left:auto;font-weight:400}
+.cmp table{font-size:12px}
+.cmp th,.cmp td{padding:6px 7px}
+.cmp .cmpname{font-size:13px;line-height:1.5;color:var(--ink);margin:0 0 8px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.cmp .cmptools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}
+.cmp .cmpsku{font-family:var(--mono);font-size:11.5px;color:var(--muted2)}
+.cmp .cmpchips{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 2px}
+.cmp .cmpchip{background:var(--soft);border:1px solid var(--hair);border-radius:999px;
+  padding:3px 9px;font-size:12px;color:var(--body);white-space:nowrap}
+.cmp .cmpchip b{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+.cmp .cmpai{font-size:13px;line-height:1.8;color:var(--body);white-space:pre-wrap;
+  background:var(--soft);border:1px solid var(--hair);border-radius:var(--r-md);
+  padding:12px;max-height:46vh;overflow:auto}
+.cmp .cmpai .think{color:var(--muted2)}
+.cmp .cmpempty{font-size:12.5px;color:var(--muted);line-height:1.7;padding:6px 0}
+.cmp .pwsub{white-space:normal}
+"""
+
+COMPETE_JS = r"""
+(function(){
+var CUR = null, POLL = null, ES = null, RAW = '', TRIED = {};
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function num(v){ if(v===null||v===undefined||v==='') return null;
+  var n=Number(v); return isNaN(n)?null:n; }
+function fx(v,d){ var n=num(v); if(n===null) return '—';
+  return n.toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+function money(v){ var n=num(v); return n===null?'—':('¥'+fx(n,2)); }
+function cnt(v){ var n=num(v); return n===null?'—':n.toLocaleString('zh-CN'); }
+function acc(){ var e=$('pwAcc'); return e ? e.value : ''; }
+function msg(s,bad){ var e=$('cmpMsg'); if(!e) return; e.textContent=s||'';
+  e.style.color = bad ? 'var(--redink)' : 'var(--muted)'; }
+function skuLink(s){
+  return '<a class="skulink" href="https://item.jd.com/'+esc(s)+'.html" target="_blank"'
+    + ' rel="noopener noreferrer" title="在新标签打开京东商品页">'+esc(s)+'</a>';
+}
+function section(title, sub, body){
+  return '<h3>'+esc(title)+(sub?'<span class="tagline">'+sub+'</span>':'')+'</h3>'+body;
+}
+function table(head, rows){
+  return '<div class="tblwrap short"><table><thead><tr>'+head+'</tr></thead><tbody>'
+    + rows + '</tbody></table></div>';
+}
+
+function render(d){
+  var own = num(d.price);
+  var band = d.priceBand || {};
+  var cps = (d.competitorShown || []).slice(0, 8);
+  var html = '';
+
+  var adv = (band.adCount !== undefined && band.adCount !== null)
+    ? band.adCount : cps.filter(function(x){ return x.ad; }).length;
+  if(cps.length){
+    html += section('同款竞品', '共 '+cnt((d.competitors||[]).length)+' 个 · 广告 '+cnt(adv)+' 个',
+      table('<th class="l noSort">商品</th><th class="n noSort">价格</th>'
+            + '<th class="n noSort">较你</th>',
+        cps.map(function(x){
+          var p = num(x.price);
+          var diff = (p!==null && own!==null) ? (p-own) : null;
+          return '<tr><td class="l">'
+            + '<div class="pwsub" style="color:var(--ink)">'
+            + esc(String(x.title||'').slice(0,44))+'</div>'
+            + '<div class="pwsub">'+skuLink(x.sku)
+            + (x.ad ? ' · <span style="color:var(--primary)">广告</span>' : '')
+            + (x.shop ? ' · '+esc(x.shop) : '')+'</div></td>'
+            + '<td>'+money(p)+'</td>'
+            + '<td>'+(diff===null?'—':((diff>0?'+':'')+fx(diff,2)))+'</td></tr>';
+        }).join('')));
+  } else {
+    html += section('同款竞品', '', '<div class="cmpempty">没有抓到同款，换个核心词或稍后重试。</div>');
+  }
+  if(band.count){
+    html += '<div class="pwsub" style="margin-top:6px">竞品价带 '
+      + money(band.min)+' ~ '+money(band.max)+'，中位 '+money(band.median)
+      + (band.basis ? ('（'+esc(band.basis)+'）') : '')
+      + (band.ownRank ? ('；你在第 '+band.ownRank+' 低（共 '+(band.count+1)+' 个）') : '')
+      + '</div>';
+  }
+
+  var tr = d.trends || [];
+  if(tr.length){
+    html += section('行业关键词', '近7天 · 指数口径',
+      table('<th class="l noSort">词</th><th class="n noSort">展现</th>'
+            + '<th class="n noSort">点击</th><th class="n noSort">CTR</th>'
+            + '<th class="n noSort">CVR</th><th class="n noSort">出价</th>',
+        tr.map(function(x){
+          return '<tr><td class="l">'+esc(x.word)+'</td><td>'+cnt(x.imp)+'</td>'
+            + '<td>'+cnt(x.clicks)+'</td><td>'+fx(x.ctr,2)+'%</td>'
+            + '<td>'+fx(x.cvr,2)+'%</td><td>'+money(x.bid)+'</td></tr>';
+        }).join('')));
+  }
+
+  var recs = d.recs || {}, order = ['热搜词','潜力词','竞品词','竞品争夺词'], chips = '';
+  order.forEach(function(k){
+    var arr = (recs[k]||[]).slice(0, k==='竞品词' ? 8 : 6);
+    if(!arr.length) return;
+    chips += '<div class="pwsub" style="margin:7px 0 2px">'+esc(k)+'</div>'
+      + '<div class="cmpchips">' + arr.map(function(x){
+          return '<span class="cmpchip" title="搜索量 '+cnt(x.pv)+' · 建议出价 '
+            + money(x.bid)+'">'+esc(x.word)+' <b>'+cnt(x.pv)+'</b></span>';
+        }).join('') + '</div>';
+  });
+  if(chips) html += section('京东推词', '搜索量 + 建议出价', chips);
+
+  var own2 = d.ownTerms || [];
+  if(own2.length){
+    html += section('本店搜索词', '近30天 · 按花费',
+      table('<th class="l noSort">词</th><th class="n noSort">花费</th>'
+            + '<th class="n noSort">订单</th><th class="n noSort">ROI</th>',
+        own2.map(function(x){
+          return '<tr><td class="l">'+esc(x.word)+'</td><td>'+money(x.cost)+'</td>'
+            + '<td>'+cnt(x.orders)+'</td><td>'+fx(x.roi,2)+'</td></tr>';
+        }).join('')));
+  }
+
+  html += '<div class="pwsub" style="margin-top:12px">抓取于 '
+    + esc(String(d.fetchedAt||'').replace('T',' ').slice(0,16))
+    + ' · 账号 '+esc(d.accountLabel || d.account || '')
+    + ' · 核心词「'+esc(d.keyword||'')+'」</div>'
+    + '<div class="pwsub" style="margin-top:4px">'+esc(d.caliber||'')+'</div>';
+
+  $('cmpContent').innerHTML = html;
+}
+
+function paint(){
+  var b = $('cmpAi'); if(!b) return;
+  var txt = (RAW || 'AI 正在思考…')
+    .replace(/\*\*/g, '')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/^[-*_]{3,}\s*$/gm, '');
+  b.textContent = txt;
+  b.scrollTop = b.scrollHeight;
+  var p = $('cmpPanel');
+  if(p) p.scrollTop = p.scrollHeight;
+}
+
+function start(){
+  if(!CUR) return;
+  msg('开始抓取（约 30~60 秒，期间占用浏览器登录态）…');
+  var q = 'sku='+encodeURIComponent(CUR.sku)
+        + '&account='+encodeURIComponent(acc())
+        + '&name='+encodeURIComponent(CUR.name||'');
+  if(CUR.price !== null && CUR.price !== undefined && CUR.price !== ''){
+    q += '&price='+encodeURIComponent(CUR.price);
+  }
+  fetch('/api/compete/run?'+q, {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ msg(j.error||'启动失败', true); return; }
+      poll();
+    })
+    .catch(function(e){ msg('启动失败：'+e, true); });
+}
+
+function poll(){
+  clearTimeout(POLL);
+  if(!CUR) return;
+  fetch('/api/compete/status?sku='+encodeURIComponent(CUR.sku)
+        + '&account='+encodeURIComponent(acc()), {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j.running){ msg(j.progress||'抓取中…'); POLL = setTimeout(poll, 2000); return; }
+      if(j.error){ msg('抓取失败：'+j.error, true); return; }
+      load(true);
+    })
+    .catch(function(){ POLL = setTimeout(poll, 2500); });
+}
+
+function load(afterRun){
+  if(!CUR) return;
+  var sku = CUR.sku;
+  if(!afterRun) msg('读取缓存…');
+  fetch('/api/compete?sku='+encodeURIComponent(sku)
+        + '&account='+encodeURIComponent(acc()), {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j.ok && j.data){
+        if(!j.data.name && CUR.name) j.data.name = CUR.name;
+        // 价格以左侧表格当前值为准（缓存里的价格可能是上次抓取时的）
+        if(CUR.price !== null && CUR.price !== undefined && CUR.price !== ''){
+          j.data.price = CUR.price;
+        }
+        render(j.data);
+        msg(j.fresh ? '缓存 ' + String(j.data.fetchedAt||'').replace('T',' ').slice(0,16)
+              : '缓存已过期，可点「重新抓取」');
+        return;
+      }
+      if(afterRun){
+        msg('抓取完成但没有数据，请稍后重试', true);
+        return;
+      }
+      if(TRIED[sku]){ msg('没有可用数据，可点「重新抓取」', true); return; }
+      TRIED[sku] = 1;
+      start();
+    })
+    .catch(function(e){ msg('读取失败：'+e, true); });
+}
+
+function show(sku, name, price){
+  CUR = {sku:String(sku), name:name||'', price:price};
+  $('cmpEmpty').style.display = 'none';
+  $('cmpBody').style.display = '';
+  $('cmpTag').textContent = 'SKU '+sku;
+  $('cmpName').textContent = name || ('SKU '+sku);
+  $('cmpSku').innerHTML = skuLink(sku);
+  $('cmpContent').innerHTML = '';
+  $('cmpAiBox').style.display = 'none';
+  $('cmpAi').textContent = '';
+  if(ES){ try{ ES.close(); }catch(e){} ES = null; }
+  load(false);
+}
+
+function refresh(){
+  if(!CUR) return;
+  delete TRIED[CUR.sku];
+  start();
+}
+
+function togglePanel(){
+  var sp = document.querySelector('.pwSplit');
+  if(!sp) return;
+  sp.classList.toggle('collapsed');
+  try{ localStorage.setItem('cmpCollapsed', sp.classList.contains('collapsed') ? '1' : '0'); }catch(e){}
+}
+
+function ai(){
+  if(!CUR) return;
+  if(ES){ try{ ES.close(); }catch(e){} ES = null; }
+  RAW = '';
+  $('cmpAiBox').style.display = '';
+  $('cmpAi').textContent = 'AI 正在读取数据…';
+  var panel = $('cmpPanel');
+  if(panel) panel.scrollTop = panel.scrollHeight;
+  fetch('/api/compete/ai?sku='+encodeURIComponent(CUR.sku)
+        + '&account='+encodeURIComponent(acc()), {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ $('cmpAi').textContent = j.error || 'AI 启动失败'; return; }
+      var es = new EventSource('/api/ai/stream?job='+encodeURIComponent(j.jobId));
+      ES = es;
+      es.addEventListener('content', function(e){
+        var d = JSON.parse(e.data); RAW += d.t; paint();
+      });
+      es.addEventListener('reasoning', function(){ if(!RAW) paint(); });
+      es.addEventListener('phase', function(e){
+        if(RAW) return;
+        var d = JSON.parse(e.data);
+        $('cmpAi').textContent = d.t || 'AI 正在思考…';
+      });
+      es.addEventListener('error', function(e){
+        try{ var d = JSON.parse(e.data); RAW += '\n[出错] '+(d.t||''); paint(); }catch(_){}
+      });
+      es.addEventListener('done', function(){
+        try{ es.close(); }catch(e){}
+        ES = null; paint();
+      });
+    })
+    .catch(function(e){ $('cmpAi').textContent = 'AI 启动失败：'+e; });
+}
+
+window.CMP = {show: show, refresh: refresh, ai: ai, togglePanel: togglePanel};
+try{
+  if(localStorage.getItem('cmpCollapsed') === '1'){
+    var sp = document.querySelector('.pwSplit');
+    if(sp) sp.classList.add('collapsed');
+  }
+}catch(e){}
+})();
+"""
+
+
 @app.get("/price", response_class=HTMLResponse)
 def price_page(request: Request):
     """SKU 前台价：逐日看每个 SKU 的「成交金额 ÷ 成交件数」怎么变。
@@ -3381,7 +3833,7 @@ def price_page(request: Request):
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SKU 前台价 · 京东广告运营</title>
-<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PRICE_CSS}</style>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PRICE_CSS}</style><style>{COMPETE_CSS}</style>
 </head><body>
 {report2.navtop("/price")}
 <header class="top"><div class="wrap pagehead">
@@ -3390,7 +3842,7 @@ def price_page(request: Request):
   <div class="metaline">
     <span>前台件单价 = 商智成交金额 ÷ 成交件数</span><span class="dot"></span>
     <span>消费者实付（含优惠券 / 满减）</span><span class="dot"></span>
-    <span>只读本地按天入库，不发请求</span>
+    <span>价格表只读本地；右侧竞品分析按需抓取</span>
   </div>
   <div class="actions">
     <a class="btn ghost mini" href="/profit">月度利润 →</a>
@@ -3413,6 +3865,8 @@ def price_page(request: Request):
       <button type="button" class="chip" onclick="PWQUICK('month')">本月</button>
       <button type="button" class="chip" onclick="PWQUICK('lastmonth')">上月</button>
     </span>
+    <button type="button" class="btn sec mini" style="margin-left:auto"
+            onclick="CMP.togglePanel()">竞品面板</button>
   </div>
   <div class="hint" id="pwMsg" style="min-height:20px">读取本地商智商品明细…</div>
   <div class="pwcover" id="pwCover"></div>
@@ -3436,6 +3890,7 @@ def price_page(request: Request):
 
 <div class="grid g4" id="pwKpis" style="display:none;margin-top:18px"></div>
 
+<div class="pwSplit">
 <div class="card" id="pwTableCard" style="margin-top:18px">
   <h2>价格变化 <span class="tagline">点任意一行看逐日曲线</span></h2>
   <div class="toolbar">
@@ -3448,6 +3903,28 @@ def price_page(request: Request):
   </div>
 </div>
 
+<aside class="card cmp" id="cmpPanel">
+  <h2>竞品与关键词 <span class="tagline" id="cmpTag">点左侧 SKU 行开始</span></h2>
+  <div class="cmpempty" id="cmpEmpty">选一个 SKU，自动分析同款竞品、价格带、行业关键词和京东推词；
+    也可以让 AI 基于这些数据给出投放动作。</div>
+  <div id="cmpBody" style="display:none">
+    <div class="cmpname" id="cmpName"></div>
+    <div class="cmptools">
+      <span class="cmpsku" id="cmpSku"></span>
+      <button class="btn ghost mini" onclick="CMP.togglePanel()">收起</button>
+      <button class="btn sec mini" onclick="CMP.refresh()">重新抓取</button>
+      <button class="btn mini" onclick="CMP.ai()">AI 解读</button>
+    </div>
+    <div class="hint" id="cmpMsg" style="min-height:18px;margin:0 0 4px"></div>
+    <div id="cmpContent"></div>
+    <div id="cmpAiBox" style="display:none">
+      <h3>AI 解读<span class="tagline">基于本面板数据</span></h3>
+      <div class="cmpai" id="cmpAi"></div>
+    </div>
+  </div>
+</aside>
+</div>
+
 <div class="card" id="pwDetail" style="display:none">
   <h2><span id="pwDTitle">—</span>
     <span class="tagline">逐日前台件单价（成交金额 ÷ 成交件数）</span></h2>
@@ -3456,6 +3933,10 @@ def price_page(request: Request):
 </div>
 
 <div class="note" style="margin-top:18px">
+  <p><b>右侧「竞品与关键词」</b>：点任意 SKU 行后按需抓取京东搜索前台的同款在售商品、
+     行业关键词效率（京准通流量解析）、京东推词（热搜/潜力/竞品/争夺）和本店近 30 天搜索词，
+     结果按 SKU + 账号缓存 12 小时，可点「重新抓取」刷新；「AI 解读」用现有模型配置生成投放建议。
+     京东看不到竞品后台的计划/预算/出价，面板给的是公开前台数据 + 平台侧指标。</p>
   <p><b>前台件单价</b> = 商智「商品明细」成交金额 ÷ 成交件数（消费者实付，已含优惠券/满减），
      与「月度利润」页的前台件单价是同一口径；不是商品页标价（商智没有标价字段）。</p>
   <p><b>有成交才有价</b>：某天 0 件，这天就没有价，曲线断开、不做插值——
@@ -3487,6 +3968,7 @@ def price_page(request: Request):
 {report2._echarts_src()}
 <script>window.PW_INIT = {json.dumps(init, ensure_ascii=False)};</script>
 <script>{PRICE_JS}</script>
+<script>{COMPETE_JS}</script>
 </body></html>""")
 
 
@@ -3587,6 +4069,117 @@ def api_price_realtime_fetch(account: str | None = None):
                                          name="sz-realtime", trigger="manual")
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------- 竞品与关键词分析
+_COMPETE_JOBS: dict[str, dict] = {}
+_COMPETE_LOCK = threading.Lock()
+
+
+def _compete_state(sku: str) -> dict:
+    with _COMPETE_LOCK:
+        return dict(_COMPETE_JOBS.get(str(sku)) or {})
+
+
+def _sku_arg(sku: str) -> str:
+    sku = str(sku or "").strip()
+    return sku if re.fullmatch(r"\d{5,20}", sku) else ""
+
+
+@app.get("/api/compete")
+def api_compete(sku: str, account: str | None = None):
+    """读某个 SKU 的竞品/关键词分析缓存（12 小时内返回 fresh=True）。"""
+    sku = _sku_arg(sku)
+    if not sku:
+        return JSONResponse({"ok": False, "error": "SKU 不合法"},
+                            headers={"Cache-Control": "no-store"})
+    acc = compete._account_for(account) if account else None
+    fresh = compete.load_cache(sku, acc)
+    if fresh:
+        return JSONResponse({"ok": True, "data": fresh, "fresh": True},
+                            headers={"Cache-Control": "no-store"})
+    old = compete.load_cache(sku, acc, max_age=None)
+    if old:
+        return JSONResponse({"ok": True, "data": old, "fresh": False},
+                            headers={"Cache-Control": "no-store"})
+    return JSONResponse({"ok": False, "empty": True},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/compete/run")
+def api_compete_run(sku: str, account: str | None = None,
+                    keyword: str | None = None, name: str | None = None,
+                    price: float | None = None):
+    """后台抓一次：前台同款 + 行业词 + 京东推词 + 本店搜索词。"""
+    sku = str(sku or "").strip()
+    if not re.fullmatch(r"\d{5,20}", sku):
+        return {"ok": False, "error": "SKU 不合法"}
+    key = f"{sku}:{compete._account_for(account)}"
+    if _compete_state(key).get("running"):
+        return {"ok": True, "running": True}
+    with _COMPETE_LOCK:
+        _COMPETE_JOBS[key] = {"running": True, "progress": "排队中…", "error": None,
+                              "startedAt": settings.now_iso(), "finishedAt": None}
+
+    def _log(text: str) -> None:
+        with _COMPETE_LOCK:
+            job = _COMPETE_JOBS.get(key)
+            if job is not None:
+                job["progress"] = str(text)[:140]
+
+    def _work() -> None:
+        try:
+            compete.collect(sku, account=account, keyword=keyword,
+                            name=name, price=price, log=_log)
+            with _COMPETE_LOCK:
+                job = _COMPETE_JOBS.get(key) or {}
+                job.update({"running": False, "progress": "完成", "error": None,
+                            "finishedAt": settings.now_iso()})
+        except Exception as exc:  # noqa: BLE001
+            with _COMPETE_LOCK:
+                job = _COMPETE_JOBS.get(key) or {}
+                job.update({"running": False, "error": f"{type(exc).__name__}: {exc}"[:300],
+                            "finishedAt": settings.now_iso()})
+
+    threading.Thread(target=_work, daemon=True, name=f"compete-{sku}").start()
+    return {"ok": True, "running": True}
+
+
+@app.get("/api/compete/status")
+def api_compete_status(sku: str, account: str | None = None):
+    sku = _sku_arg(sku)
+    if not sku:
+        return {"ok": False, "error": "SKU 不合法"}
+    st = _compete_state(f"{sku}:{compete._account_for(account)}")
+    if not st:
+        return {"ok": True, "running": False}
+    return {"ok": True, **{k: st.get(k) for k in
+                           ("running", "progress", "error", "startedAt", "finishedAt")}}
+
+
+@app.post("/api/compete/ai")
+def api_compete_ai(sku: str, account: str | None = None):
+    """用现有 LLM 配置对某个 SKU 的竞品/关键词数据做解读（SSE 走 /api/ai/stream）。"""
+    if not settings.AI_ENABLED:
+        return {"ok": False, "error": "AI 解读已禁用（JD_AI_ENABLED=0）"}
+    sku = _sku_arg(sku)
+    if not sku:
+        return {"ok": False, "error": "SKU 不合法"}
+    data = compete.load_cache(sku, compete._account_for(account), max_age=None)
+    if not data:
+        return {"ok": False, "error": "先抓取分析数据，再让 AI 解读"}
+    job = aijobs.JOBS.new("compete", {"sku": str(sku)})
+
+    def _work() -> None:
+        try:
+            job.emit("phase", "读取竞品与关键词数据…")
+            compete.ai_run(data, on_event=lambda kind, text="": job.emit(kind, text))
+            job.finish(result={"sku": str(sku)})
+        except Exception as exc:  # noqa: BLE001
+            job.finish(error=f"{type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_work, daemon=True, name=f"compete-ai-{sku}").start()
+    return {"ok": True, "jobId": job.id}
 
 
 @app.post("/api/price/backfill")
@@ -4525,6 +5118,12 @@ class LoginSession:
         from . import config
         from .browser import has_login, launch_persistent, session_ok
         pw = ctx = None
+        # 与保活/检查/抓取共用同一个 Profile：不拿锁就起浏览器，会在「别的任务正开着
+        # 同一个 user_data_dir」时直接失败（页面表现为一直出不来二维码/窗口）。
+        if not self._profile_lock.acquire(timeout=60):
+            self._set(state="error",
+                      message="浏览器登录态正被其他任务占用（抓取/保活/检查），请等它结束再登录")
+            return
         try:
             # 容器里没有 X 显示：有头 Chromium 起不来（Playwright 只会抛一句难懂的
             # "headed browser without having a XServer"），这里先给出可操作的提示。
@@ -4589,11 +5188,19 @@ class LoginSession:
                 pw and pw.stop()
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                self._profile_lock.release()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _loop(self, account: str) -> None:
         from . import config
         from .browser import has_login, launch_persistent, session_ok
         pw = ctx = None
+        if not self._profile_lock.acquire(timeout=60):
+            self._set(state="error",
+                      message="浏览器登录态正被其他任务占用（抓取/保活/检查），请等它结束再扫码")
+            return
         try:
             pw, ctx = launch_persistent(headless=True, account=account)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -4634,6 +5241,10 @@ class LoginSession:
                 pass
             try:
                 pw and pw.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._profile_lock.release()
             except Exception:  # noqa: BLE001
                 pass
 
