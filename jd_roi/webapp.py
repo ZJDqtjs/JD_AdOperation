@@ -2827,6 +2827,179 @@ def profit_page(request: Request):
 </body></html>""")
 
 
+def _mb_num(v, kind: str = "money") -> str:
+    if v is None or v == "":
+        return "—"
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if kind == "int":
+        return f"{int(n):,}"
+    if kind == "pct":
+        return f"{n * 100:.2f}%"
+    return f"{n:,.2f}"
+
+
+def _mb_group_card(g: dict) -> str:
+    threshold = g.get("threshold")
+    if threshold is None:
+        badge = '<span class="badge b-idle">未配置毛保线</span>'
+    elif (g.get("settle") or 0) <= 0:
+        badge = '<span class="badge b-idle">无结算数据</span>'
+    elif g.get("triggered"):
+        badge = '<span class="badge b-bad">触发毛保</span>'
+    else:
+        badge = '<span class="badge b-ok">达标</span>'
+    line = _mb_num(threshold, "pct") if threshold is not None else "未配置"
+    shortfall = (f'<span>需补利润 <b style="color:var(--redink)">¥{_mb_num(g.get("shortfall"))}</b></span>'
+                 if g.get("triggered") else "")
+    return (
+        '<div class="card" style="margin-top:0">'
+        f'<h2 style="margin:0 0 10px;font-size:16px">{_e(g.get("label"))}'
+        f' <span class="tagline">毛保线 {_e(line)}</span> {badge}</h2>'
+        '<div class="tm" style="margin:0">'
+        f'<span>成交件数 <b>{_mb_num(g.get("qty"), "int")}</b></span>'
+        f'<span>前台成交额 <b>¥{_mb_num(g.get("sale"))}</b></span>'
+        f'<span>结算采购额 <b>¥{_mb_num(g.get("settle"))}</b></span>'
+        f'<span>京东毛利额 <b>¥{_mb_num(g.get("profit"))}</b></span>'
+        f'<span>京东毛利率 <b>{_mb_num(g.get("margin"), "pct")}</b></span>'
+        f'{shortfall}</div></div>'
+    )
+
+
+def _mb_html(diag: dict, acc_label: str, start: str, end: str, saved_at: str = "") -> str:
+    groups = diag.get("groups") or []
+    total = diag.get("total") or {}
+    skipped = diag.get("skipped") or []
+    shortfall = sum(float(g.get("shortfall") or 0) for g in groups)
+
+    warn = ""
+    if not diag.get("rules"):
+        warn = ('<div class="warn">当前账号「' + _e(acc_label) + '」没有配置毛保线，下面只测算京东毛利，不判定触发。'
+                '已配置：雨润禾（常温 &lt; 10%、冷冻 &lt; 18%）。</div>')
+    elif skipped:
+        names = "、".join(f'{_e(x.get("skuId"))} {_e(str(x.get("itemName") or "")[:16])}'
+                         for x in skipped[:5])
+        warn = (f'<div class="warn">{len(skipped)} 个 SKU 缺平均前台价或扣点后采购价，未计入测算：'
+                f'{names}{" 等" if len(skipped) > 5 else ""}。可先到「月度利润」点「只更新 ERP 成本」再试。</div>')
+
+    rows = []
+    for g in groups:
+        for it in (g.get("items") or []):
+            rows.append(
+                '<tr>'
+                f'<td class="l">{"冷冻" if it.get("temp") == "frozen" else "常温"}</td>'
+                f'<td class="l"><b>{_e(it.get("skuId"))}</b></td>'
+                f'<td class="l nm" title="{_e(it.get("itemName"))}">{_e(it.get("itemName") or "—")}</td>'
+                f'<td class="n">{_mb_num(it.get("qty"), "int")}</td>'
+                f'<td class="n">¥{_mb_num(it.get("frontPrice"))}</td>'
+                f'<td class="n">¥{_mb_num(it.get("supply"))}</td>'
+                f'<td class="n">¥{_mb_num(it.get("unitProfit"))}</td>'
+                f'<td class="n">¥{_mb_num(it.get("profit"))}</td>'
+                f'<td class="n">¥{_mb_num(it.get("settle"))}</td>'
+                f'<td class="n">{_mb_num(it.get("margin"), "pct")}</td>'
+                '</tr>')
+    table = ('<div class="tblwrap long" style="margin-top:14px"><table><thead><tr>'
+             '<th class="l">温层</th><th class="l">SKU</th><th class="l">商品名称</th>'
+             '<th class="n">成交件数</th><th class="n">平均前台价</th><th class="n">扣点后采购价</th>'
+             '<th class="n">京东毛利/件</th><th class="n">京东毛利额</th><th class="n">结算采购额</th>'
+             '<th class="n">毛利率</th></tr></thead><tbody>'
+             + ("".join(rows) or '<tr><td class="l" colspan="10">没有可用于测算的 SKU：需要同时有平均前台价与扣点后采购价。</td></tr>')
+             + '</tbody></table></div>')
+
+    return (
+        f'<div class="hint" style="margin:0 0 12px">{_e(acc_label)} · {_e(start)} ~ {_e(end)}'
+        + (f' · 利润缓存 {_e(saved_at)}' if saved_at else '') + '</div>'
+        + warn
+        + '<div class="grid g2">' + "".join(_mb_group_card(g) for g in groups) + '</div>'
+        + '<div class="tm" style="margin-top:14px">'
+        f'<span>合计：成交 <b>{_mb_num(total.get("qty"), "int")}</b> 件</span>'
+        f'<span>前台成交额 <b>¥{_mb_num(total.get("sale"))}</b></span>'
+        f'<span>结算采购额 <b>¥{_mb_num(total.get("settle"))}</b></span>'
+        f'<span>京东毛利额 <b>¥{_mb_num(total.get("profit"))}</b></span>'
+        f'<span>京东毛利率 <b>{_mb_num(total.get("margin"), "pct")}</b></span>'
+        f'<span>触发补差合计 <b>¥{_mb_num(shortfall)}</b></span></div>'
+        + table
+    )
+
+
+@app.get("/maobao", response_class=HTMLResponse)
+def maobao_page(request: Request):
+    """毛利诊断（京东毛保）独立页：读本地利润缓存，按温层判定是否触发毛保。"""
+    q = request.query_params
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS}
+    acc = q.get("account") or next((k for k in keys if maobao.rules_for(k)), settings.MAIN_ACCOUNT)
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    start, end = _last_month_range()
+    if q.get("start") and q.get("end"):
+        try:
+            start, end = profit.norm_range(q.get("start"), q.get("end"))
+        except ValueError:
+            pass
+
+    opts = "".join(
+        f'<option value="{_e(k)}"{" selected" if k == acc else ""}>{_e(labels[k])}'
+        f'{"（未配置毛保线）" if not maobao.rules_for(k) else ""}</option>'
+        for k in keys)
+
+    data = _profit.load_cached(acc, start, end)
+    if not data:
+        body = ('<div class="warn">本地没有 '
+                f'{_e(start)} ~ {_e(end)} 的 {_e(labels.get(acc, acc))} 利润缓存。先到 '
+                f'<a href="/profit?account={_e(acc)}&start={_e(start)}&end={_e(end)}">月度利润</a>'
+                ' 查询这个区间（有缓存秒出），再回本页诊断。</div>')
+    else:
+        diag = maobao.diagnose(data.get("rows") or [], acc, labels.get(acc))
+        body = _mb_html(diag, data.get("accountLabel") or labels.get(acc, acc),
+                        start, end, data.get("savedAt") or "")
+
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>毛利诊断 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+</head><body>
+{report2.navtop("/maobao")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}毛保</div>
+  <h1>毛利诊断 · 京东毛保测算</h1>
+  <div class="metaline">
+    <span>京东毛利 = 平均前台价 − 扣点后采购价</span><span class="dot"></span>
+    <span>数据与「月度利润」同一份本地缓存</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/profit?account={_e(acc)}&start={_e(start)}&end={_e(end)}">月度利润 →</a>
+    <a class="btn ghost mini" href="/cache?kind=profit">缓存管理 →</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="card">
+  <form class="toolbar" method="get" action="/maobao">
+    <label class="fld">账号 <select name="account" onchange="this.form.submit()">{opts}</select></label>
+    <label class="fld">起 <input type="date" name="start" value="{_e(start)}"></label>
+    <label class="fld">止 <input type="date" name="end" value="{_e(end)}"></label>
+    <button class="btn" type="submit">查询</button>
+  </form>
+  <div class="hint" style="margin-bottom:0">只读本地缓存，不触发抓取；缓存缺失或过期时去「月度利润」重算。</div>
+</div>
+
+<div style="margin-top:18px">{body}</div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>口径</b>：平均前台价取利润行（商智成交额 ÷ 成交件数）；扣点后采购价 = ERP 到手结算价。
+     京东毛利/件 = 平均前台价 − 扣点后采购价；毛利率 = 京东毛利合计 ÷ 结算给我们的扣点后采购价合计。</p>
+  <p><b>毛保</b>：雨润禾常温品低于 10%、冷冻品低于 18% 触发。
+     需补利润 = 毛保线 × 结算采购额 − 实际毛利额，即京东要补到毛保线还差的利润。</p>
+  <p><b>温层判定</b>：已登记 SKU 按登记表；未登记的按商品名关键词（冷冻 / 速冻 / 解冻 / 薯条 / 什锦蔬菜 /
+     欧式杂菜 / 毛豆 / 青豆 / 纳豆 → 冷冻，冻干 → 常温），都没有按常温。</p>
+</div>
+
+</div></body></html>""")
+
+
 @app.post("/api/profit/run")
 def api_profit_run(account: str | None = None, start: str = "", end: str = "", force: int = 0,
                    accounts: str = ""):
