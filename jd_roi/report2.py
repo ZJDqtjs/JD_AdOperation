@@ -24,18 +24,34 @@ SPIKE_SVG = (
     '</g></svg>'
 )
 
-_NAV_ITEMS = [("/", "控制台"), ("/report", "分析报表"), ("/ai", "AI 分析台"),
-              ("/paycomm", "CPS花费"), ("/paycomm/spend", "京准通花费"),
-              ("/cashflow", "广告费流水"), ("/profit", "月度利润"),
-              ("/price", "SKU前台价"), ("/maobao", "毛利诊断"),
+_NAV_ITEMS = [("/", "控制台"), ("/report", "分析报表"), ("/activity", "团长活动"),
+              ("/ai", "AI 分析台"),
+              ("广告情况", [("/paycomm", "CPS花费"), ("/paycomm/spend", "京准通花费"),
+                           ("/cashflow", "广告费流水"),
+                           ("/profit", "月度利润"), ("/maobao", "毛利诊断")]),
+              ("/price", "SKU前台价"),
               ("/cache", "缓存"), ("/login", "登录")]
 
 
 def navtop(active: str = "", right: str = "") -> str:
     """全站统一顶栏：品牌符号 + 主导航 + 右侧插槽。"""
-    links = "".join(
-        f'<a class="nava{" on" if href == active else ""}" href="{href}">{label}</a>'
-        for href, label in _NAV_ITEMS)
+    parts = []
+    for key, label in _NAV_ITEMS:
+        if isinstance(label, list):
+            on = " on" if any(h == active for h, _ in label) else ""
+            items = "".join(
+                f'<a class="navdrop-a{" on" if h == active else ""}" href="{h}">{t}</a>'
+                for h, t in label)
+            parts.append(
+                f'<div class="navgroup"><span class="nava navgroup-btn{on}" tabindex="0" '
+                f'role="button" aria-haspopup="true">{key}'
+                f'<svg class="navcaret" viewBox="0 0 12 12" aria-hidden="true">'
+                f'<path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" '
+                f'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
+                f'<div class="navdrop" role="menu">{items}</div></div>')
+        else:
+            parts.append(f'<a class="nava{" on" if key == active else ""}" href="{key}">{label}</a>')
+    links = "".join(parts)
     return (
         f'<nav class="navtop"><div class="wrap">'
         f'<a class="brand" href="/">{SPIKE_SVG}'
@@ -97,6 +113,20 @@ body{margin:0;background:var(--canvas);color:var(--body);font-family:var(--sans)
   text-decoration:none;transition:background .15s,color .15s;white-space:nowrap}
 .nava:hover{background:var(--soft);color:var(--ink)}
 .nava.on{background:var(--surface-card);color:var(--ink);font-weight:600}
+/* 导航二级菜单（广告情况） */
+.navgroup{position:relative;display:flex;align-items:center}
+.navgroup-btn{display:inline-flex;align-items:center;gap:4px;cursor:default}
+.navcaret{width:11px;height:11px;flex:none;transition:transform .18s}
+.navgroup:hover .navcaret,.navgroup:focus-within .navcaret{transform:rotate(180deg)}
+.navdrop{position:absolute;top:100%;left:0;min-width:168px;padding:6px;display:none;z-index:80;
+  background:var(--canvas);border:1px solid var(--hair);border-radius:var(--r-md);
+  box-shadow:var(--shadow-lift)}
+.navgroup:hover .navdrop,.navgroup:focus-within .navdrop{display:block}
+.navdrop-a{display:block;padding:8px 12px;border-radius:var(--r-sm);color:var(--muted);
+  font-size:13.5px;font-weight:500;text-decoration:none;white-space:nowrap;
+  transition:background .15s,color .15s}
+.navdrop-a:hover{background:var(--soft);color:var(--ink)}
+.navdrop-a.on{background:var(--surface-card);color:var(--ink);font-weight:600}
 .navspacer{margin-left:auto}
 .navpill{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:9999px;
   background:var(--surface-card);color:var(--strong);font-size:12px;font-weight:600}

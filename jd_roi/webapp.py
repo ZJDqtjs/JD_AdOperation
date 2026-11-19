@@ -59,7 +59,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse, Response, StreamingResponse)
 
-from . import (aijobs, ai_page, analyze2, analyze_ai, cashflow, compete, config,
+from . import (activity, aijobs, ai_page, analyze2, analyze_ai, cashflow, compete, config,
                dailystore as ds, industry, maobao, paycomm, pricewatch, profit,
                report2, scrape_day, settings)
 
@@ -3052,6 +3052,718 @@ def api_profit_export(job: str | None = None, account: str | None = None,
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
+
+
+# ================================================================ 团长招商活动
+ACTIVITY_CSS = """
+.acttabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 14px}
+.acttabs a{padding:6px 14px;border-radius:9999px;border:1px solid var(--hair);
+  color:var(--muted);text-decoration:none;font-size:12.5px;background:var(--canvas)}
+.acttabs a.on{background:var(--surface-card);color:var(--ink);border-color:var(--cream);font-weight:600}
+.actrow{display:grid;grid-template-columns:74px 1fr 64px 64px;gap:10px;align-items:center;
+  font-size:12.5px;padding:3px 0;border-bottom:1px dashed var(--hair2)}
+.actrow:last-child{border-bottom:none}
+.actrow .bar{height:10px;border-radius:9999px;background:var(--hair);overflow:hidden}
+.actrow .bar i{display:block;height:100%;background:var(--primary);border-radius:9999px}
+.actrow .n{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+.actsec{margin-top:26px;display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.actsec h2{font-family:var(--serif);font-weight:400;font-size:22px;color:var(--ink);margin:0}
+.actsec .hint{margin:0}
+td.sku{max-width:340px}
+td.sku .nm{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td.sku .sub,td.act .sub{font-size:11.5px;color:var(--muted2)}
+td.act{max-width:260px}
+td.act .nm{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td.act .sub{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tagb{display:inline-block;padding:1px 8px;border-radius:9999px;font-size:11px;font-weight:600;
+  white-space:nowrap}
+.tagb.on{background:var(--greenbg);color:var(--greenink)}
+.tagb.end{background:var(--soft);color:var(--muted)}
+.tagb.wait{background:var(--amberbg);color:var(--amberink)}
+.tagb.off{background:var(--redbg);color:var(--redink)}
+tr.rowlink{cursor:pointer}
+tr.rowlink:hover td{background:var(--soft)}
+tr.selrow td{background:#fbf1eb}
+/* 报名日历（GitHub 贡献图风格）：行=星期，列=上周/本周/下周 */
+.hmwrap{display:flex;gap:26px;align-items:flex-start;flex-wrap:wrap}
+.hm{display:grid;grid-template-columns:34px repeat(3,34px);gap:5px;justify-content:start}
+.hmwd{display:flex;align-items:center;justify-content:flex-end;padding-right:6px;
+  font-size:11px;color:var(--muted)}
+.hmwk{display:flex;flex-direction:column;align-items:center;gap:1px;padding:0 0 2px;
+  font-size:11px;font-weight:600;color:var(--strong);line-height:1.25}
+.hmwk span{font-weight:400;color:var(--muted2);font-size:9px}
+.hmcell{display:flex;justify-content:space-between;align-items:center;width:34px;height:34px;
+  padding:0 4px;border-radius:7px;border:1px solid var(--hair);text-decoration:none;
+  color:var(--ink);background:var(--soft);transition:transform .12s,box-shadow .12s}
+.hmcell .hmd{font-size:10px;color:var(--muted)}
+.hmcell .hmc{font-family:var(--serif);font-size:14px;line-height:1}
+.hmcell.lv0{background:var(--soft);color:var(--muted2)}
+.hmcell.lv1{background:#dcece1;border-color:#c7e0cf}
+.hmcell.lv2{background:#cfe6d5;border-color:#b4d9bf}
+.hmcell.lv3{background:#9ed3ac;border-color:#86c898}
+.hmcell.lv4{background:#5db872;border-color:#4aa463;color:#fff}
+.hmcell.lv4 .hmd{color:#eaf5ec}
+.hmcell.today{box-shadow:inset 0 0 0 2px var(--primary)}
+.hmcell.sel{outline:2px solid var(--primary);outline-offset:2px}
+.hmcell.future{border-style:dashed}
+.hmcell:hover{transform:translateY(-1px);box-shadow:var(--shadow-soft)}
+/* 右侧：近 21 天报名分布 */
+.hmside{flex:1;min-width:260px}
+.hmside-h{font-size:12px;font-weight:600;color:var(--strong);margin-bottom:12px}
+.hmchart{display:flex;align-items:flex-end;gap:4px}
+.hmbar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;min-width:0}
+.hmbar i{display:block;width:100%;border-radius:3px 3px 0 0;background:var(--soft);
+  border:1px solid var(--hair);border-bottom:none}
+.hmbar i.lv1{background:#dcece1;border-color:#c7e0cf}
+.hmbar i.lv2{background:#cfe6d5;border-color:#b4d9bf}
+.hmbar i.lv3{background:#9ed3ac;border-color:#86c898}
+.hmbar i.lv4{background:#5db872;border-color:#4aa463}
+.hmbar i.today{box-shadow:inset 0 0 0 2px var(--primary)}
+.hmbar b{font-size:9.5px;font-weight:400;color:var(--muted2);line-height:14px}
+.hmmeta{display:flex;flex-wrap:wrap;gap:16px;margin-top:10px;font-size:11.5px;color:var(--muted)}
+.hmmeta b{color:var(--strong);font-weight:600}
+.hmfoot{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  flex-wrap:wrap;margin-top:12px}
+.hmleg{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--muted)}
+.hmleg i{display:block;width:14px;height:14px;border-radius:4px;border:1px solid var(--hair)}
+.hmleg i.lv0{background:var(--soft)}
+.hmleg i.lv1{background:#dcece1;border-color:#c7e0cf}
+.hmleg i.lv2{background:#cfe6d5;border-color:#b4d9bf}
+.hmleg i.lv3{background:#9ed3ac;border-color:#86c898}
+.hmleg i.lv4{background:#5db872;border-color:#4aa463}
+"""
+
+ACT_JS = r"""
+(function(){
+  var TIMER = null;
+  function tip(s, cls){
+    var el = document.getElementById('actTip');
+    if(!el) return;
+    el.className = 'note' + (cls ? ' ' + cls : '');
+    el.style.display = s ? 'block' : 'none';
+    el.textContent = s || '';
+  }
+  window.actRun = function(){
+    var b = document.getElementById('actRunBtn');
+    if(b){ b.disabled = true; b.textContent = '抓取中…'; }
+    tip('已提交抓取任务，等待后台执行…');
+    fetch('/api/activity/run', {method:'POST'}).then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){
+          tip('启动失败：' + (j.error || '未知错误'));
+          if(b){ b.disabled = false; b.textContent = '立即抓取'; }
+          return;
+        }
+        if(TIMER) clearInterval(TIMER);
+        TIMER = setInterval(poll, 3000);
+      }).catch(function(e){
+        tip('启动失败：' + e);
+        if(b){ b.disabled = false; b.textContent = '立即抓取'; }
+      });
+  };
+  function poll(){
+    fetch('/api/activity/status').then(function(r){ return r.json(); }).then(function(s){
+      if(s.active){ tip('抓取中：' + (s.progress || '执行中…')); return; }
+      if(TIMER){ clearInterval(TIMER); TIMER = null; }
+      var b = document.getElementById('actRunBtn');
+      if(b){ b.disabled = false; b.textContent = '立即抓取'; }
+      if(s.error){ tip('抓取失败：' + s.error); return; }
+      tip('抓取完成，正在刷新…');
+      setTimeout(function(){ location.reload(); }, 600);
+    }).catch(function(){});
+  }
+  if(window.ACT_RUNNING){ TIMER = setInterval(poll, 3000); }
+  // 报名明细整行可点：进入该活动自己的数据视图
+  document.querySelectorAll('tr.rowlink[data-href]').forEach(function(tr){
+    tr.addEventListener('click', function(e){
+      if(e.target.closest('a,button,input,select')) return;
+      window.location.href = tr.getAttribute('data-href');
+    });
+  });
+})();
+"""
+
+
+def _an(v, digits: int = 0) -> str:
+    try:
+        f = float(v or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if digits:
+        return f"{f:,.{digits}f}"
+    return f"{int(round(f)):,}"
+
+
+def _amoney(v) -> str:
+    return _an(v, 2)
+
+
+def _act_sku_names(keys: list) -> dict:
+    """从本地商智商品明细拼 skuId→商品名（报名日志里只有 SKU）。"""
+    names: dict = {}
+    for key in keys:
+        try:
+            days = ds.days_for(key, "sz_product")[-7:]
+        except Exception:  # noqa: BLE001
+            days = []
+        for day in reversed(days):
+            payload = ds.load_day(key, day, "sz_product") or {}
+            for r in payload.get("rows") or []:
+                sid = str(r.get("sku_id") or "").strip()
+                if sid and sid != "合计" and r.get("name"):
+                    names.setdefault(sid, str(r.get("name")))
+    return names
+
+
+def _act_status(start: str, end: str) -> tuple:
+    day = _today().isoformat()
+    if start and day < start:
+        return ("未开始", "wait")
+    if end and day > end:
+        return ("已结束", "end")
+    if start or end:
+        return ("进行中", "on")
+    return ("—", "end")
+
+
+@app.get("/activity", response_class=HTMLResponse)
+def activity_page(request: Request):
+    q = request.query_params
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS}
+    sel = q.get("account") or ""
+    acc_keys = [sel] if sel in keys else keys
+
+    # 效果区间：默认昨天；支持 days=1/7/30 或自定义 start/end
+    start, end = resolve_range(q.get("start"), q.get("end"), q.get("days") or 1)
+    since = q.get("since") or (_today() - dt.timedelta(days=90)).isoformat()
+    kw = (q.get("q") or "").strip()
+    union_sel = q.get("union") or ""
+
+    signups = activity.load_signups(acc_keys, since=since)
+    acts = activity.load_activities(acc_keys)
+    items, unions = acts.get("items") or {}, acts.get("unions") or {}
+    sku_names = _act_sku_names(acc_keys)
+
+    # 团长筛选选项（报名记录里出现过的 + 本地活动快照里的）
+    union_opts = {}
+    for r in signups:
+        uid = str(r.get("cpUnionId") or "")
+        if uid:
+            union_opts[uid] = r.get("cpUnionName") or (unions.get(uid) or {}).get("name") or uid
+    for uid, u in unions.items():
+        union_opts.setdefault(uid, u.get("name") or uid)
+
+    # 报名日历：start = 按该商品活动开始日（含未来/预报名），signup = 按报名操作时间
+    hm_mode = q.get("hm") if q.get("hm") in ("start", "signup") else "start"
+    day_sel = (q.get("day") or "").strip()
+    act_sel = (q.get("act") or "").strip()
+    sku_sel = (q.get("sku") or "").strip()
+
+    filtered = []
+    for r in signups:
+        if union_sel and str(r.get("cpUnionId") or "") != union_sel:
+            continue
+        name = sku_names.get(str(r.get("skuId"))) or ""
+        hay = " ".join(str(r.get(x) or "") for x in
+                       ("skuId", "activityName", "activityId", "cpUnionName", "activityName"))
+        if kw and kw.lower() not in (hay + " " + name).lower():
+            continue
+        filtered.append((r, name))
+
+    def _hm_day(r) -> str:
+        if hm_mode == "signup":
+            return str(r.get("optTime") or "")[:10]
+        return str(r.get("startDate") or "")
+
+    hm_counts: dict = {}
+    for r, _n in filtered:
+        d = _hm_day(r)
+        if d:
+            hm_counts[d] = hm_counts.get(d, 0) + 1
+
+    # 点击报名行 → 只看这个活动的数据（按该活动报名过的 SKU 归集）
+    act_all = [r for r in signups if str(r.get("activityId")) == act_sel] if act_sel else []
+    act_skus = {str(r.get("skuId")) for r in act_all if r.get("skuId")}
+    if sku_sel:
+        act_skus.add(sku_sel)
+    act_info = (items.get(act_sel) or {}) if act_sel else {}
+    act_union_ids = {str(r.get("cpUnionId")) for r in act_all if r.get("cpUnionId")}
+    if act_info.get("cpUnionId"):
+        act_union_ids.add(str(act_info["cpUnionId"]))
+    act_title = act_info.get("title") or (act_all[0].get("activityName") if act_all else "") or sku_sel
+
+    rows = filtered
+    if act_sel:
+        rows = [(r, n) for r, n in rows if str(r.get("activityId")) == act_sel]
+    if day_sel:
+        rows = [(r, n) for r, n in rows if _hm_day(r) == day_sel]
+
+    n_sku = len({r.get("skuId") for r, _ in rows})
+    n_union = len({r.get("cpUnionId") for r, _ in rows if r.get("cpUnionId")})
+    n_act = len({r.get("activityId") for r, _ in rows})
+
+    # ---- 近 21 天报名日历（上周 / 本周 / 下周）----
+    from urllib.parse import quote
+    today_iso = _today().isoformat()
+    monday = _today() - dt.timedelta(days=_today().weekday())
+    weeks = [monday - dt.timedelta(days=7), monday, monday + dt.timedelta(days=7)]
+    wk_labels = ["上周", "本周", "下周"]
+    days_q = q.get("days") or ""
+
+    def _qlink(**over) -> str:
+        base = {"account": sel, "since": since, "q": kw, "union": union_sel,
+                "days": days_q, "hm": hm_mode, "day": day_sel,
+                "act": act_sel, "sku": sku_sel}
+        base.update(over)
+        return "?" + "&".join(f"{k}={quote(str(v))}" for k, v in base.items()
+                              if v not in (None, ""))
+
+    max_c = max([hm_counts.get((ws + dt.timedelta(days=i)).isoformat(), 0)
+                 for ws in weeks for i in range(7)] or [0]) or 1
+    wd_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    hm_head = '<div class="hmwd"></div>' + "".join(
+        f'<div class="hmwk" title="{ws.isoformat()} ~ '
+        f'{(ws + dt.timedelta(days=6)).isoformat()}">{lab}'
+        f'<span>{ws.month:02d}/{ws.day:02d}</span></div>'
+        for lab, ws in zip(wk_labels, weeks))
+    hm_cells = ""
+    for i, wd in enumerate(wd_names):
+        hm_cells += f'<div class="hmwd">{wd}</div>'
+        for ws in weeks:
+            d = ws + dt.timedelta(days=i)
+            ds_iso = d.isoformat()
+            c = hm_counts.get(ds_iso, 0)
+            lv = 0 if not c else max(1, min(4, int(round(c / max_c * 4)) or 1))
+            cls = f"lv{lv}"
+            if ds_iso == today_iso:
+                cls += " today"
+            if ds_iso == day_sel:
+                cls += " sel"
+            if ds_iso > today_iso:
+                cls += " future"
+            href = _qlink(day="" if ds_iso == day_sel else ds_iso) + "#signup"
+            tip = f"{ds_iso} · {c} 条报名" + ("（未来开始，预报名）" if ds_iso > today_iso else "")
+            hm_cells += (f'<a class="hmcell {cls}" href="{href}" title="{_e(tip)}">'
+                         f'<span class="hmd">{d.day}</span>'
+                         f'<span class="hmc">{c if c else ""}</span></a>')
+
+    # 右侧：近 21 天报名分布条 + 概览
+    days_all = [weeks[0] + dt.timedelta(days=i) for i in range(21)]
+    bars = []
+    for d in days_all:
+        ds_iso = d.isoformat()
+        c = hm_counts.get(ds_iso, 0)
+        lv = 0 if not c else max(1, min(4, int(round(c / max_c * 4)) or 1))
+        cls = f"lv{lv}" if c else "lv0"
+        if ds_iso == today_iso:
+            cls += " today"
+        hpx = max(3, round(c / max_c * 118)) if c else 3
+        tip = f"{ds_iso} · {c} 条报名" + ("（未来开始，预报名）" if ds_iso > today_iso else "")
+        bars.append(f'<div class="hmbar" title="{_e(tip)}">'
+                    f'<i class="{cls}" style="height:{hpx}px"></i>'
+                    f'<b>{d.day}</b></div>')
+    active_days = sum(1 for d in days_all if hm_counts.get(d.isoformat(), 0))
+    week_cnt = sum(hm_counts.get((monday + dt.timedelta(days=i)).isoformat(), 0)
+                   for i in range(7))
+    peak = max(days_all, key=lambda d: hm_counts.get(d.isoformat(), 0), default=None)
+    peak_c = hm_counts.get(peak.isoformat(), 0) if peak else 0
+    peak_txt = f"峰值 {peak.isoformat()[5:]} · {peak_c} 条" if peak_c else "暂无报名"
+    hm_side = (
+        '<div class="hmside">'
+        '<div class="hmside-h">近 21 天报名分布</div>'
+        f'<div class="hmchart">{"".join(bars)}</div>'
+        '<div class="hmmeta">'
+        f'<span>本周 <b>{week_cnt}</b> 条</span>'
+        f'<span>有报名 <b>{active_days}</b> 天</span>'
+        f'<span>{peak_txt}</span></div></div>')
+
+    total_hm = sum(hm_counts.values())
+    future_cnt = (sum(1 for r, _n in filtered
+                      if str(r.get("startDate") or "") > today_iso) if hm_mode == "start" else 0)
+    no_start = (sum(1 for r, _n in filtered if not r.get("startDate"))
+                if hm_mode == "start" else 0)
+    hm_tabs = (
+        f'<a class="chip{" on" if hm_mode == "start" else ""}" '
+        f'href="{_qlink(hm="start", day="")}">按活动开始日（含预报名）</a>'
+        f'<a class="chip{" on" if hm_mode == "signup" else ""}" '
+        f'href="{_qlink(hm="signup", day="")}">按报名时间</a>')
+    hm_card = (
+        '<div class="card" style="margin-top:16px">'
+        '<div class="toolbar" style="justify-content:space-between;margin-bottom:12px">'
+        f'<div><b>报名日历</b> <span class="hint" style="margin:0">近 21 天 · 共 {total_hm} 条'
+        f'{"（未来开始 " + str(future_cnt) + " 条预报名）" if future_cnt else ""}</span></div>'
+        f'<div class="toolbar" style="margin:0">{hm_tabs}</div></div>'
+        f'<div class="hmwrap"><div class="hm">{hm_head}{hm_cells}</div>{hm_side}</div>'
+        '<div class="hmfoot"><span class="hint" style="margin:0">点击格子筛选当天明细，再点一次取消；'
+        '虚线格 = 未来日期（预报名）'
+        + (f'；官方活动无开始日，未计入 {no_start} 条' if no_start and hm_mode == "start" else "")
+        + '</span><span class="hmleg">少 <i class="lv0"></i><i class="lv1"></i>'
+        '<i class="lv2"></i><i class="lv3"></i><i class="lv4"></i> 多</span></div>'
+        '</div>')
+
+    # ---- 报名明细 ----
+    trs = []
+    for r, name in rows[:800]:
+        st_txt, st_cls = _act_status(r.get("startDate") or "", r.get("endDate") or "")
+        act_sub = ""
+        if r.get("actStart") or r.get("actEnd"):
+            act_sub = (f'<span class="sub">活动期 {_e(r.get("actStart") or "?")} ~ '
+                       f'{_e(r.get("actEnd") or "?")}</span>')
+        union_txt = r.get("cpUnionName") or ""
+        if not union_txt and r.get("cpUnionId"):
+            union_txt = (unions.get(str(r.get("cpUnionId"))) or {}).get("name") or ""
+        union_id_html = (f'<br><span class="sub">ID {_e(r.get("cpUnionId"))}</span>'
+                         if r.get("cpUnionId") else "")
+        trs.append(
+            f'<tr class="rowlink{" selrow" if str(r.get("activityId")) == act_sel and str(r.get("skuId")) == sku_sel else ""}"'
+            f' data-href="{_e(_qlink(act=r.get("activityId"), sku=r.get("skuId")))}#effect">'
+            f'<td class="n mono" style="white-space:nowrap">{_e(str(r.get("optTime") or "")[5:16])}</td>'
+            f'<td class="l">{_e(r.get("accountLabel") or labels.get(r.get("account"), ""))}</td>'
+            f'<td class="l sku"><span class="nm" title="{_e(name)}">{_e(name or "—")}</span>'
+            f'<span class="sub">SKU {_e(r.get("skuId"))}</span></td>'
+            f'<td class="l act"><span class="nm">{_e(r.get("activityName") or "—")}</span>'
+            f'<span class="sub">ID {_e(r.get("activityId"))}'
+            f'{" · 官方活动" if r.get("official") else ""}</span>{act_sub}</td>'
+            f'<td class="l">{_e(union_txt or "—")}{union_id_html}</td>'
+            f'<td class="n" style="white-space:nowrap">{_e(r.get("startDate") or "—")}'
+            f'<br><span class="sub">至 {_e(r.get("endDate") or "—")}</span></td>'
+            f'<td class="n">{_e(r.get("commission") if r.get("commission") is not None else "—")}%'
+            f'<br><span class="sub">服务费 {_e(r.get("serviceFee") if r.get("serviceFee") is not None else "—")}%</span></td>'
+            f'<td class="n"><span class="tagb {st_cls}">{st_txt}</span></td>'
+            '</tr>')
+    if not trs:
+        trs.append('<tr><td colspan="8" class="l hint" style="padding:18px">'
+                   '本地还没有报名记录。点右上角「立即抓取」，或等凌晨自动任务抓完后刷新。</td></tr>')
+
+    day_note = ""
+    if day_sel:
+        metric = "活动开始" if hm_mode == "start" else "报名时间"
+        day_note = (f' · <b>{metric} {_e(day_sel)}</b> '
+                    f'<a class="btn ghost mini" href="{_qlink(day="")}">清除筛选</a>')
+    act_note = ""
+    if act_sel:
+        act_note = (f' · <b>活动 {_e(act_title)}</b> '
+                    f'<a class="btn ghost mini" href="{_qlink(act="", sku="")}">查看全部</a>')
+    signup_card = (
+        '<div class="card" id="signup">'
+        '<div class="toolbar" style="justify-content:space-between">'
+        '<div><b>报名明细</b> <span class="hint" style="margin:0">'
+        f'{len(rows)} 条 · 报名时间 ≥ {_e(since)}'
+        f'{" · 关键词「" + _e(kw) + "」" if kw else ""}{act_note}{day_note}</span></div>'
+        f'<div class="hint" style="margin:0">点击任意一行 → 查看该活动自己的效果数据</div></div>'
+        '<div class="tblwrap long" style="max-height:64vh"><table><thead><tr>'
+        '<th class="l">报名时间</th><th class="l">账号</th><th class="l">商品</th>'
+        '<th class="l">活动</th><th class="l">团长</th><th class="n">活动起止（该商品）</th>'
+        '<th class="n">佣金 / 服务费</th><th class="n">状态</th>'
+        '</tr></thead><tbody>' + "".join(trs) + '</tbody></table></div></div>')
+
+    # ---- 效果数据 ----
+    perf = activity.load_perf(acc_keys, start, end)
+    days = perf.get("days") or []
+    tot = {"click": 0.0, "order": 0.0, "gmv": 0.0, "fee": 0.0}
+    cp_map: dict = {}
+    sku_map: dict = {}
+    daily: dict = {}
+    daily_act: dict = {}
+    for d in days:
+        s = d.get("summary") or {}
+        tot["click"] += float(s.get("clickCnt") or 0)
+        tot["order"] += float(s.get("inOrderCnt") or 0)
+        day = d.get("date") or ""
+        cur = daily.setdefault(day, {"click": 0.0, "order": 0.0})
+        cur["click"] += float(s.get("clickCnt") or 0)
+        cur["order"] += float(s.get("inOrderCnt") or 0)
+        for row in d.get("cp") or []:
+            uid = str(row.get("cpUnionId") or "")
+            e = cp_map.setdefault(uid, {"name": row.get("cpUnionName") or
+                                       (unions.get(uid) or {}).get("name") or uid,
+                                       "accounts": set(), "click": 0.0, "order": 0.0,
+                                       "gmv": 0.0, "fee": 0.0, "skus": set()})
+            e["accounts"].add(d.get("account") or "")
+            e["click"] += float(row.get("clickCnt") or 0)
+            e["order"] += float(row.get("estimateOrderCnt") or 0)
+            e["gmv"] += float(row.get("estimateGMV") or 0)
+            e["fee"] += float(row.get("estimateFee") or 0)
+            for spu in row.get("spuList") or []:
+                e["skus"].add(str(spu))
+        for row in d.get("sku") or []:
+            sid = str(row.get("skuId") or "")
+            e = sku_map.setdefault(sid, {"name": row.get("skuName") or sku_names.get(sid) or sid,
+                                         "click": 0.0, "order": 0.0, "gmv": 0.0,
+                                         "fee": 0.0, "unions": set()})
+            e["click"] += float(row.get("clickCnt") or 0)
+            e["order"] += float(row.get("estimateOrderCnt") or 0)
+            e["gmv"] += float(row.get("estimateGMV") or 0)
+            e["fee"] += float(row.get("estimateFee") or 0)
+            if float(row.get("estimateOrderCnt") or 0) > 0:
+                e["unions"].add(str(d.get("account")))
+            if act_sel and sid in act_skus:
+                ca = daily_act.setdefault(day, {"click": 0.0, "order": 0.0})
+                ca["click"] += float(row.get("clickCnt") or 0)
+                ca["order"] += float(row.get("estimateOrderCnt") or 0)
+        tot["gmv"] += sum(float(r.get("estimateGMV") or 0) for r in d.get("sku") or [])
+        tot["fee"] += sum(float(r.get("estimateFee") or 0) for r in d.get("sku") or [])
+
+    sku_items = [(sid, e) for sid, e in sku_map.items()
+                 if not act_sel or sid in act_skus]
+    cp_items = [(uid, e) for uid, e in cp_map.items()
+                if not act_sel or uid in act_union_ids]
+    if act_sel:
+        # 活动视图：点击/订单/GMV/费用全部只按该活动报名过的商品归集
+        tot = {
+            "click": sum(e["click"] for _sid, e in sku_items),
+            "order": sum(e["order"] for _sid, e in sku_items),
+            "gmv": sum(e["gmv"] for _sid, e in sku_items),
+            "fee": sum(e["fee"] for _sid, e in sku_items),
+        }
+    roi = (tot["gmv"] / tot["fee"]) if tot["fee"] else 0.0
+    n_order_union = len([e for _u, e in cp_items if e["order"] > 0])
+    n_order_sku = len([e for _s, e in sku_items if e["order"] > 0])
+
+    trend_daily = daily_act if act_sel else daily
+    day_rows = []
+    max_order = max([v["order"] for v in trend_daily.values()] or [0]) or 1
+    for day in ds.day_span(start, end):
+        v = trend_daily.get(day) or {"click": 0.0, "order": 0.0}
+        w = max(int(round(v["order"] / max_order * 100)), 2)
+        day_rows.append(
+            f'<div class="actrow"><div>{day[5:]}</div>'
+            f'<div class="bar"><i style="width:{w}%"></i></div>'
+            f'<div class="n">{_an(v["order"])} 单</div>'
+            f'<div class="n">{_an(v["click"])} 点</div></div>')
+    trend_card = ('<div class="card"><h3 style="margin-top:0">每日走势</h3>'
+                  '<div class="hint">条形 = 预估订单量；右侧为点击量</div>'
+                  + "".join(day_rows) + '</div>')
+
+    cp_rows = sorted(cp_items, key=lambda kv: kv[1]["gmv"], reverse=True)
+    cp_html = "".join(
+        '<tr>'
+        f'<td class="l">{_e(e["name"])}<span class="sub">ID {_e(uid)}</span></td>'
+        f'<td class="l">{_e(" / ".join(sorted(labels.get(k, k) for k in e["accounts"] if k)))}</td>'
+        f'<td class="n">{_an(e["click"])}</td><td class="n">{_an(e["order"])}</td>'
+        f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
+        f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td>'
+        f'<td class="n">{len(e["skus"])}</td></tr>'
+        for uid, e in cp_rows) or (
+        '<tr><td colspan="8" class="l hint" style="padding:18px">'
+        + ('该活动没有团长归因（官方活动）' if act_sel else '该区间没有出单团长数据')
+        + '</td></tr>')
+
+    sku_rows = sorted(sku_items, key=lambda kv: kv[1]["gmv"], reverse=True)
+    sku_html = "".join(
+        '<tr>'
+        f'<td class="l sku"><span class="nm" title="{_e(e["name"])}">{_e(e["name"])}</span></td>'
+        f'<td class="n">{_an(e["click"])}</td><td class="n">{_an(e["order"])}</td>'
+        f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
+        f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td>'
+        f'<td class="n">{len(e["unions"])}</td></tr>'
+        for _sid, e in sku_rows) or (
+        '<tr><td colspan="7" class="l hint" style="padding:18px">'
+        + ('该活动报名的商品在这个区间没有出单' if act_sel else '该区间没有商品出单数据')
+        + '</td></tr>')
+
+    # 活动视图的标题与横幅
+    eff_title = "活动效果"
+    eff_hint = f"{_e(start)} ~ {_e(end)} · 出单概览 / 出单团长 / 商品效果（按天累加）"
+    cp_title = "出单团长"
+    sku_title = "商品效果"
+    act_banner = ""
+    if act_sel:
+        unames = "、".join((unions.get(u) or {}).get("name") or u
+                           for u in sorted(act_union_ids)) or "—"
+        period = ""
+        if act_info.get("startTime") or act_info.get("endTime"):
+            period = f" · 活动期 {act_info.get('startTime') or '?'} ~ {act_info.get('endTime') or '?'}"
+        eff_title = "活动效果 · " + _e(act_title)
+        eff_hint = (f"{_e(start)} ~ {_e(end)} · 只统计该活动报名过的 "
+                    f"{len(act_skus)} 个商品")
+        cp_title = "出单团长（该团长整体，含其他活动）"
+        sku_title = "商品效果（仅该活动报名商品）"
+        act_banner = (
+            '<div class="card" id="effect" style="margin-top:16px;border-color:var(--primary)">'
+            '<div class="toolbar" style="justify-content:space-between;margin-bottom:4px">'
+            f'<div><b>正在查看：{_e(act_title)}</b>'
+            f'<span class="hint" style="margin:0"> · 活动ID {_e(act_sel)} · 团长 {_e(unames)}{_e(period)}</span></div>'
+            f'<div style="display:flex;gap:8px"><a class="btn ghost mini" href="#signup">看报名明细 ↑</a>'
+            f'<a class="btn sec mini" href="{_qlink(act="", sku="")}">查看全部</a></div></div>'
+            '<div class="hint" style="margin:0">点击/订单/GMV/费用按该活动已报名的商品归集；'
+            '团长表无法拆分到单个活动，展示的是该团长在所选区间的整体数据。</div>'
+            '</div>')
+
+    acc_opts = '<option value="">全部账号</option>' + "".join(
+        f'<option value="{_e(k)}"{" selected" if k == sel else ""}>{_e(labels[k])}</option>'
+        for k in keys)
+    union_list_opts = '<option value="">全部团长</option>' + "".join(
+        f'<option value="{_e(uid)}"{" selected" if uid == union_sel else ""}>{_e(name)}</option>'
+        for uid, name in sorted(union_opts.items(), key=lambda kv: kv[1]))
+
+    days_param = q.get("days") or ("1" if (start == end and end == _yesterday().isoformat()) else "")
+    chips = []
+    for d, lab in ((1, "昨天"), (7, "近 7 天"), (30, "近 30 天")):
+        on = " on" if str(days_param) == str(d) else ""
+        chips.append(f'<a class="chip{on}" href="{_qlink(days=d)}">{lab}</a>')
+
+    last_state = {}
+    for k in acc_keys:
+        st = activity._read(activity.acct_dir(k) / "state.json", {}) if k else {}
+        if st.get("lastRun") and (not last_state.get("lastRun")
+                                  or st["lastRun"] > last_state["lastRun"]):
+            last_state = st
+    run_state = activity.runtime_status()
+    wait_days = max(len(ds.day_span(start, end)) - len({d.get("date") for d in days}), 0)
+    warn = ""
+    if not days:
+        warn = ('<div class="warn">本地还没有这个区间的效果数据。点「立即抓取」补抓，'
+                '或等凌晨自动任务；默认只回刷最近 '
+                f'{settings.REFRESH_DAYS} 天。</div>')
+    elif wait_days:
+        warn = (f'<div class="hint">该区间有 {wait_days} 天还没有效果数据（可能超出回刷窗口）。</div>')
+    act_warn = ""
+    if act_sel and act_info:
+        a_s = str(act_info.get("startTime") or "")
+        a_e = str(act_info.get("endTime") or "")
+        if a_s and a_e and (a_e < start or a_s > end):
+            act_warn = (f'<div class="hint">该活动期为 {_e(a_s)} ~ {_e(a_e)}，与当前统计区间 '
+                        f'{_e(start)} ~ {_e(end)} 不重叠；可切换「近 30 天」或自定义区间查看。</div>')
+
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>团长招商活动 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{ACTIVITY_CSS}</style>
+</head><body>
+{report2.navtop("/activity")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}团长招商</div>
+  <h1>团长招商活动 · 报名与效果</h1>
+  <div class="metaline">
+    <span>报名明细来自操作日志「活动」(businessType=32)</span><span class="dot"></span>
+    <span>效果来自团长招商页 · 团长诊断</span><span class="dot"></span>
+    <span>每天 {settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d} 自动抓取</span>
+  </div>
+  <div class="actions">
+    <button class="btn" id="actRunBtn" onclick="actRun()">立即抓取</button>
+    <a class="btn ghost mini" href="https://jzt.jd.com/jtk/#/activity-cp" target="_blank">团长招商页 ↗</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="note" id="actTip" style="display:{'block' if run_state.get('active') else 'none'}">
+  {('抓取中：' + _e(run_state.get('progress') or '执行中…')) if run_state.get('active') else ''}
+</div>
+
+<div class="card">
+  <form class="toolbar" method="get" action="/activity">
+    <label class="fld">账号 <select name="account">{acc_opts}</select></label>
+    <label class="fld">团长 <select name="union">{union_list_opts}</select></label>
+    <label class="fld">报名起始 <input type="date" name="since" value="{_e(since)}"></label>
+    <label class="fld">关键词 <input type="text" name="q" value="{_e(kw)}" placeholder="SKU / 活动名 / 团长"></label>
+    <input type="hidden" name="days" value="{_e(days_param or 1)}">
+    <button class="btn" type="submit">查询</button>
+  </form>
+  <div class="hint" style="margin-bottom:0">
+    最近一次抓取：{_e(last_state.get('lastRun') or '尚未执行')}
+    {('· 报名库存 ' + str(last_state.get('signupRows')) + ' 条') if last_state.get('signupRows') else ''}
+    · 自动任务每天回刷最近 {settings.REFRESH_DAYS} 天效果 + 最近 30 天报名日志
+  </div>
+</div>
+
+<div class="grid g4" style="margin-top:16px">
+  <div class="kpi"><div class="lbl">报名记录</div><div class="val">{len(rows)}</div>
+    <div class="sub">按商品拆开的报名条数</div></div>
+  <div class="kpi"><div class="lbl">报名商品</div><div class="val">{n_sku}</div>
+    <div class="sub">去重 SKU</div></div>
+  <div class="kpi"><div class="lbl">合作团长</div><div class="val">{n_union}</div>
+    <div class="sub">去重团长</div></div>
+  <div class="kpi"><div class="lbl">参与活动</div><div class="val">{n_act}</div>
+    <div class="sub">去重活动</div></div>
+</div>
+
+<div style="margin-top:16px">{hm_card}</div>
+
+<div style="margin-top:16px">{signup_card}</div>
+
+<div class="actsec">
+  <h2>{eff_title}</h2>
+  <span class="hint">{eff_hint}</span>
+</div>
+{act_banner}
+<div class="acttabs">{''.join(chips)}</div>
+<form class="toolbar" method="get" action="/activity">
+  <input type="hidden" name="account" value="{_e(sel)}">
+  <input type="hidden" name="since" value="{_e(since)}">
+  <input type="hidden" name="q" value="{_e(kw)}">
+  <input type="hidden" name="union" value="{_e(union_sel)}">
+  <input type="hidden" name="act" value="{_e(act_sel)}">
+  <input type="hidden" name="sku" value="{_e(sku_sel)}">
+  <label class="fld">起 <input type="date" name="start" value="{_e(start)}"></label>
+  <label class="fld">止 <input type="date" name="end" value="{_e(end)}"></label>
+  <button class="btn sec" type="submit">查询区间</button>
+</form>
+{warn}
+{act_warn}
+
+<div class="grid g5" style="margin-top:12px">
+  <div class="kpi"><div class="lbl">点击量</div><div class="val">{_an(tot['click'])}</div></div>
+  <div class="kpi"><div class="lbl">引入订单量</div><div class="val">{_an(tot['order'])}</div>
+    <div class="sub">出单团长 {n_order_union} · 出单商品 {n_order_sku}</div></div>
+  <div class="kpi"><div class="lbl">预估 GMV</div><div class="val">{_amoney(tot['gmv'])}</div></div>
+  <div class="kpi"><div class="lbl">预估费用</div><div class="val">{_amoney(tot['fee'])}</div>
+    <div class="sub">佣金 + 团长服务费</div></div>
+  <div class="kpi"><div class="lbl">ROI</div><div class="val">{_an(roi, 2)}</div>
+    <div class="sub">GMV ÷ 预估费用</div></div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3 style="margin-top:0">{cp_title}</h3>
+  <div class="tblwrap short"><table><thead><tr>
+    <th class="l">团长</th><th class="l">账号</th><th class="n">点击量</th>
+    <th class="n">预估订单</th><th class="n">预估 GMV</th><th class="n">预估费用</th>
+    <th class="n">ROI</th><th class="n">出单商品数</th>
+  </tr></thead><tbody>{cp_html}</tbody></table></div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3 style="margin-top:0">{sku_title}</h3>
+  <div class="tblwrap short"><table><thead><tr>
+    <th class="l">商品</th><th class="n">点击量</th><th class="n">预估订单</th>
+    <th class="n">预估 GMV</th><th class="n">预估费用</th><th class="n">ROI</th>
+    <th class="n">出单团长数</th>
+  </tr></thead><tbody>{sku_html}</tbody></table></div>
+</div>
+
+<div style="margin-top:16px">{trend_card}</div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>数据口径</b>：报名明细逐条解析自京准通「操作日志 → 活动」的“报名团长招商活动 /
+     报名cps官方活动”，活动起止是该商品自己的提报时段（同一活动里不同 SKU 可能不同）；
+     团长由「已报名活动」接口的活动 ID → 团长 ID 映射，再用团长信息接口补名称。</p>
+  <p><b>效果口径</b>：出单概览 / 出单团长 / 商品效果与团长招商页「团长诊断」一致；
+     预估费用含佣金与团长服务费，ROI = 预估 GMV ÷ 预估费用。按天入库后区间内直接相加。</p>
+  <p><b>注意</b>：CPS 是点击后 15 天归因，最近 15 天的数据每晚会被回刷修正。</p>
+</div>
+
+</div>
+<script>window.ACT_RUNNING = {'true' if run_state.get('active') else 'false'};</script>
+<script>{ACT_JS}</script>
+</body></html>""")
+
+
+@app.post("/api/activity/run")
+def api_activity_run(start: str = "", end: str = "", days: int = 0):
+    s, e = None, None
+    if start and end:
+        s, e = ds.norm_day(start), ds.norm_day(end)
+    elif days:
+        e = _today().isoformat()
+        s = (_today() - dt.timedelta(days=max(int(days), 1) - 1)).isoformat()
+    return activity.run_background(accounts=settings.ACCOUNTS, start=s, end=e,
+                                   log=_log_progress)
+
+
+@app.get("/api/activity/status")
+def api_activity_status():
+    return activity.runtime_status()
 
 
 # ================================================================ SKU 前台价
@@ -6058,6 +6770,58 @@ def api_login_qr():
 
 
 # ================================================================ 调度
+def _activity_nightly():
+    """凌晨团长活动抓取：报名日志（近 30 天）+ 效果（近 REFRESH_DAYS 天）。
+
+    与按天抓取共用同一把抓取锁 / 同一个浏览器 Profile，所以必须在主抓取
+    释放之后再跑（activity.run 会阻塞等锁，最长 1 小时）。
+    """
+    try:
+        today = _today()
+        start = (today - dt.timedelta(days=30)).isoformat()
+        _log_progress("团长活动：开始抓取报名日志（近 30 天）与效果数据")
+        res = activity.run(accounts=settings.ACCOUNTS, start=start,
+                           end=today.isoformat(), perf_days=settings.REFRESH_DAYS,
+                           log=_log_progress)
+        total = sum(v.get("signups", 0) for v in (res.get("accounts") or {}).values())
+        _log_progress(f"团长活动：完成，本次解析报名 {total} 条")
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"团长活动抓取失败：{type(exc).__name__}: {exc}")
+
+
+def _activity_fresh(hours: int = 6) -> bool:
+    """全部账号都在最近 N 小时内抓过，就不再重复跑（容器频繁重启时省时间）。"""
+    now = settings.now().replace(tzinfo=None)
+    for a in settings.ACCOUNTS:
+        st = activity._read(activity.acct_dir(a["key"]) / "state.json", {})
+        last = st.get("lastRun")
+        if not last:
+            return False
+        try:
+            if (now - dt.datetime.fromisoformat(last)).total_seconds() > hours * 3600:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+_ACT_SPAWN_AT = {"t": 0.0}
+
+
+def _spawn_activity_nightly() -> None:
+    if activity.runtime_status().get("active"):
+        return
+    if _activity_fresh():
+        # 不用 _log_progress：它会覆盖「当前抓取进度」，主抓取还在跑时容易误导
+        print("[activity] 最近已抓过，跳过", flush=True)
+        return
+    # 启动补跑与定时调度可能在同一分钟内各调一次，只允许安排一个线程去等锁
+    if time.time() - _ACT_SPAWN_AT["t"] < 7200:
+        return
+    _ACT_SPAWN_AT["t"] = time.time()
+    threading.Thread(target=_activity_nightly, name="activity-nightly", daemon=True).start()
+
+
 def _nightly_job():
     """回刷最近 REFRESH_DAYS 天，并补齐停机期间的空洞。"""
     # 行业大盘按「本地实际有数据的区间」单独补一份缓存：
@@ -6073,6 +6837,7 @@ def _nightly_job():
         _log_progress("数据已是最新，无需抓取")
         # 没有抓取也要核算：可能是白天手动补过数，页面摘要不该停在更早的一天
         _price_snapshot()
+        _spawn_activity_nightly()
         return
     start, end = rng
     newest = scrape_day.newest_day()
@@ -6083,6 +6848,8 @@ def _nightly_job():
                                      after=_after_scrape)
     if not res.get("ok"):
         _log_progress(f"定时任务未启动：{res.get('error')}")
+    # 主抓取已占锁，团长活动线程会等它结束后再跑（同一个 Profile 不能并发）
+    _spawn_activity_nightly()
 
 
 def _schedule_target(dt=None):
