@@ -43,14 +43,18 @@ _RE_OFFICIAL = re.compile(r"商品id[:：]\s*(\d+)\s*,\s*佣金比例[:：]\s*([
 
 _JS_POST = """
 async ({url, payload}) => {
-  const r = await fetch(url, {
-    method: 'POST', credentials: 'include',
-    headers: {'Content-Type':'application/json',
-      'accept':'application/json, text/plain, */*',
-      'referer':'https://jzt.jd.com/jtk/','language':'zh_CN','siteid':'0','loginmode':'0'},
-    body: JSON.stringify(payload)
-  });
-  return await r.text();
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch(url, {
+      method: 'POST', credentials: 'include', signal: ctl.signal,
+      headers: {'Content-Type':'application/json',
+        'accept':'application/json, text/plain, */*',
+        'referer':'https://jzt.jd.com/jtk/','language':'zh_CN','siteid':'0','loginmode':'0'},
+      body: JSON.stringify(payload)
+    });
+    return {status: r.status, text: await r.text()};
+  } finally { clearTimeout(timer); }
 }
 """
 
@@ -88,7 +92,11 @@ def _write(path: Path, obj) -> None:
 # ---------------------------------------------------------------- 接口
 def _post(page, url: str, payload):
     res = page.evaluate(_JS_POST, {"url": url, "payload": payload})
-    d = json.loads(res)
+    if not isinstance(res, dict):
+        raise RuntimeError(f"{url} -> 无效响应 {str(res)[:120]}")
+    if res.get("status") != 200:
+        raise RuntimeError(f"{url} -> HTTP {res.get('status')} {str(res.get('text'))[:160]}")
+    d = json.loads(res.get("text") or "{}")
     if d.get("code") not in (1, 0):
         raise RuntimeError(f"{url} -> {json.dumps(d, ensure_ascii=False)[:200]}")
     return d
@@ -254,6 +262,93 @@ def fetch_perf_day(page, day: str) -> dict:
     return {"date": day, "fetchedAt": settings.now_iso(), "summary": summ, "cp": cp, "sku": sku}
 
 
+# ---------------------------------------------------------------- 订单明细（活动维度）
+# 团长诊断只按团长/商品汇总，没有活动维度；订单明细里每单带 cpActId，
+# 按它汇总才能拿到「这个活动自己的订单/GMV/佣金」，这是活动视图的数据来源。
+ORDER_URL = "https://atoms-api.jd.com/union/pop/report/detail/orders?requestFrom=0"
+_ORDER_BASE = {
+    "startDate": "", "endDate": "", "startCptDay": None, "endCptDay": None,
+    "sourceEmt": None, "isValid": 1, "pageIndex": 1, "pageSize": 100,
+    "orderTimeFlag": 1, "cptTimeFlag": 0, "taskId": None, "contentId": None,
+    "selectType": 0, "actType": 0, "orderId": "", "orderState": None,
+    "deliveryModeType": 1,
+}
+
+
+def fetch_order_day(page, day: str, max_pages: int = 30) -> dict:
+    """拉某天的订单明细，只保留有效订单且属于团长活动的，按活动 → 商品汇总。
+
+    这个接口的几个坑（实测）：
+      * 第 1 页偶发空包（会话没挂稳），要重试，且空包时 total 可能是 0 而不是 None；
+      * 单次查询超过约 20 页会被限流（后续页一直空），所以按天拉、页间隔 1 秒；
+      * total 有时返回 0，这时以“最后一页不足 100 条”判定抓完。
+    """
+    rows, page_no, total, retry = [], 1, None, 0
+    seen = set()
+    complete = False
+    while page_no <= max_pages:
+        payload = dict(_ORDER_BASE, startDate=day, endDate=day, pageIndex=page_no)
+        d = _post(page, ORDER_URL, payload)
+        body = d.get("content") or d.get("data") or {}
+        batch = body.get("data") or []
+        t = body.get("total")
+        if t:
+            total = int(t)
+        if not batch:
+            if retry < 3:
+                retry += 1
+                time.sleep(2)
+                continue
+            break
+        retry = 0
+        for r in batch:
+            oid = r.get("orderId")
+            if oid in seen:
+                continue
+            seen.add(oid)
+            rows.append(r)
+        if total and len(rows) >= total:
+            complete = True
+            break
+        if len(batch) < 100:
+            complete = True
+            break
+        page_no += 1
+        time.sleep(0.8)
+    acts: dict = {}
+    for r in rows:
+        try:
+            if int(r.get("isValid") or 0) != 1:
+                continue
+            aid = str(int(r.get("cpActId") or 0))
+            if aid == "0":
+                continue
+            sid = str(r.get("skuId") or "")
+            gmv = float(r.get("skuPrice") or 0)
+            cosfee = float(r.get("cosFee") or 0)
+            cpfee = float(r.get("cpFee") or 0)
+            qty = int(r.get("skuCount") or 0)
+        except (TypeError, ValueError):
+            continue
+        name = str(r.get("cpActName") or r.get("actName") or r.get("planName") or aid)
+        e = acts.setdefault(aid, {"actName": name, "orders": 0, "qty": 0, "gmv": 0.0,
+                                  "cosFee": 0.0, "cpFee": 0.0, "skus": {}})
+        e["orders"] += 1
+        e["qty"] += qty
+        e["gmv"] += gmv
+        e["cosFee"] += cosfee
+        e["cpFee"] += cpfee
+        sk = e["skus"].setdefault(sid, {"name": str(r.get("skuName") or sid), "orders": 0,
+                                        "qty": 0, "gmv": 0.0, "cosFee": 0.0, "cpFee": 0.0})
+        sk["orders"] += 1
+        sk["qty"] += qty
+        sk["gmv"] += gmv
+        sk["cosFee"] += cosfee
+        sk["cpFee"] += cpfee
+    return {"date": day, "fetchedAt": settings.now_iso(), "total": len(rows),
+            "expected": total or None, "complete": complete, "acts": acts}
+
+
 # ---------------------------------------------------------------- 合并落盘
 def _merge_signups(key: str, fresh: list) -> dict:
     path = acct_dir(key) / "signups.json"
@@ -388,6 +483,39 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                         except Exception as exc:  # noqa: BLE001
                             rec["errors"].append(f"perf {day}: {exc}")
                     log(f"[{label}] 已报名活动 {rec['activities']} 个，效果 {rec['perfDays']} 天")
+                    # 订单明细 → 活动维度。必须先进「订单明细」页等它初始化，
+                    # 否则接口会偶发返回空包（会话/身份还没挂上）。
+                    try:
+                        page.goto("https://jzt.jd.com/jtk/#/order-detail",
+                                  wait_until="domcontentloaded", timeout=90000)
+                        page.wait_for_timeout(12000)
+                        for day in _days(perf_start, perf_end):
+                            path = acct_dir(key) / "orders" / f"{day}.json"
+                            try:
+                                od = fetch_order_day(page, day)
+                            except Exception as exc:  # noqa: BLE001
+                                rec["errors"].append(f"orders {day}: {exc}")
+                                try:
+                                    page.reload()
+                                    page.wait_for_timeout(9000)
+                                    od = fetch_order_day(page, day)
+                                except Exception as exc2:  # noqa: BLE001
+                                    rec["errors"].append(f"orders {day} retry: {exc2}")
+                                    time.sleep(5)
+                                    continue
+                            old = _read(path, {}) or {}
+                            if (od.get("complete")
+                                    or int(od.get("total") or 0) >= int(old.get("total") or 0)):
+                                _write(path, od)
+                                rec["orderDays"] = rec.get("orderDays", 0) + 1
+                            else:
+                                rec["errors"].append(
+                                    f"orders {day}: 本次不完整 {od.get('total')}/{od.get('expected')}，保留旧数据")
+                            time.sleep(2)
+                        log(f"[{label}] 订单明细 {rec.get('orderDays', 0)} 天")
+                    except Exception as exc:  # noqa: BLE001
+                        rec["errors"].append(f"orders page: {exc}")
+                        log(f"[{label}] 订单明细页打开失败：{exc}")
                 else:
                     rec["errors"].append("团长招商页不可访问")
                     log(f"[{label}] 团长招商页不可访问（可能无权限），跳过效果数据")
@@ -505,6 +633,19 @@ def load_perf(keys: list, start: str, end: str) -> dict:
     for key in keys:
         for day in _days(start, end):
             p = acct_dir(key) / "perf" / f"{day}.json"
+            if p.exists():
+                d = _read(p, None)
+                if d:
+                    d["account"] = key
+                    days.append(d)
+    return {"days": days}
+
+
+def load_orders(keys: list, start: str, end: str) -> dict:
+    days = []
+    for key in keys:
+        for day in _days(start, end):
+            p = acct_dir(key) / "orders" / f"{day}.json"
             if p.exists():
                 d = _read(p, None)
                 if d:

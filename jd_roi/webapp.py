@@ -3084,6 +3084,25 @@ td.act .sub{display:block;overflow:hidden;text-overflow:ellipsis;white-space:now
 tr.rowlink{cursor:pointer}
 tr.rowlink:hover td{background:var(--soft)}
 tr.selrow td{background:#fbf1eb}
+/* 效果区紧凑化：5 个 KPI 一行、卡片留白收窄、表格行高压缩 */
+.grid.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
+#effectWrap .actsec{margin-top:18px}
+#effectWrap .kpi{padding:12px 14px}
+#effectWrap .kpi .lbl{font-size:11px}
+#effectWrap .kpi .val{font-size:22px}
+#effectWrap .kpi .sub{font-size:11.5px}
+#effectWrap .card{padding:16px 18px}
+#effectWrap .toolbar{margin-bottom:10px}
+#effectWrap th,#effectWrap td{padding:7px 9px;font-size:12.5px}
+#effectWrap .actrow{padding:2px 0}
+#effectWrap .tblwrap{max-height:320px}
+#effectWrap .acttabs{margin-bottom:8px}
+#effectWrap .acttabs a{padding:4px 12px;font-size:12px}
+#effectWrap .warn{margin:8px 0}
+.actctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+.actctl .toolbar{margin:0}
+@media(max-width:1100px){.grid.g5{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:760px){.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))}}
 /* 报名日历（GitHub 贡献图风格）：行=星期，列=上周/本周/下周 */
 .hmwrap{display:flex;gap:26px;align-items:flex-start;flex-wrap:wrap}
 .hm{display:grid;grid-template-columns:34px repeat(3,34px);gap:5px;justify-content:start}
@@ -3173,11 +3192,76 @@ ACT_JS = r"""
     }).catch(function(){});
   }
   if(window.ACT_RUNNING){ TIMER = setInterval(poll, 3000); }
-  // 报名明细整行可点：进入该活动自己的数据视图
-  document.querySelectorAll('tr.rowlink[data-href]').forEach(function(tr){
+
+  // 报名明细整行可点：AJAX 局部刷新「活动效果」，不跳 URL、不刷新整页
+  function actParam(over){
+    var p = {}, base = window.ACT_CTX || {};
+    Object.keys(base).forEach(function(k){ p[k] = base[k]; });
+    Object.keys(over || {}).forEach(function(k){ p[k] = over[k]; });
+    var out = [];
+    Object.keys(p).forEach(function(k){
+      var v = p[k];
+      if(v !== '' && v !== null && v !== undefined){
+        out.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+      }
+    });
+    return out.join('&');
+  }
+  window.actLoad = function(opts, tr){
+    opts = opts || {};
+    var ctx = window.ACT_CTX || {};
+    var over = {act: ('act' in opts) ? opts.act : (ctx.act || ''),
+                sku: ('sku' in opts) ? opts.sku : (ctx.sku || '')};
+    if(opts.start || opts.end){
+      over.start = opts.start || '';
+      over.end = opts.end || '';
+      over.days = '';
+    } else if(opts.days){
+      over.days = String(opts.days);
+      over.start = '';
+      over.end = '';
+    }
+    var wrap = document.getElementById('effectWrap');
+    if(!wrap) return;
+    wrap.style.opacity = '.45';
+    fetch('/api/activity/effect?' + actParam(over))
+      .then(function(r){ return r.text(); })
+      .then(function(html){
+        wrap.innerHTML = html;
+        wrap.style.opacity = '1';
+        // 记住当前活动与区间，后续点行 / 切区间都沿用，不会回到“今天”
+        ctx.act = over.act;
+        ctx.sku = over.sku;
+        if('start' in over){ ctx.start = over.start; ctx.end = over.end; ctx.days = ''; }
+        if('days' in over){ ctx.days = over.days; ctx.start = ''; ctx.end = ''; }
+        var rs = document.querySelectorAll('tr.rowlink');
+        for(var i = 0; i < rs.length; i++){ rs[i].classList.remove('selrow'); }
+        if(tr){ tr.classList.add('selrow'); }
+        try{ wrap.scrollIntoView({behavior: 'smooth', block: 'start'}); }catch(e){}
+      })
+      .catch(function(){ wrap.style.opacity = '1'; });
+  };
+  window.actShowAll = function(){ window.actLoad({act: '', sku: ''}); };
+  window.actRange = function(d){ window.actLoad({days: d}); };
+  window.actRangeCustom = function(){
+    var wrap = document.getElementById('effectWrap');
+    if(!wrap) return;
+    var form = wrap.querySelector('form');
+    if(!form) return;
+    var s = form.querySelector('input[name="start"]');
+    var e = form.querySelector('input[name="end"]');
+    if(!s || !e || !s.value || !e.value) return;
+    window.actLoad({start: s.value, end: e.value});
+  };
+  document.querySelectorAll('tr.rowlink[data-act]').forEach(function(tr){
     tr.addEventListener('click', function(e){
       if(e.target.closest('a,button,input,select')) return;
-      window.location.href = tr.getAttribute('data-href');
+      e.preventDefault();
+      var s = tr.getAttribute('data-start') || '';
+      var en = tr.getAttribute('data-end') || '';
+      var opts = {act: tr.getAttribute('data-act'), sku: tr.getAttribute('data-sku')};
+      if(s && en){ opts.start = s; opts.end = en; }   // 直接定位到该商品的活动起止
+      window.actLoad(opts, tr);
     });
   });
 })();
@@ -3417,6 +3501,8 @@ def activity_page(request: Request):
                          if r.get("cpUnionId") else "")
         trs.append(
             f'<tr class="rowlink{" selrow" if str(r.get("activityId")) == act_sel and str(r.get("skuId")) == sku_sel else ""}"'
+            f' data-act="{_e(r.get("activityId"))}" data-sku="{_e(r.get("skuId"))}"'
+            f' data-start="{_e(r.get("startDate") or "")}" data-end="{_e(r.get("endDate") or "")}"'
             f' data-href="{_e(_qlink(act=r.get("activityId"), sku=r.get("skuId")))}#effect">'
             f'<td class="n mono" style="white-space:nowrap">{_e(str(r.get("optTime") or "")[5:16])}</td>'
             f'<td class="l">{_e(r.get("accountLabel") or labels.get(r.get("account"), ""))}</td>'
@@ -3509,8 +3595,41 @@ def activity_page(request: Request):
                  if not act_sel or sid in act_skus]
     cp_items = [(uid, e) for uid, e in cp_map.items()
                 if not act_sel or uid in act_union_ids]
+
+    # 活动视图优先用订单明细：每单带 cpActId，能精确算“这个活动自己的订单/GMV/费用”
+    act_ord = None
+    order_days: dict = {}
+    order_cov = 0
     if act_sel:
-        # 活动视图：点击/订单/GMV/费用全部只按该活动报名过的商品归集
+        odata = activity.load_orders(acc_keys, start, end)
+        order_cov = len({x.get("date") for x in odata.get("days") or []})
+        if order_cov:
+            act_ord = {"orders": 0, "qty": 0, "gmv": 0.0, "fee": 0.0, "skus": {}}
+            for x in odata["days"]:
+                a = (x.get("acts") or {}).get(act_sel)
+                if not a:
+                    continue
+                day = x.get("date") or ""
+                day_fee = float(a.get("cosFee") or 0) + float(a.get("cpFee") or 0)
+                act_ord["orders"] += int(a.get("orders") or 0)
+                act_ord["qty"] += int(a.get("qty") or 0)
+                act_ord["gmv"] += float(a.get("gmv") or 0)
+                act_ord["fee"] += day_fee
+                dcur = order_days.setdefault(day, {"orders": 0.0, "gmv": 0.0})
+                dcur["orders"] += int(a.get("orders") or 0)
+                dcur["gmv"] += float(a.get("gmv") or 0)
+                for sid, sk in (a.get("skus") or {}).items():
+                    sid = str(sid)
+                    e = act_ord["skus"].setdefault(sid, {
+                        "name": sk.get("name") or sku_names.get(sid) or sid,
+                        "orders": 0, "qty": 0, "gmv": 0.0, "fee": 0.0})
+                    e["orders"] += int(sk.get("orders") or 0)
+                    e["qty"] += int(sk.get("qty") or 0)
+                    e["gmv"] += float(sk.get("gmv") or 0)
+                    e["fee"] += float(sk.get("cosFee") or 0) + float(sk.get("cpFee") or 0)
+    use_orders = bool(act_sel and act_ord is not None)
+    if act_sel and not use_orders:
+        # 没有订单明细缓存时，退回按“报名商品”维度估算
         tot = {
             "click": sum(e["click"] for _sid, e in sku_items),
             "order": sum(e["order"] for _sid, e in sku_items),
@@ -3518,22 +3637,28 @@ def activity_page(request: Request):
             "fee": sum(e["fee"] for _sid, e in sku_items),
         }
     roi = (tot["gmv"] / tot["fee"]) if tot["fee"] else 0.0
+    act_roi = ((act_ord["gmv"] / act_ord["fee"]) if (act_ord and act_ord["fee"]) else 0.0)
+    act_sku_cnt = len([e for e in (act_ord or {}).get("skus", {}).values() if e["orders"] > 0])
     n_order_union = len([e for _u, e in cp_items if e["order"] > 0])
     n_order_sku = len([e for _s, e in sku_items if e["order"] > 0])
 
-    trend_daily = daily_act if act_sel else daily
+    trend_src = order_days if use_orders else (daily_act if act_sel else daily)
     day_rows = []
-    max_order = max([v["order"] for v in trend_daily.values()] or [0]) or 1
+    max_order = max([v.get("orders", v.get("order", 0)) for v in trend_src.values()] or [0]) or 1
     for day in ds.day_span(start, end):
-        v = trend_daily.get(day) or {"click": 0.0, "order": 0.0}
-        w = max(int(round(v["order"] / max_order * 100)), 2)
+        v = trend_src.get(day) or {"orders": 0.0, "order": 0.0, "click": 0.0, "gmv": 0.0}
+        od = v.get("orders", v.get("order", 0))
+        w = 0 if not od else max(int(round(od / max_order * 100)), 3)
+        right = _amoney(v.get("gmv") or 0) if use_orders else f'{_an(v.get("click") or 0)} 点'
         day_rows.append(
             f'<div class="actrow"><div>{day[5:]}</div>'
             f'<div class="bar"><i style="width:{w}%"></i></div>'
-            f'<div class="n">{_an(v["order"])} 单</div>'
-            f'<div class="n">{_an(v["click"])} 点</div></div>')
+            f'<div class="n">{_an(od)} 单</div>'
+            f'<div class="n">{right}</div></div>')
+    trend_hint = ("条形 = 该活动有效订单量；右侧为 GMV（订单明细口径）" if use_orders
+                  else "条形 = 预估订单量；右侧为点击量")
     trend_card = ('<div class="card"><h3 style="margin-top:0">每日走势</h3>'
-                  '<div class="hint">条形 = 预估订单量；右侧为点击量</div>'
+                  f'<div class="hint">{trend_hint}</div>'
                   + "".join(day_rows) + '</div>')
 
     cp_rows = sorted(cp_items, key=lambda kv: kv[1]["gmv"], reverse=True)
@@ -3547,21 +3672,41 @@ def activity_page(request: Request):
         f'<td class="n">{len(e["skus"])}</td></tr>'
         for uid, e in cp_rows) or (
         '<tr><td colspan="8" class="l hint" style="padding:18px">'
-        + ('该活动没有团长归因（官方活动）' if act_sel else '该区间没有出单团长数据')
+        + (('该团长在所选区间没有出单数据' if act_union_ids
+            else '该活动没有团长归因（官方活动）') if act_sel else '该区间没有出单团长数据')
         + '</td></tr>')
 
-    sku_rows = sorted(sku_items, key=lambda kv: kv[1]["gmv"], reverse=True)
-    sku_html = "".join(
-        '<tr>'
-        f'<td class="l sku"><span class="nm" title="{_e(e["name"])}">{_e(e["name"])}</span></td>'
-        f'<td class="n">{_an(e["click"])}</td><td class="n">{_an(e["order"])}</td>'
-        f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
-        f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td>'
-        f'<td class="n">{len(e["unions"])}</td></tr>'
-        for _sid, e in sku_rows) or (
-        '<tr><td colspan="7" class="l hint" style="padding:18px">'
-        + ('该活动报名的商品在这个区间没有出单' if act_sel else '该区间没有商品出单数据')
-        + '</td></tr>')
+    if use_orders:
+        sku_head = ('<th class="l">商品</th><th class="n">订单量</th><th class="n">件数</th>'
+                    '<th class="n">预估 GMV</th><th class="n">预估费用</th><th class="n">ROI</th>')
+        _ord_rows = sorted((act_ord or {}).get("skus", {}).items(),
+                           key=lambda kv: kv[1]["gmv"], reverse=True)
+        sku_html = "".join(
+            '<tr>'
+            f'<td class="l sku"><span class="nm" title="{_e(e["name"])}">{_e(e["name"])}</span>'
+            f'<span class="sub">SKU {_e(sid)}</span></td>'
+            f'<td class="n">{_an(e["orders"])}</td><td class="n">{_an(e["qty"])}</td>'
+            f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
+            f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td></tr>'
+            for sid, e in _ord_rows) or (
+            '<tr><td colspan="6" class="l hint" style="padding:18px">'
+            '该活动在所选区间没有有效订单</td></tr>')
+    else:
+        sku_head = ('<th class="l">商品</th><th class="n">点击量</th><th class="n">预估订单</th>'
+                    '<th class="n">预估 GMV</th><th class="n">预估费用</th><th class="n">ROI</th>'
+                    '<th class="n">出单团长数</th>')
+        sku_rows = sorted(sku_items, key=lambda kv: kv[1]["gmv"], reverse=True)
+        sku_html = "".join(
+            '<tr>'
+            f'<td class="l sku"><span class="nm" title="{_e(e["name"])}">{_e(e["name"])}</span></td>'
+            f'<td class="n">{_an(e["click"])}</td><td class="n">{_an(e["order"])}</td>'
+            f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
+            f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td>'
+            f'<td class="n">{len(e["unions"])}</td></tr>'
+            for _sid, e in sku_rows) or (
+            '<tr><td colspan="7" class="l hint" style="padding:18px">'
+            + ('该活动报名的商品在这个区间没有出单' if act_sel else '该区间没有商品出单数据')
+            + '</td></tr>')
 
     # 活动视图的标题与横幅
     eff_title = "活动效果"
@@ -3575,20 +3720,45 @@ def activity_page(request: Request):
         period = ""
         if act_info.get("startTime") or act_info.get("endTime"):
             period = f" · 活动期 {act_info.get('startTime') or '?'} ~ {act_info.get('endTime') or '?'}"
+        cp_tot = {"click": 0.0, "order": 0.0, "gmv": 0.0, "fee": 0.0}
+        for _u, e in cp_items:
+            for k in cp_tot:
+                cp_tot[k] += e[k]
+        if cp_items:
+            cp_roi = cp_tot["gmv"] / cp_tot["fee"] if cp_tot["fee"] else 0
+            only_union = sorted(act_union_ids)[0] if len(act_union_ids) == 1 else ""
+            cp_link = (f' <a class="btn ghost mini" href="{_qlink(act="", sku="", union=only_union)}">'
+                       '只看团长 →</a>') if only_union else ""
+            cp_line = (f"所属团长整体（团长诊断口径，含其他活动）：{_an(cp_tot['click'])} 点击 · "
+                       f"{_an(cp_tot['order'])} 单 · GMV {_amoney(cp_tot['gmv'])} · "
+                       f"费用 {_amoney(cp_tot['fee'])} · ROI {_an(cp_roi, 2)}{cp_link}")
+        else:
+            cp_line = "所属团长在所选区间没有出单数据"
         eff_title = "活动效果 · " + _e(act_title)
-        eff_hint = (f"{_e(start)} ~ {_e(end)} · 只统计该活动报名过的 "
-                    f"{len(act_skus)} 个商品")
+        if use_orders:
+            eff_hint = (f"{_e(start)} ~ {_e(end)} · 订单明细按活动ID精确归集"
+                        f"（覆盖 {order_cov} 天）")
+            sku_title = "商品效果（该活动有效订单）"
+        else:
+            eff_hint = (f"{_e(start)} ~ {_e(end)} · 暂无订单明细缓存，"
+                        f"按系统记录的报名商品（{len(act_skus)} 个）估算")
+            sku_title = "商品效果（系统记录的该活动报名商品）"
         cp_title = "出单团长（该团长整体，含其他活动）"
-        sku_title = "商品效果（仅该活动报名商品）"
+        banner_note = ("点击/订单/GMV/费用来自订单明细（每单按 cpActId 归集到本活动）；"
+                       "团长表是该团长整体数据，含其他活动。")
+        if not use_orders:
+            banner_note = ("当前区间没有订单明细缓存，先按系统记录的报名商品估算；"
+                           "团长表是该团长整体数据。")
         act_banner = (
             '<div class="card" id="effect" style="margin-top:16px;border-color:var(--primary)">'
             '<div class="toolbar" style="justify-content:space-between;margin-bottom:4px">'
             f'<div><b>正在查看：{_e(act_title)}</b>'
             f'<span class="hint" style="margin:0"> · 活动ID {_e(act_sel)} · 团长 {_e(unames)}{_e(period)}</span></div>'
             f'<div style="display:flex;gap:8px"><a class="btn ghost mini" href="#signup">看报名明细 ↑</a>'
-            f'<a class="btn sec mini" href="{_qlink(act="", sku="")}">查看全部</a></div></div>'
-            '<div class="hint" style="margin:0">点击/订单/GMV/费用按该活动已报名的商品归集；'
-            '团长表无法拆分到单个活动，展示的是该团长在所选区间的整体数据。</div>'
+            '<a class="btn sec mini" href="javascript:void(0)" '
+            'onclick="actShowAll();return false;">查看全部</a></div></div>'
+            f'<div class="hint" style="margin:0">{banner_note}</div>'
+            f'<div class="hint" style="margin:6px 0 0;color:var(--ink)">{cp_line}</div>'
             '</div>')
 
     acc_opts = '<option value="">全部账号</option>' + "".join(
@@ -3602,7 +3772,8 @@ def activity_page(request: Request):
     chips = []
     for d, lab in ((1, "昨天"), (7, "近 7 天"), (30, "近 30 天")):
         on = " on" if str(days_param) == str(d) else ""
-        chips.append(f'<a class="chip{on}" href="{_qlink(days=d)}">{lab}</a>')
+        chips.append(f'<a class="chip{on}" href="javascript:void(0)" data-days="{d}" '
+                     f'onclick="actRange({d});return false;">{lab}</a>')
 
     last_state = {}
     for k in acc_keys:
@@ -3626,6 +3797,58 @@ def activity_page(request: Request):
         if a_s and a_e and (a_e < start or a_s > end):
             act_warn = (f'<div class="hint">该活动期为 {_e(a_s)} ~ {_e(a_e)}，与当前统计区间 '
                         f'{_e(start)} ~ {_e(end)} 不重叠；可切换「近 30 天」或自定义区间查看。</div>')
+    act_zero = ""
+    if use_orders and act_ord["orders"] == 0:
+        act_zero = (f'<div class="warn">该活动在 {_e(start)} ~ {_e(end)} 没有有效订单'
+                    '（订单明细口径，已按活动ID精确归集）。'
+                    '若活动刚开始/还没开始，0 属正常；可切换更长区间查看。</div>')
+    elif act_sel and not use_orders and tot["click"] == 0 and tot["order"] == 0:
+        act_zero = (f'<div class="warn">系统记录的该活动报名商品在 {_e(start)} ~ {_e(end)} 没有出单'
+                    '（活动可能刚开始、还没开始，或这段时间没有推客成交）。'
+                    '上面的 KPI 为 0 属正常；可切换「近 30 天」看更长区间，'
+                    '或参考横幅里的「所属团长整体」数据。</div>')
+    order_warn = ""
+    if act_sel:
+        total_days = len(ds.day_span(start, end))
+        if use_orders and order_cov < total_days:
+            order_warn = (f'<div class="hint">订单明细覆盖 {order_cov}/{total_days} 天'
+                          f'（夜间只回刷最近 {settings.REFRESH_DAYS} 天），更早的日期没有活动维度数据。</div>')
+        elif not use_orders:
+            order_warn = ('<div class="hint">该区间没有订单明细缓存，活动数据暂按报名商品维度估算；'
+                          f'切换近 {settings.REFRESH_DAYS} 天或点「立即抓取」可拿到精确的活动订单。</div>')
+
+    if use_orders:
+        kpi_html = (
+            '<div class="grid g5" style="margin-top:12px">'
+            f'<div class="kpi"><div class="lbl">出单商品数</div><div class="val">{act_sku_cnt}</div>'
+            '<div class="sub">该活动有效订单</div></div>'
+            f'<div class="kpi"><div class="lbl">引入订单量</div><div class="val">{_an(act_ord["orders"])}</div>'
+            f'<div class="sub">件数 {_an(act_ord["qty"])}</div></div>'
+            f'<div class="kpi"><div class="lbl">预估 GMV</div><div class="val">{_amoney(act_ord["gmv"])}</div>'
+            '<div class="sub">商品金额合计</div></div>'
+            f'<div class="kpi"><div class="lbl">预估费用</div><div class="val">{_amoney(act_ord["fee"])}</div>'
+            '<div class="sub">佣金 + 团长服务费</div></div>'
+            f'<div class="kpi"><div class="lbl">ROI</div><div class="val">{_an(act_roi, 2)}</div>'
+            '<div class="sub">GMV ÷ 预估费用</div></div>'
+            '</div>')
+    else:
+        kpi_html = (
+            '<div class="grid g5" style="margin-top:12px">'
+            f'<div class="kpi"><div class="lbl">点击量</div><div class="val">{_an(tot["click"])}</div></div>'
+            f'<div class="kpi"><div class="lbl">引入订单量</div><div class="val">{_an(tot["order"])}</div>'
+            f'<div class="sub">出单团长 {n_order_union} · 出单商品 {n_order_sku}</div></div>'
+            f'<div class="kpi"><div class="lbl">预估 GMV</div><div class="val">{_amoney(tot["gmv"])}</div></div>'
+            f'<div class="kpi"><div class="lbl">预估费用</div><div class="val">{_amoney(tot["fee"])}</div>'
+            '<div class="sub">佣金 + 团长服务费</div></div>'
+            f'<div class="kpi"><div class="lbl">ROI</div><div class="val">{_an(roi, 2)}</div>'
+            '<div class="sub">GMV ÷ 预估费用</div></div>'
+            '</div>')
+
+    act_ctx_json = json.dumps({
+        "account": sel, "since": since, "q": kw, "union": union_sel,
+        "hm": hm_mode, "day": day_sel, "start": start, "end": end,
+        "days": days_param or "", "act": act_sel, "sku": sku_sel,
+    }, ensure_ascii=False).replace("</", "<\\/")
 
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3683,38 +3906,35 @@ def activity_page(request: Request):
 
 <div style="margin-top:16px">{signup_card}</div>
 
+<div id="effectWrap">
+<!--EFFECT_START-->
 <div class="actsec">
   <h2>{eff_title}</h2>
   <span class="hint">{eff_hint}</span>
 </div>
 {act_banner}
-<div class="acttabs">{''.join(chips)}</div>
-<form class="toolbar" method="get" action="/activity">
-  <input type="hidden" name="account" value="{_e(sel)}">
-  <input type="hidden" name="since" value="{_e(since)}">
-  <input type="hidden" name="q" value="{_e(kw)}">
-  <input type="hidden" name="union" value="{_e(union_sel)}">
-  <input type="hidden" name="act" value="{_e(act_sel)}">
-  <input type="hidden" name="sku" value="{_e(sku_sel)}">
-  <label class="fld">起 <input type="date" name="start" value="{_e(start)}"></label>
-  <label class="fld">止 <input type="date" name="end" value="{_e(end)}"></label>
-  <button class="btn sec" type="submit">查询区间</button>
-</form>
+<div class="actctl">
+  <div class="acttabs">{''.join(chips)}</div>
+  <form class="toolbar" onsubmit="return false" method="get" action="/activity">
+    <input type="hidden" name="account" value="{_e(sel)}">
+    <input type="hidden" name="since" value="{_e(since)}">
+    <input type="hidden" name="q" value="{_e(kw)}">
+    <input type="hidden" name="union" value="{_e(union_sel)}">
+    <input type="hidden" name="act" value="{_e(act_sel)}">
+    <input type="hidden" name="sku" value="{_e(sku_sel)}">
+    <label class="fld">起 <input type="date" name="start" value="{_e(start)}"></label>
+    <label class="fld">止 <input type="date" name="end" value="{_e(end)}"></label>
+    <button class="btn sec" type="button" onclick="actRangeCustom()">查询区间</button>
+  </form>
+</div>
 {warn}
 {act_warn}
+{act_zero}
+{order_warn}
 
-<div class="grid g5" style="margin-top:12px">
-  <div class="kpi"><div class="lbl">点击量</div><div class="val">{_an(tot['click'])}</div></div>
-  <div class="kpi"><div class="lbl">引入订单量</div><div class="val">{_an(tot['order'])}</div>
-    <div class="sub">出单团长 {n_order_union} · 出单商品 {n_order_sku}</div></div>
-  <div class="kpi"><div class="lbl">预估 GMV</div><div class="val">{_amoney(tot['gmv'])}</div></div>
-  <div class="kpi"><div class="lbl">预估费用</div><div class="val">{_amoney(tot['fee'])}</div>
-    <div class="sub">佣金 + 团长服务费</div></div>
-  <div class="kpi"><div class="lbl">ROI</div><div class="val">{_an(roi, 2)}</div>
-    <div class="sub">GMV ÷ 预估费用</div></div>
-</div>
+{kpi_html}
 
-<div class="card" style="margin-top:16px">
+<div class="card" style="margin-top:12px">
   <h3 style="margin-top:0">{cp_title}</h3>
   <div class="tblwrap short"><table><thead><tr>
     <th class="l">团长</th><th class="l">账号</th><th class="n">点击量</th>
@@ -3723,16 +3943,16 @@ def activity_page(request: Request):
   </tr></thead><tbody>{cp_html}</tbody></table></div>
 </div>
 
-<div class="card" style="margin-top:16px">
+<div class="card" style="margin-top:12px">
   <h3 style="margin-top:0">{sku_title}</h3>
   <div class="tblwrap short"><table><thead><tr>
-    <th class="l">商品</th><th class="n">点击量</th><th class="n">预估订单</th>
-    <th class="n">预估 GMV</th><th class="n">预估费用</th><th class="n">ROI</th>
-    <th class="n">出单团长数</th>
+    {sku_head}
   </tr></thead><tbody>{sku_html}</tbody></table></div>
 </div>
 
-<div style="margin-top:16px">{trend_card}</div>
+<div style="margin-top:12px">{trend_card}</div>
+<!--EFFECT_END-->
+</div>
 
 <div class="note" style="margin-top:18px">
   <p><b>数据口径</b>：报名明细逐条解析自京准通「操作日志 → 活动」的“报名团长招商活动 /
@@ -3740,13 +3960,17 @@ def activity_page(request: Request):
      团长由「已报名活动」接口的活动 ID → 团长 ID 映射，再用团长信息接口补名称。</p>
   <p><b>效果口径</b>：出单概览 / 出单团长 / 商品效果与团长招商页「团长诊断」一致；
      预估费用含佣金与团长服务费，ROI = 预估 GMV ÷ 预估费用。按天入库后区间内直接相加。</p>
+  <p><b>活动视图</b>：点击报名明细某一行后，优先用「订单明细」里每单的 cpActId 汇总该活动的
+     有效订单（订单量 / GMV / 佣金 + 团长服务费 / ROI 都是活动自己的数）；点击量平台没有活动维度，
+     用所属团长的整体点击作参考。没有订单明细缓存的日期会退回“按报名商品估算”。</p>
   <p><b>注意</b>：CPS 是点击后 15 天归因，最近 15 天的数据每晚会被回刷修正。</p>
 </div>
 
 </div>
 <script>window.ACT_RUNNING = {'true' if run_state.get('active') else 'false'};</script>
+<script>window.ACT_CTX = {act_ctx_json};</script>
 <script>{ACT_JS}</script>
-</body></html>""")
+</body></html>""", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/activity/run")
@@ -3764,6 +3988,26 @@ def api_activity_run(start: str = "", end: str = "", days: int = 0):
 @app.get("/api/activity/status")
 def api_activity_status():
     return activity.runtime_status()
+
+
+@app.get("/api/activity/effect")
+def api_activity_effect(act: str = "", sku: str = "", start: str = "", end: str = "",
+                        days: str = "", account: str = "", since: str = "",
+                        q: str = "", union: str = "", hm: str = "start", day: str = ""):
+    """局部刷新用：只返回「活动效果」那一段 HTML，点击行不再整页跳转。"""
+    from urllib.parse import urlencode
+    params = {"act": act, "sku": sku, "start": start, "end": end, "days": days,
+              "account": account, "since": since, "q": q, "union": union,
+              "hm": hm, "day": day}
+    qs = urlencode({k: v for k, v in params.items() if v not in ("", None)})
+    req = Request({"type": "http", "method": "GET", "path": "/activity",
+                   "query_string": qs.encode(), "headers": [],
+                   "scheme": "http", "server": ("127.0.0.1", 80), "root_path": ""})
+    html = activity_page(req).body.decode("utf-8")
+    if "<!--EFFECT_START-->" not in html:
+        return HTMLResponse("<div class='hint'>加载失败，请刷新页面重试</div>")
+    frag = html.split("<!--EFFECT_START-->", 1)[1].split("<!--EFFECT_END-->", 1)[0]
+    return HTMLResponse(frag, headers={"Cache-Control": "no-store"})
 
 
 # ================================================================ SKU 前台价
