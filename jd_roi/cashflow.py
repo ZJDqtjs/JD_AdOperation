@@ -133,7 +133,16 @@ def _fetch_all(page, api: str, base: dict, begin: str, end: str,
 
 
 def fetch_account(key: str, begin: str, end: str) -> dict:
-    """抓一个账号的财务记录；调用方负责持有 Profile 锁。"""
+    """抓一个账号在 [begin,end] 的财务记录；调用方负责持有 Profile 锁。"""
+    return fetch_spans(key, [(begin, end)], begin, end)[0]
+
+
+def fetch_spans(key: str, spans: list[tuple[str, str]], begin: str, end: str) -> list[dict]:
+    """一次浏览器会话里按 spans 逐个抓流水列表，每个 span 返回一份 raw。
+
+    「补缺的日期」只抓缺的那几段，不再整段重抓；余额 / 消费汇总仍按用户请求的
+    begin~end 取一次（这两个接口不分页，一次就够）。调用方负责持有 Profile 锁。
+    """
     from .browser import launch_persistent, session_ok
 
     acc = settings.get_account(key)
@@ -155,16 +164,21 @@ def fetch_account(key: str, begin: str, end: str) -> dict:
         pin_rows, _ = _rows(pins)
         _sleep()
 
-        recharge = _fetch_all(page, "account/cashrecharge/list",
-                              tpl.get("account/cashrecharge/list") or {}, begin, end)
-        consume = _fetch_all(page, "subaccount/cashconsume/list",
-                             tpl.get("subaccount/cashconsume/list") or {}, begin, end)
-        assign = _fetch_all(page, "account/cashassign/list",
-                            tpl.get("account/cashassign/list") or {}, begin, end)
+        got: list[dict] = []
+        for b, e in spans:
+            recharge = _fetch_all(page, "account/cashrecharge/list",
+                                  tpl.get("account/cashrecharge/list") or {}, b, e)
+            consume = _fetch_all(page, "subaccount/cashconsume/list",
+                                 tpl.get("subaccount/cashconsume/list") or {}, b, e)
+            assign = _fetch_all(page, "account/cashassign/list",
+                                tpl.get("account/cashassign/list") or {}, b, e)
 
-        fbase = dict(tpl.get("subaccount/freeze/list") or {})
-        fbase["pin"] = (pin_rows[0].get("pinName") if pin_rows else "") or ""
-        freeze = _fetch_all(page, "subaccount/freeze/list", fbase, begin, end)
+            fbase = dict(tpl.get("subaccount/freeze/list") or {})
+            fbase["pin"] = (pin_rows[0].get("pinName") if pin_rows else "") or ""
+            freeze = _fetch_all(page, "subaccount/freeze/list", fbase, b, e)
+            got.append({"range": {"begin": b, "end": e}, "recharge": recharge,
+                        "consume": consume, "assign": assign, "freeze": freeze})
+            _sleep()
 
         sbase = dict(tpl.get("subaccount/consumer/sumCost/query") or {})
         sbase.pop("page", None)
@@ -176,18 +190,18 @@ def fetch_account(key: str, begin: str, end: str) -> dict:
                                        "body": {"beginDate": begin, "endDate": end,
                                                 "timeFilterType": 0}})
 
-        return {
+        fetched_at = settings.now_iso()
+        return [{
             "account": key, "label": acc.get("label") or key,
             "account_id": acc.get("account_id") or 0,
-            "range": {"begin": begin, "end": end},
-            "fetched_at": settings.now_iso(),
+            "range": piece["range"], "fetched_at": fetched_at,
             "balance": (balance or {}).get("data"),
             "pins": pin_rows,
             "summary": (summary or {}).get("data"),
             "consume_info": (info or {}).get("data"),
-            "recharge": recharge, "consume": consume,
-            "assign": assign, "freeze": freeze,
-        }
+            "recharge": piece["recharge"], "consume": piece["consume"],
+            "assign": piece["assign"], "freeze": piece["freeze"],
+        } for piece in got]
     finally:
         try:
             context.close()
@@ -215,38 +229,198 @@ def save(data: dict) -> Path:
     return p
 
 
-def load_range(begin: str, end: str) -> list[dict]:
-    """读某区间的全部账号缓存（没有的账号跳过）。"""
-    items = []
-    for a in settings.ACCOUNTS:
-        p = cache_path(a["key"], begin, end)
-        if not p.exists():
+def _load_pieces(key: str) -> list[dict]:
+    """读该账号的全部缓存分片（每份带上文件名与区间，用来按天挑主人）。"""
+    out: list[dict] = []
+    if not CACHE_DIR.exists():
+        return out
+    for p in CACHE_DIR.glob("*.json"):
+        m = CACHE_RE.match(p.name)
+        if not m or m.group("key") != key:
             continue
         try:
-            items.append(json.loads(p.read_text(encoding="utf-8")))
+            d = json.loads(p.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             continue
+        d["_file"] = p.name
+        d["_begin"] = m.group("begin")
+        d["_end"] = m.group("end")
+        out.append(d)
+    return out
+
+
+def _span_len(begin: str, end: str) -> int:
+    return len(date_list(begin, end))
+
+
+def _covered_days(pieces: list[dict], begin: str, end: str) -> set[str]:
+    days: set[str] = set()
+    for p in pieces:
+        if p["_begin"] <= end and p["_end"] >= begin:
+            days.update(date_list(max(p["_begin"], begin), min(p["_end"], end)))
+    return days
+
+
+def _recharge_day(r: dict) -> str:
+    return _d(r.get("createDate"))
+
+
+def _assign_day(r: dict) -> str:
+    return _d(r.get("createTime"))
+
+
+def _freeze_day(r: dict) -> str:
+    return _d(r.get("createDate"))
+
+
+def _merge_account(key: str, begin: str, end: str) -> dict | None:
+    """把该账号的多段缓存按「天」拼成一份 [begin,end] 的 raw。
+
+    同一天被多份缓存覆盖时，取抓取时间新的那份；同一批抓的取区间更窄的那份
+    （补抓出来的小分片比整月文件更贴近真实）。所以整月文件 + 单日补抓也能拼。
+    """
+    pieces = [p for p in _load_pieces(key) if p["_begin"] <= end and p["_end"] >= begin]
+    if not pieces:
+        return None
+    day_set = set(date_list(begin, end))
+    owner: dict[str, dict] = {}
+    for p in sorted(pieces, key=lambda x: ((x.get("fetched_at") or ""),
+                                          -_span_len(x["_begin"], x["_end"]))):
+        for d in date_list(max(p["_begin"], begin), min(p["_end"], end)):
+            if d in day_set:
+                owner[d] = p
+    taken: dict[str, set] = defaultdict(set)
+    for d, p in owner.items():
+        taken[p["_file"]].add(d)
+    latest = max(pieces, key=lambda x: ((x.get("fetched_at") or ""),
+                                        -_span_len(x["_begin"], x["_end"])))
+    try:
+        label = settings.get_account(key).get("label") or latest.get("label") or key
+    except Exception:  # noqa: BLE001
+        label = latest.get("label") or key
+    merged = {
+        "account": key, "label": label,
+        "account_id": latest.get("account_id") or 0,
+        "range": {"begin": begin, "end": end},
+        "fetched_at": max((p.get("fetched_at") or "" for p in pieces), default=""),
+        "balance": latest.get("balance"), "pins": latest.get("pins"),
+        "summary": latest.get("summary"), "consume_info": latest.get("consume_info"),
+    }
+    for field, dayfn in (("recharge", _recharge_day), ("consume", _day),
+                         ("assign", _assign_day), ("freeze", _freeze_day)):
+        rows: list[dict] = []
+        for p in pieces:
+            own = taken.get(p["_file"]) or set()
+            for r in p.get(field) or []:
+                d = dayfn(r)
+                if d:
+                    if d in own:
+                        rows.append(r)
+                elif p is latest:            # 认不出日期的行只从最新那份留一份，避免重复
+                    rows.append(r)
+        merged[field] = rows
+    return merged
+
+
+def load_spliced(begin: str, end: str) -> list[dict]:
+    """读任意区间：各账号各自的缓存分片按天拼起来（没有缓存的账号跳过）。"""
+    items = []
+    for a in settings.ACCOUNTS:
+        merged = _merge_account(a["key"], begin, end)
+        if merged:
+            items.append(merged)
     return items
 
 
-def cached_ranges() -> list[dict]:
-    """已抓过的区间，按结束日倒序：[{begin, end, accounts:[key], fetchedAt}]。"""
-    out: dict[tuple, dict] = {}
+def missing_spans(key: str, begin: str, end: str) -> list[tuple[str, str]]:
+    """该账号在 [begin,end] 里没缓存的日子，压成连续的小段。"""
+    days = date_list(begin, end)
+    covered = _covered_days(_load_pieces(key), begin, end)
+    spans: list[tuple[str, str]] = []
+    start = None
+    prev = None
+    for d in days:
+        if d in covered:
+            if start:
+                spans.append((start, prev))
+                start = None
+        else:
+            if not start:
+                start = d
+            prev = d
+    if start:
+        spans.append((start, prev))
+    return spans
+
+
+def gap_plan(begin: str, end: str) -> dict[str, list[tuple[str, str]]]:
+    """要补抓的计划：{账号key: 缺的连续日期段}，没缺的账号不在里面。"""
+    return {a["key"]: sp for a in settings.ACCOUNTS
+            if (sp := missing_spans(a["key"], begin, end))}
+
+
+def span_text(spans: list[tuple[str, str]]) -> str:
+    return "、".join(s if s == e else f"{s} ~ {e}" for s, e in spans)
+
+
+def _cleanup_contained(key: str, begin: str, end: str) -> None:
+    """拼好的整段缓存落盘后，把被它完全包住的旧分片删掉，缓存清单不堆小文件。"""
+    keep = cache_path(key, begin, end)
+    for p in CACHE_DIR.glob("*.json"):
+        m = CACHE_RE.match(p.name)
+        if not m or m.group("key") != key or p == keep:
+            continue
+        if m.group("begin") >= begin and m.group("end") <= end:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def cache_entries() -> list[dict]:
+    """给 /cache 页用的缓存清单（一条 = 一个账号的一份分片）。"""
+    out: list[dict] = []
     if not CACHE_DIR.exists():
-        return []
+        return out
     for p in CACHE_DIR.glob("*.json"):
         m = CACHE_RE.match(p.name)
         if not m:
             continue
-        k = (m.group("begin"), m.group("end"))
-        rec = out.setdefault(k, {"begin": k[0], "end": k[1], "accounts": [], "fetchedAt": ""})
-        rec["accounts"].append(m.group("key"))
+        key, b, e = m.group("key"), m.group("begin"), m.group("end")
         try:
-            got = json.loads(p.read_text(encoding="utf-8")).get("fetched_at") or ""
-            rec["fetchedAt"] = max(rec["fetchedAt"], got)
+            data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
-            pass
-    return sorted(out.values(), key=lambda x: (x["end"], x["begin"]), reverse=True)
+            data = {}
+        rows = sum(len(data.get(k) or []) for k in ("recharge", "consume", "assign", "freeze"))
+        consume = round(sum(_f(r.get("amount")) for r in (data.get("consume") or [])), 2)
+        try:
+            label = settings.get_account(key).get("label") or data.get("label") or key
+        except Exception:  # noqa: BLE001
+            label = data.get("label") or key
+        st = p.stat()
+        out.append({
+            "mode": "cashflow", "account": key, "accountLabel": label,
+            "start": b, "end": e, "rows": rows, "total": consume,
+            "jobId": data.get("fetched_at"),
+            "savedAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "sizeKB": round(st.st_size / 1024, 1), "files": [p.name],
+            "legacy": False, "stale": False,
+        })
+    return sorted(out, key=lambda x: x["savedAt"], reverse=True)
+
+
+def delete_cache(account: str, start: str, end: str) -> dict:
+    key = str(account or "")
+    if not key or "/" in key or "\\" in key:
+        return {"ok": False, "deleted": [], "error": "账号参数不合法"}
+    fp = cache_path(key, start, end)
+    if fp.exists():
+        try:
+            fp.unlink()
+            return {"ok": True, "deleted": [fp.name], "error": None}
+        except OSError as exc:
+            return {"ok": False, "deleted": [], "error": str(exc)}
+    return {"ok": True, "deleted": [], "error": "没有找到对应的缓存文件"}
 
 
 # ============================================================ 汇总
@@ -450,30 +624,34 @@ def default_range(days: int = 30) -> tuple[str, str]:
 
 
 def snapshot(begin: str = "", end: str = "") -> dict:
-    """页面用的数据快照：读**指定区间**的本地缓存，不触发任何请求。
+    """页面用的数据快照：读本地缓存并按天拼接，不触发任何请求。
 
-    没给区间就退回「最近一次抓过的区间」，方便直接打开页面看上次的结果。
+    没给区间就退回近 30 天。缺哪些日子、要不要补抓由 gap_plan 决定，
+    页面只展示结果；缓存清单统一去 /cache 页看。
     """
-    ranges = cached_ranges()
     if not (begin and end):
-        if ranges:
-            begin, end = ranges[0]["begin"], ranges[0]["end"]
-        else:
-            begin, end = default_range(30)
-    raw = load_range(begin, end)
+        begin, end = default_range(30)
+    raw = load_spliced(begin, end)
     accs = [build(d) for d in raw]
+    plan = gap_plan(begin, end)
+    gap_days = sorted({d for sp in plan.values() for s, e in sp for d in date_list(s, e)})
     base = {"ok": True, "empty": not accs, "accounts": [], "daily": [],
-            "begin": begin, "end": end, "ranges": ranges,
+            "begin": begin, "end": end,
+            "gaps": [{"account": k,
+                      "label": (settings.get_account(k).get("label") or k),
+                      "spans": [[s, e] for s, e in sp],
+                      "days": sum(len(date_list(s, e)) for s, e in sp)}
+                     for k, sp in plan.items()],
+            "gapDays": len(gap_days),
+            "gapRange": [gap_days[0], gap_days[-1]] if gap_days else [],
             "labels": [], "totals": {"cash": 0, "begin": 0, "recharge": 0, "consume": 0}}
     if not accs:
         base["empty"] = True
         return base
     daily = daily_rows(accs, begin, end)
-    got = {a["range"].get("end") for a in accs if a["range"]}
     base.update({
         "empty": False, "accounts": accs, "daily": daily,
         "fetched_at": max((a["fetched_at"] for a in accs), default=""),
-        "ranges_mixed": len(got) > 1,
         "labels": [a["label"] for a in accs],
         "missing": [a["label"] for a in settings.ACCOUNTS
                     if a["key"] not in {x["account"] for x in accs}],
@@ -785,7 +963,10 @@ class Runner:
             return dict(self._state)
 
     def start(self, begin: str = "", end: str = "") -> dict:
-        """按任意区间抓取（begin/end 为 YYYY-MM-DD，跨度上限 370 天）。"""
+        """按任意区间补抓（begin/end 为 YYYY-MM-DD，跨度上限 370 天）。
+
+        只看「缓存里缺哪几天」：每天都有的账号直接跳过，一段都不缺就什么都不抓。
+        """
         if not (begin and end):
             begin, end = default_range(30)
         try:
@@ -797,22 +978,30 @@ class Runner:
             return {"ok": False, "error": "结束日不能早于开始日"}
         if (d1 - d0).days + 1 > 370:
             return {"ok": False, "error": "一次最多抓 370 天，请分段"}
+        plan = gap_plan(begin, end)
+        if not plan:
+            return {"ok": True, "nothing": True, "range": [begin, end],
+                    "message": f"{begin} ~ {end} 每一天都有缓存，无需补抓"}
+        n_days = sum(len(date_list(s, e)) for sp in plan.values() for s, e in sp)
         with self._lock:
             if self._state["running"]:
                 return {"ok": False, "error": "已经在抓了，等这一轮结束"}
             self._state.update({"running": True, "done": 0,
-                                "total": len(settings.ACCOUNTS), "account": None,
-                                "message": "排队等待浏览器登录态…", "error": None,
+                                "total": len(plan), "account": None,
+                                "message": f"缺 {len(plan)} 个账号共 {n_days} 天，"
+                                           "排队等待浏览器登录态…",
+                                "error": None,
                                 "startedAt": settings.now_iso(), "finishedAt": None,
                                 "range": [begin, end], "failed": []})
         self._cancel.clear()
-        self._thread = threading.Thread(target=self._run, args=(begin, end),
+        self._thread = threading.Thread(target=self._run, args=(begin, end, plan),
                                         name="cashflow-run", daemon=True)
         self._thread.start()
-        return {"ok": True, "range": [begin, end]}
+        return {"ok": True, "range": [begin, end], "accounts": len(plan), "days": n_days}
 
-    def _run(self, begin: str, end: str) -> None:
-        keys = [a["key"] for a in settings.ACCOUNTS]
+    def _run(self, begin: str, end: str,
+             plan: dict[str, list[tuple[str, str]]]) -> None:
+        keys = list(plan)
         try:
             if not self._profile_lock.acquire(timeout=300):
                 raise RuntimeError("浏览器登录态被其它任务占用（登录/保活/抓取），稍后再试")
@@ -821,12 +1010,18 @@ class Runner:
                     if self._cancel.is_set():
                         break
                     label = settings.get_account(key).get("label") or key
+                    spans = plan[key]
                     with self._lock:
                         self._state.update({"account": label,
-                                            "message": f"正在抓「{label}」的充值/消费/分配流水…"})
+                                            "message": f"正在补「{label}」缺的 {span_text(spans)}…"})
                     try:
-                        data = fetch_account(key, begin, end)
-                        save(data)
+                        for raw in fetch_spans(key, spans, begin, end):
+                            save(raw)                 # 先按小段落盘
+                        merged = _merge_account(key, begin, end)
+                        if merged:
+                            merged["fetched_at"] = settings.now_iso()
+                            save(merged)              # 再拼成整段，下次查询直接命中
+                            _cleanup_contained(key, begin, end)
                     except Exception as e:  # noqa: BLE001
                         with self._lock:
                             self._state["failed"].append(f"{label}：{type(e).__name__}: {e}")
@@ -841,7 +1036,7 @@ class Runner:
                 self._state.update({
                     "running": False, "account": None, "range": [begin, end],
                     "finishedAt": settings.now_iso(),
-                    "message": ("抓取完成" if not failed else
+                    "message": ("补齐完成" if not failed else
                                 f"完成，但有 {len(failed)} 个账号失败"),
                 })
         except Exception as e:  # noqa: BLE001

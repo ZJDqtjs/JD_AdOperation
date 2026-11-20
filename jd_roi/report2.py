@@ -29,7 +29,7 @@ _NAV_ITEMS = [("/", "控制台"), ("/report", "分析报表"), ("/activity", "�
               ("广告情况", [("/paycomm", "CPS花费"), ("/paycomm/spend", "京准通花费"),
                            ("/cashflow", "广告费流水"),
                            ("/profit", "月度利润"), ("/maobao", "毛利诊断")]),
-              ("/price", "SKU前台价"),
+              ("/price", "SKU前台价"), ("/subsidy", "超级补贴"),
               ("/cache", "缓存"), ("/login", "登录")]
 
 
