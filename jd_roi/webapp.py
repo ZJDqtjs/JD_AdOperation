@@ -6,12 +6,11 @@
 
 页面：
     /            控制台（区间选择、数据覆盖、立即抓取、扫码登录）
-    /report      任意区间的聚合分析报表（自带区间选择器；⑧行业大盘页签）
+    /report      任意区间的聚合分析报表（自带区间选择器；⑨行业大盘页签）
     /ai          独立 AI 分析台：每日 AI 报告 + 可追问对话框（含思考过程流式展示）
     /paycomm     CPS 花费：按 SKU 看付款佣金金额，可导出 Excel
     /paycomm/spend  京准通花费：按 SKU 看广告花费（智能投放 + 全站智能推广），可导出 Excel
     /price      SKU 前台价：逐日看每个 SKU 的成交均价怎么变（读本地按天入库的商智明细）
-    /subsidy    超级补贴：京麦「消息 → 店铺 → 超级补贴」按 SKU 汇总补贴活动状态
     /cashflow    广告费流水：账户余额、充值/消费柱状图、每日消耗（财务记录口径）
     /login       扫码登录
 
@@ -64,7 +63,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
 
 from . import (activity, aijobs, ai_page, analyze2, analyze_ai, cashflow, compete, config,
                dailystore as ds, industry, itemprobe, maobao, paycomm, pricewatch,
-               profit, report2, scrape_day, settings, subsidy)
+               profit, report2, scrape_day, settings)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -82,7 +81,7 @@ _ATTR_RE = re.compile(r'\b(href|src|action)=(["\'])/(?!/)')
 # 只给已知的首段路径补前缀，避免误伤 JS 里的 split('/') 之类的普通字符串
 _URL_STR_RE = re.compile(
     r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico'
-    r'|cashflow|paycomm|profit|price|subsidy|cache)\b)')
+    r'|cashflow|paycomm|profit|price|cache)\b)')
 
 
 @app.middleware("http")
@@ -439,7 +438,8 @@ def dashboard(request: Request):
 </div>
 
 <div class="card" style="margin-top:18px">
-  <h2>数据覆盖 <span class="tagline">按天入库</span></h2>
+  <h2>数据覆盖 <span class="tagline">按天入库</span>
+    <a class="btn ghost mini" style="margin-left:auto" href="/cache">缓存管理 →</a></h2>
   <p class="hint">按天入库；<b>只要某天缺数据，区间分析就会按 0 计入</b>。缺哪几天可以用下方「立即抓取」补。</p>
   <div class="note">补数策略：<b>{gap_html}</b>。定时任务会把「停机期间的空洞」和「最近 {settings.REFRESH_DAYS} 天回刷」合并成一次抓取。</div>
   <div class="grid g2">{cal}</div>
@@ -3136,13 +3136,14 @@ tr.selrow td{background:#fbf1eb}
 .inpq:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(196,90,59,.10)}
 @media(max-width:1100px){.grid.g5{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:760px){.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))}}
-/* 报名日历（GitHub 贡献图风格）：行=星期，列=上周/本周/下周 */
-.hmwrap{display:flex;gap:26px;align-items:flex-start;flex-wrap:wrap}
-.hm{display:grid;grid-template-columns:34px repeat(3,34px);gap:5px;justify-content:start}
-.hmwd{display:flex;align-items:center;justify-content:flex-end;padding-right:6px;
-  font-size:11px;color:var(--muted)}
-.hmwk{display:flex;flex-direction:column;align-items:center;gap:1px;padding:0 0 2px;
-  font-size:11px;font-weight:600;color:var(--strong);line-height:1.25}
+/* 报名日历（日历直觉）：行=周，列=周一~周日 */
+.hmwrap{display:flex;flex-direction:column;gap:18px;align-items:stretch}
+.hm{display:grid;grid-template-columns:52px repeat(7,34px);gap:5px;justify-content:start;
+  align-items:center}
+.hmhd{display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted)}
+.hmwk{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;
+  padding:0 2px;font-size:11px;font-weight:600;color:var(--strong);line-height:1.25;
+  white-space:nowrap}
 .hmwk span{font-weight:400;color:var(--muted2);font-size:9px}
 .hmcell{display:flex;justify-content:center;align-items:center;width:34px;height:34px;
   padding:0 4px;border-radius:7px;border:1px solid var(--hair);text-decoration:none;
@@ -3159,11 +3160,12 @@ tr.selrow td{background:#fbf1eb}
 .hmcell.sel{outline:2px solid var(--primary);outline-offset:2px}
 .hmcell.future{border-style:dashed}
 .hmcell:hover{transform:translateY(-1px);box-shadow:var(--shadow-soft)}
-/* 右侧：近 21 天报名分布 */
-.hmside{flex:1;min-width:260px}
+/* 近 21 天报名分布：日历下方单独一行 */
+.hmside{width:100%}
 .hmside-h{font-size:12px;font-weight:600;color:var(--strong);margin-bottom:12px}
-.hmchart{display:flex;align-items:flex-end;gap:4px}
-.hmbar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;min-width:0}
+.hmchart{display:flex;align-items:flex-end;gap:4px;justify-content:space-between}
+.hmbar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;
+  min-width:0;max-width:34px}
 .hmbar i{display:block;width:100%;border-radius:3px 3px 0 0;background:var(--soft);
   border:1px solid var(--hair);border-bottom:none}
 .hmbar i.lv1{background:#dcece1;border-color:#c7e0cf}
@@ -3458,15 +3460,15 @@ def activity_page(request: Request):
     max_c = max([hm_counts.get((ws + dt.timedelta(days=i)).isoformat(), 0)
                  for ws in weeks for i in range(7)] or [0]) or 1
     wd_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    hm_head = '<div class="hmwd"></div>' + "".join(
-        f'<div class="hmwk" title="{ws.isoformat()} ~ '
-        f'{(ws + dt.timedelta(days=6)).isoformat()}">{lab}'
-        f'<span>{ws.month:02d}/{ws.day:02d}</span></div>'
-        for lab, ws in zip(wk_labels, weeks))
+    # 横向日历：表头周一到周日，下面三行分别是上周 / 本周 / 下周
+    hm_head = '<div class="hmhd"></div>' + "".join(
+        f'<div class="hmhd">{wd}</div>' for wd in wd_names)
     hm_cells = ""
-    for i, wd in enumerate(wd_names):
-        hm_cells += f'<div class="hmwd">{wd}</div>'
-        for ws in weeks:
+    for lab, ws in zip(wk_labels, weeks):
+        hm_cells += (f'<div class="hmwk" title="{ws.isoformat()} ~ '
+                     f'{(ws + dt.timedelta(days=6)).isoformat()}">{lab}'
+                     f'<span>{ws.month:02d}/{ws.day:02d}</span></div>')
+        for i in range(7):
             d = ws + dt.timedelta(days=i)
             ds_iso = d.isoformat()
             c = hm_counts.get(ds_iso, 0)
@@ -4103,10 +4105,6 @@ tr.pwrow.on td{background:var(--surface-card)}
 .pwcover{display:flex;gap:8px 18px;flex-wrap:wrap;align-items:center;font-size:12px;
   color:var(--muted);margin:2px 0 0}
 .pwcover b{color:var(--ink)}
-.pwsubonly{display:inline-flex;align-items:center;gap:6px;font-size:12px;
-  color:var(--muted);cursor:pointer;user-select:none}
-.pwsubonly input{accent-color:var(--primary)}
-#pwSubTable td.l.pwsbnm{max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pwempty{color:var(--muted);font-size:13px;padding:26px 0;text-align:center}
 /* 商品页探寻：只保留秒杀图标 */
 .pwbadges{display:inline-flex;gap:3px;flex-wrap:wrap;vertical-align:middle}
@@ -4125,19 +4123,10 @@ var DAYS = [], ROWS = [], TOT = {}, SEL = null, LAST = null, CH = null;
 var RT = null, SNAP = null, PROBE_BUSY = false;
 var PENDING = [], PENDING_FORCE = false;
 var SORT = {k:'amt', d:-1};
-var SUBONLY = false;
-
-var SUB_LBL = {win:'在线', substitute:'替补', offline:'已下线', expired:'已失效',
-               deleted:'已删除', quit:'已退出', lose:'竞价失败', onfail:'上场失败'};
-var SUB_CLS = {win:'b-ok', substitute:'b-warn', offline:'b-bad', expired:'b-bad',
-               deleted:'b-bad', quit:'b-idle', lose:'b-bad', onfail:'b-warn'};
 
 var COLS = [
   {k:'__item',  t:'商品',      l:1},
   {k:'priceLatest', t:'最新前台价'},
-  {k:'subsidyPrice', t:'超补价',
-   hint:'京东超级补贴「补贴后价格」（报名价）。页面按消息时间还原每天是否在线；'
-      + '前台价低于超补价说明还有券/满减叠加，高于超补价说明当天不是所有成交都走了超补'},
   {k:'changeDodPct', t:'较上日',
    hint:'真的是紧邻的上一天：今天对比昨天同一时刻；中间有 0 成交的天就不给涨跌幅'},
   {k:'changePct', t:'较区间初'},
@@ -4158,23 +4147,6 @@ function fx(v,dec){ var n=num(v); if(n===null) return '—';
   return n.toLocaleString('zh-CN',{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
 function money(v){ var n=num(v); return n===null?'—':('¥'+fx(n,2)); }
 function cnt(v){ var n=num(v); return n===null?'—':n.toLocaleString('zh-CN'); }
-/* 超补价：报名价 + 当前状态；再和最新前台价比一次，价差就是券/满减的叠加幅度 */
-function subBadge(k){
-  if(!k) return '<span class="badge b-idle" style="padding:1px 7px;font-size:10.5px">无记录</span>';
-  return '<span class="badge '+(SUB_CLS[k]||'b-idle')+'" style="padding:1px 7px;font-size:10.5px">'
-       + (SUB_LBL[k]||k) + '</span>';
-}
-function subCell(r){
-  var sp = num(r.subsidyPrice);
-  if(sp===null) return '<span class="flat">—</span><div class="pwsub">未报名 / 无消息</div>';
-  var lp = num(r.priceLatest), d = (lp===null?null:lp-sp);
-  var pct = (d===null||!sp)?null:d/sp*100;
-  return '<span class="pwcur">'+money(sp)+'</span>'
-    + '<div class="pwsub">'+subBadge(r.subsidyStatus)
-    + (r.subsidyOnlineDays?(' 在线'+r.subsidyOnlineDays+'天'):'')+'</div>'
-    + (d===null?'':'<div class="pwsub">前台价'+(d<0?'低':'高')+' '
-        + fx(Math.abs(d),2)+'元 / '+fx(Math.abs(pct),1)+'%</div>');
-}
 /* SKU 编号 → 京东商品页；新标签打开，且不触发行点击（行点击是看曲线） */
 function skuLink(sid){
   var s = String(sid == null ? '' : sid);
@@ -4301,7 +4273,6 @@ function rowHtml(r){
       + '<div class="pwsub">'+esc(String(r.latestDay||'').slice(5))
       + (r.realtime ? ' <span class="pwrt">实时</span>' : '')
       + ' · '+cnt(r.priceDays)+'天有价</div></td>'
-    + '<td>'+subCell(r)+'</td>'
     + '<td>'+pctCell(r.changeDodPct, dodExtra)
       + '<div class="pwsub">'+esc(dodSub)+'</div></td>'
     + '<td>'+pctCell(r.changePct, chgExtra)+'</td>'
@@ -4325,7 +4296,6 @@ function sortVal(r, k){
 function render(){
   var kw = ($('pwFilter') ? $('pwFilter').value : '').trim().toLowerCase();
   var list = ROWS.filter(function(r){
-    if(SUBONLY && !(r.subsidyStatus==='win' && num(r.subsidyPrice)!==null)) return false;
     if(!kw) return true;
     return String(r.skuId||'').indexOf(kw) >= 0
         || String(r.itemName||'').toLowerCase().indexOf(kw) >= 0;
@@ -4344,41 +4314,6 @@ function render(){
     || '<tr><td colspan="'+COLS.length+'" class="l pwempty">没有匹配的商品</td></tr>';
   $('pwCount').textContent = '共 ' + ROWS.length + ' 个有成交的 SKU'
     + (list.length !== ROWS.length ? ('，筛选后 ' + list.length + ' 行') : '');
-}
-
-/* 超补报名 SKU 清单：即使区间内没有成交（没进价格表）也列出来 */
-function renderSub(sb){
-  var card = $('pwSubCard'); if(!card) return;
-  card.style.display = '';
-  var acc = encodeURIComponent($('pwAcc') ? $('pwAcc').value : '');
-  if(!sb || !sb.available){
-    $('pwSubTag').textContent = '未抓取';
-    $('pwSubMsg').innerHTML = '还没有该店铺的超级补贴消息：'
-      + '<a href="/subsidy?account='+acc+'" target="_blank">去抓取一次 →</a>';
-    $('pwSubBody').innerHTML = '<tr><td colspan="9" class="l pwempty">暂无数据</td></tr>';
-    return;
-  }
-  var list = sb.list || [];
-  $('pwSubTag').textContent = '报名 '+cnt(sb.skuCount)+' 个 · 在线 '+cnt(sb.onlineCount)
-    + ' · 价格表内 '+cnt(sb.inPriceCount);
-  $('pwSubMsg').innerHTML = '消息抓取于 <b>'+esc(String(sb.fetchedAt||'—').slice(0,16))+'</b>。'
-    + '超补 SKU 在商智区间没有成交时不会出现在上面的价格表，但仍列在这里，'
-    + '用来区分「没卖」与「没抓」；要更新消息去「超级补贴」页。';
-  $('pwSubBody').innerHTML = list.map(function(x){
-    return '<tr>'
-      + '<td>'+subBadge(x.status)+'</td>'
-      + '<td class="mono">'+skuLink(x.skuId)+'</td>'
-      + '<td class="l pwsbnm">'+esc(x.itemName||'—')+'</td>'
-      + '<td>'+money(x.price)+'</td>'
-      + '<td class="mono">'+esc(x.enrollId||'—')+'</td>'
-      + '<td>'+(x.inPrice
-          ? '<span class="badge b-ok" style="padding:1px 7px;font-size:10.5px">在表</span>'
-          : '<span class="pwsub">区间无成交</span>')+'</td>'
-      + '<td>'+cnt(x.qty)+'</td>'
-      + '<td>'+money(x.priceAvg)+'</td>'
-      + '<td class="mono">'+esc((x.lastTime||'').slice(5))+'</td>'
-      + '</tr>';
-  }).join('') || '<tr><td colspan="9" class="l pwempty">没有报名 SKU</td></tr>';
 }
 
 function kpiBox(label, val, sub){
@@ -4431,17 +4366,6 @@ function cover(){
     bits.push('今天 <b>'+esc(String(LAST.realtimeDay).slice(5))+'</b> 用实时快照（未结算）');
   }
   var miss = (LAST.missingDays || []), empty = (LAST.emptyDays || []);
-  var sb = LAST.subsidy || {};
-  var sbAcc = encodeURIComponent($('pwAcc') ? $('pwAcc').value : '');
-  if(sb.available){
-    bits.push('超补在线 <b>'+cnt(sb.onlineCount)+'</b> 个 SKU'
-      + (sb.belowCount ? ('（其中 <b>'+cnt(sb.belowCount)+'</b> 个前台价低于超补价）') : '')
-      + '，消息抓取于 ' + esc(String(sb.fetchedAt||'—').slice(0,16))
-      + ' <a href="/subsidy?account='+sbAcc+'" target="_blank">更新</a>');
-  } else {
-    bits.push('没有超级补贴消息缓存，超补价列会全是「—」：'
-      + '<a href="/subsidy?account='+sbAcc+'" target="_blank">先抓一次</a>');
-  }
   if(miss.length){
     bits.push('缺 <b>'+miss.length+'</b> 天未抓：'+esc(miss.slice(0,4).join('、'))
       + (miss.length>4?' …':''));
@@ -4470,11 +4394,6 @@ function detail(r){
     + '　区间价带 '+money(r.priceMin)+' ~ '+money(r.priceMax)
     + '　成交 '+cnt(r.qty)+' 件 / '+money(r.amt)
     + '　访客 '+cnt(r.uv)
-    + (r.subsidyPrice!=null
-        ? ('　超补 '+subBadge(r.subsidyStatus)+' <b>'+money(r.subsidyPrice)+'</b>'
-           + (r.subsidyOnlineDays?('（区间在线 '+r.subsidyOnlineDays+' 天）'):'')
-           + (r.subsidyEnrollId?('　报名ID '+esc(r.subsidyEnrollId)):''))
-        : '　超补：无报名消息')
     + (pp!==null
         ? ('　'+badges(r.probeBadges, r.probeSeckill)+'　<span class="pwsub">'+probeReason(r)+'</span>')
         : (r.probeError ? ('　商品页：<span class="down">'+esc(r.probeError)+'</span>') : ''));
@@ -4492,15 +4411,6 @@ function drawChart(r){
   var xs = DAYS.map(function(d){
     return String(d).slice(5) + (LAST && d === LAST.realtimeDay ? '*' : '');
   });
-  // 超级补贴报名价：只在「当天在线」的日子画点，替补/已下线断线（不插值）
-  var subData = r.subsidyByDay || [], hasSub = false, si;
-  for(si=0; si<subData.length; si++){
-    if(num(subData[si])!==null){ hasSub = true; break; }
-  }
-  var subSeries = hasSub ? [{name:'超补价', type:'line', step:'end', data:subData,
-      connectNulls:false, symbol:'circle', symbolSize:4,
-      lineStyle:{width:1.6, type:'dashed', color:'#2f9e8f'},
-      itemStyle:{color:'#2f9e8f'}}] : [];
   CH.setOption({
     animationDuration: 260,
     grid:{left:58, right:58, top:34, bottom:36},
@@ -4510,7 +4420,7 @@ function drawChart(r){
       ps.forEach(function(p){
         var v = (p.value===null || p.value===undefined) ? null : p.value;
         out += '<br>' + p.marker + p.seriesName + '：'
-          + (v===null ? '—' : ((p.seriesName==='前台价'||p.seriesName==='超补价')
+          + (v===null ? '—' : ((p.seriesName==='前台价')
               ? (v+' 元/件') : (v+' 件')));
       });
       return out;
@@ -4538,7 +4448,7 @@ function drawChart(r){
          data:[{yAxis:r.priceAvg, lineStyle:{type:'dashed', color:'#8e8b82'},
            label:{formatter:'区间均价 '+r.priceAvg, position:'insideEndTop',
                   fontSize:10, color:'#6c6a64'}}]}}
-    ].concat(subSeries).concat([
+    ].concat([
       {name:'成交件数', type:'bar', yAxisIndex:1, data:r.sparkQty,
        barMaxWidth:16, itemStyle:{color:'rgba(108,106,100,.16)'}}
     ])
@@ -4581,7 +4491,7 @@ function load(acc, s, e){
       } else {
         msg('已读取本地商智明细（未请求京东）。点任意商品看逐日价格曲线。');
       }
-      render(); kpis(); cover(); renderSub(j.subsidy);
+      render(); kpis(); cover();
       loadRt(acc);
       loadSnap(acc);
       history.replaceState(null, '', location.pathname + '?account=' + encodeURIComponent(acc)
@@ -4908,7 +4818,6 @@ window.PW = {
     window.PW.pick(tr);
   },
   render: render,
-  subOnly: function(on){ SUBONLY = !!on; render(); },
   /* 立刻抓一次今日实时（只抓商智这一个报表） */
   rtFetch: function(){
     var m = $('pwRtMsg');
@@ -5349,7 +5258,6 @@ def price_page(request: Request):
   <div class="metaline">
     <span>前台件单价 = 商智成交金额 ÷ 成交件数</span><span class="dot"></span>
     <span>消费者实付（含优惠券 / 满减）</span><span class="dot"></span>
-    <span>叠加超级补贴报名价对账</span><span class="dot"></span>
     <span>价格表只读本地；右侧竞品分析按需抓取</span>
   </div>
   <div class="actions">
@@ -5408,8 +5316,6 @@ def price_page(request: Request):
   <div class="toolbar">
     <input id="pwFilter" placeholder="筛选 SKU / 商品名" oninput="PW.render()"
            style="min-width:240px;padding:7px 10px;border-radius:8px;border:1px solid var(--line)">
-    <label class="pwsubonly"><input type="checkbox" onchange="PW.subOnly(this.checked)">
-      只看超补在线</label>
     <span class="hint" id="pwCount" style="margin:0"></span>
   </div>
   <div class="tblwrap long">
@@ -5439,22 +5345,6 @@ def price_page(request: Request):
 </aside>
 </div>
 
-<div class="card" id="pwSubCard" style="display:none;margin-top:18px">
-  <h2>超级补贴报名 SKU
-    <span class="tagline" id="pwSubTag">京麦消息 · 店铺 → 超级补贴</span>
-    <a class="btn ghost mini" style="margin-left:auto" href="/subsidy" target="_blank">更新消息 →</a></h2>
-  <div class="hint" id="pwSubMsg" style="margin-bottom:10px"></div>
-  <div class="tblwrap short">
-    <table id="pwSubTable"><thead><tr>
-      <th class="noSort l">状态</th><th class="noSort">SKU</th>
-      <th class="noSort l">商品名称</th><th class="noSort">超补价</th>
-      <th class="noSort">报名ID</th><th class="noSort">价格表</th>
-      <th class="noSort">区间成交</th><th class="noSort">前台均价</th>
-      <th class="noSort">最近变动</th>
-    </tr></thead><tbody id="pwSubBody"></tbody></table>
-  </div>
-</div>
-
 <div class="card" id="pwDetail" style="display:none">
   <h2><span id="pwDTitle">—</span>
     <span class="tagline">逐日前台件单价（成交金额 ÷ 成交件数）</span></h2>
@@ -5477,16 +5367,6 @@ def price_page(request: Request):
   <p><b>怎么用来调广告</b>：降价后同样的点击更容易成交，转化率上升是预期内的；
      若降价后转化没起来，多半是流量/竞价问题而不是价格。涨价期 CTR 与转化下滑同样属正常，
      可对照本页的访客数与成交件数判断是否要收预算。</p>
-  <p><b>超补价对账（本页新增）</b>：超补价来自京麦「消息 → 店铺 → 超级补贴」的
-     <b>补贴后价格（报名价）</b>，按消息时间还原每个 SKU 每天是否还在活动中，
-     替补 / 已下线 / 已失效 / 已删除 / 已退出之后不再画线。它和前台价是两种口径，
-     不要混为一谈：前台价是商智成交实付均价（已含券 / 满减 / 新人价），超补价只是
-     报名时的活动价。对照关系：
-     <b>前台价 &lt; 超补价</b>＝当天还叠加了其它优惠，实际到手更低；
-     <b>前台价 &gt; 超补价</b>＝当天并非全部成交都走超补（部分原价成交，或活动前成交）；
-     <b>两者接近</b>＝价格基本由超补价决定，可以把它当真实到手价来算投产比。
-     超补消息在「超级补贴」页抓取/更新，本页顶部覆盖行会显示消息抓取时间；
-     「只看超补在线」可以快速筛出当前在活动中的 SKU。</p>
   <p><b>夜间自动核算</b>：每天凌晨抓完昨天的商智数据后，服务端会把那一天的逐 SKU 前台价
      （以及相对各自上一个有价日的变动）算好存一份，就是顶部「夜间自动核算」卡片；
      因为商智 T+1 只出一半、T+2~T+3 才定稿，每次会把最近 3 个有数据的日子一起重算覆盖。
@@ -5544,14 +5424,6 @@ def api_price(account: str | None = None, start: str = "", end: str = ""):
         return {"ok": False, "error": "区间最长 400 天，请缩小范围"}
     # 价格会随着商智回补/补抓变化，别让浏览器缓存住上一次的结果
     data = pricewatch.build(acc, span[0], span[-1])
-    # 叠加超级补贴：商智只能看到「成交实付」，看不出这笔价是不是超补活动价；
-    # 把每个 SKU 的报名价与逐日在线状态补进同一份行数据，页面才能对账。
-    try:
-        data["subsidy"] = subsidy.attach_price(
-            data.get("rows") or [], data.get("days") or [], acc)
-    except Exception as exc:  # noqa: BLE001
-        data["subsidy"] = {"available": False,
-                           "error": f"{type(exc).__name__}: {exc}"[:200]}
     # 商品页探寻结果：只补齐「最新价就是今天」的行，避免把今天的商品页价贴到历史日
     try:
         data["probe"] = itemprobe.attach(data.get("rows") or [],
@@ -5698,390 +5570,6 @@ def api_price_realtime_fetch(account: str | None = None):
                                          name="sz-realtime", trigger="manual")
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
-
-
-# ================================================================ 超级补贴
-# 数据在 jd_roi/subsidy.py：京麦「消息 → 店铺 → 超级补贴」按 SKU 汇总补贴活动状态。
-# 消息接口带 h5st 签名，只能先让页面真实发一次请求再截获头重放；
-# 这里只做页面与接口，抓取走后台线程，页面读本地缓存。
-SUBSIDY_CSS = """
-.sbstat{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px}
-.sbstat .chip b{font-variant-numeric:tabular-nums;margin-left:5px;color:var(--muted)}
-.sbstat .chip.on b{color:var(--ink)}
-.sbtbl td.l{text-align:left}
-.sbtbl tr.row{cursor:pointer}
-.sbtbl td.nm{max-width:430px;text-align:left}
-.sbtbl td.nm span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sbtbl tr.det td{background:var(--soft);padding:4px 16px 16px}
-.sbhist{border-left:2px solid var(--hair);margin:8px 0 0 10px;padding-left:16px;
-  display:flex;flex-direction:column;gap:12px}
-.sbhist .ev{position:relative}
-.sbhist .ev::before{content:"";position:absolute;left:-21px;top:5px;width:8px;height:8px;
-  border-radius:50%;background:var(--muted2);border:2px solid var(--soft)}
-.sbhist .ev.un::before{background:var(--primary);border-color:var(--soft)}
-.sbhist .evt{font-size:11.5px;color:var(--muted);font-family:var(--mono);
-  display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.sbhist .evc{font-size:12.5px;line-height:1.7;color:var(--body);margin-top:3px}
-.sbmsg .row{display:flex;gap:12px;padding:11px 0;border-bottom:1px solid var(--hair)}
-.sbmsg .row:last-child{border-bottom:0}
-.sbmsg .t{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums;
-  white-space:nowrap;width:134px;flex:none;padding-top:2px}
-.sbmsg .c{font-size:12.5px;line-height:1.7;color:var(--muted)}
-.sbmsg .row.unread .c{color:var(--ink)}
-.sbmsg .dot{width:6px;height:6px;border-radius:50%;background:var(--primary);
-  flex:none;margin-top:8px}
-.sbmsg .mh{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
-.sbempty{padding:34px 8px;text-align:center;color:var(--muted);font-size:13px;line-height:1.9}
-"""
-
-SUBSIDY_JS = """
-(function(){
-  var LBL = {win:'竞价成功', substitute:'替补', offline:'已下线', expired:'已失效',
-             deleted:'已删除', quit:'已退出', lose:'竞价失败', onfail:'上场失败',
-             invite:'报名邀请', other:'其他'};
-  var CLS = {win:'b-ok', substitute:'b-warn', offline:'b-bad', expired:'b-bad',
-             deleted:'b-bad', quit:'b-idle', lose:'b-bad', onfail:'b-warn',
-             invite:'b-info', other:'b-idle'};
-  var S = {account:'', data:null, status:'all', q:'', open:''};
-  function $(id){ return document.getElementById(id); }
-  function esc(s){
-    return String(s==null?'':s).replace(/[&<>"']/g, function(c){
-      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-    });
-  }
-  function badge(k){
-    if(!k) return '<span class="badge b-idle">—</span>';
-    return '<span class="badge '+(CLS[k]||'b-idle')+'">'+esc(LBL[k]||k)+'</span>';
-  }
-  function price(v){ return (v===null||v===undefined||v==='')?'—':'¥'+Number(v).toFixed(2); }
-  function num(v){ return (v===null||v===undefined||v==='')?'—':Number(v).toLocaleString('zh-CN'); }
-  function msg(t){ var el=$('sbMsg'); if(el) el.textContent=t||''; }
-
-  function pass(r){
-    if(S.status!=='all' && r.status!==S.status) return false;
-    var q=S.q.trim().toLowerCase();
-    if(!q) return true;
-    return (r.skuId||'').indexOf(q)>=0 ||
-      (r.itemName||'').toLowerCase().indexOf(q)>=0 ||
-      (r.enrollId||'').indexOf(q)>=0;
-  }
-
-  function kpis(d){
-    var c=d.counts||{};
-    var bad=(c.offline||0)+(c.expired||0)+(c.deleted||0)+(c.quit||0)+
-            (c.lose||0)+(c.onfail||0);
-    var html=''+
-      '<div class="kpi"><div class="lbl">SKU 总数</div><div class="val">'+(d.skuCount||0)+
-        '</div><div class="sub">覆盖 '+(d.messageCount||0)+' 条超级补贴消息</div></div>'+
-      '<div class="kpi"><div class="lbl">竞价成功</div><div class="val">'+(c.win||0)+
-        '</div><div class="sub">替补 '+(c.substitute||0)+' 个</div></div>'+
-      '<div class="kpi"><div class="lbl">已下线 / 失效</div><div class="val">'+bad+
-        '</div><div class="sub">下线 '+(c.offline||0)+' · 失效 '+(c.expired||0)+
-        ' · 删除 '+(c.deleted||0)+' · 退出 '+(c.quit||0)+'</div></div>'+
-      '<div class="kpi"><div class="lbl">未读消息</div><div class="val">'+(d.unread||0)+
-        '</div><div class="sub">抓取于 '+esc(d.fetchedAt||'—')+'</div></div>';
-    $('sbKpis').innerHTML=html;
-    $('sbKpis').style.display='';
-  }
-
-  function chips(d){
-    var c=d.counts||{};
-    var defs=[['all','全部'],['win','竞价成功'],['substitute','替补'],['offline','已下线'],
-              ['expired','已失效'],['deleted','已删除'],['quit','已退出'],
-              ['lose','竞价失败'],['onfail','上场失败']];
-    var html=defs.map(function(x){
-      var n=x[0]==='all'?(d.skuCount||0):(c[x[0]]||0);
-      if(x[0]!=='all' && !n) return '';
-      return '<button type="button" class="chip'+(S.status===x[0]?' on':'')+
-        '" onclick="SB.flt(\\u0027'+x[0]+'\\u0027)">'+x[1]+'<b>'+n+'</b></button>';
-    }).join('');
-    $('sbChips').innerHTML=html;
-  }
-
-  function detail(r){
-    var hist=(r.history||[]).slice().reverse();
-    return hist.map(function(h){
-      return '<div class="ev'+(h.unread?' un':'')+'">'+
-        '<div class="evt"><span>'+esc(h.time||'')+'</span>'+badge(h.kind)+
-        (h.detailUrl?'<a href="'+esc(h.detailUrl)+'" target="_blank">查看详情 →</a>':'')+
-        '</div><div class="evc">'+esc(h.content||'')+'</div></div>';
-    }).join('');
-  }
-
-  function table(d){
-    var list=(d.skus||[]).filter(pass);
-    $('sbCount').textContent='共 '+list.length+' 个 SKU';
-    if(!list.length){
-      $('sbBody').innerHTML='<tr><td colspan="8"><div class="sbempty">'+
-        (d.skuCount?'没有符合筛选条件的 SKU':'这些消息里没有解析到带 SKU 的补贴活动')+
-        '</div></td></tr>';
-      return;
-    }
-    var html=list.map(function(r,i){
-      var open=S.open===r.skuId;
-      var main='<tr class="row" onclick="SB.toggle(\\u0027'+esc(r.skuId)+'\\u0027)">'+
-        '<td>' + badge(r.status) + '</td>'+
-        '<td class="mono">' + esc(r.skuId) + '</td>'+
-        '<td class="nm"><span title="'+esc(r.itemName||'')+'">'+esc(r.itemName||'—')+'</span></td>'+
-        '<td class="mono">' + price(r.price) + '</td>'+
-        '<td class="mono">' + num(r.promoQty) + '</td>'+
-        '<td class="mono">' + esc(r.enrollId||'—') + '</td>'+
-        '<td class="mono">' + (r.events||0) + '</td>'+
-        '<td class="mono">' + esc((r.lastTime||'').slice(5)) + '</td></tr>';
-      var det=open?('<tr class="det"><td colspan="8"><div class="sbhist">'+
-        detail(r)+'</div></td></tr>'):'';
-      return main+det;
-    }).join('');
-    $('sbBody').innerHTML=html;
-  }
-
-  function messages(d){
-    var q=S.q.trim().toLowerCase();
-    var list=(d.messages||[]).filter(function(m){
-      if(!q) return true;
-      return (m.skuId||'').indexOf(q)>=0 ||
-        (m.itemName||'').toLowerCase().indexOf(q)>=0 ||
-        (m.content||'').toLowerCase().indexOf(q)>=0;
-    });
-    if(!list.length){
-      $('sbMsgs').innerHTML='<div class="sbempty">没有消息</div>';
-      return;
-    }
-    $('sbMsgs').innerHTML=list.map(function(m){
-      return '<div class="row'+(m.unread?' unread':'')+'">'+
-        (m.unread?'<span class="dot"></span>':'<span class="dot" style="background:transparent"></span>')+
-        '<div class="t">'+esc(m.time||'')+'</div><div class="c">'+
-        '<div class="mh">'+badge(m.kind)+
-        (m.skuId?'<span class="mono" style="font-size:11.5px;color:var(--muted)">SKU '+esc(m.skuId)+'</span>':'')+
-        (m.enrollId?'<span style="font-size:11.5px;color:var(--muted)">报名ID '+esc(m.enrollId)+'</span>':'')+
-        (m.detailUrl?'<a href="'+esc(m.detailUrl)+'" target="_blank" style="font-size:11.5px">查看详情 →</a>':'')+
-        '</div>'+esc(m.content||'')+'</div></div>';
-    }).join('');
-  }
-
-  function render(){
-    var d=S.data;
-    if(!d) return;
-    kpis(d); chips(d); table(d); messages(d);
-    $('sbAt').textContent=d.fetchedAt?('抓取于 '+d.fetchedAt):'';
-  }
-
-  function empty(text){
-    $('sbKpis').style.display='none';
-    $('sbChips').innerHTML='';
-    $('sbCount').textContent='';
-    $('sbBody').innerHTML='<tr><td colspan="8"><div class="sbempty">'+esc(text)+
-      '<br><button class="btn mini" style="margin-top:12px" onclick="SB.run()">抓取一次</button>'+
-      '</div></td></tr>';
-    $('sbMsgs').innerHTML='<div class="sbempty">'+esc(text)+'</div>';
-    $('sbAt').textContent='';
-  }
-
-  async function load(){
-    msg('读取本地缓存…');
-    try{
-      var r=await fetch('/api/subsidy?account='+encodeURIComponent(S.account), {cache:'no-store'});
-      var j=await r.json();
-      if(!j.ok){ S.data=null; msg(j.error||'暂无数据'); empty(j.error||'暂无数据'); return; }
-      S.data=j; msg(''); render();
-    }catch(e){ msg('读取失败：'+e); }
-  }
-
-  async function poll(){
-    try{
-      var r=await fetch('/api/subsidy/status?account='+encodeURIComponent(S.account), {cache:'no-store'});
-      var j=await r.json();
-      if(j.running){
-        msg(j.progress||'抓取中…');
-        setTimeout(poll, 1600);
-        return false;
-      }
-      $('sbRun').disabled=false;
-      if(j.error){ msg('抓取失败：'+j.error); return false; }
-      await load(); return true;
-    }catch(e){ $('sbRun').disabled=false; msg('抓取失败：'+e); return false; }
-  }
-
-  async function run(){
-    var btn=$('sbRun'); if(btn){ btn.disabled=true; }
-    msg('正在打开京麦消息中心…');
-    try{
-      var r=await fetch('/api/subsidy/run?account='+encodeURIComponent(S.account), {method:'POST'});
-      var j=await r.json();
-      if(!j.ok){ if(btn) btn.disabled=false; msg(j.error||'启动失败'); return; }
-      setTimeout(poll, 1200);
-    }catch(e){ if(btn) btn.disabled=false; msg('启动失败：'+e); }
-  }
-
-  function toggle(sku){ S.open = (S.open===sku?'':sku); if(S.data) table(S.data); }
-  function flt(k){ S.status=k; if(S.data){ chips(S.data); table(S.data); } }
-  function search(v){ S.q=v||''; if(S.data){ table(S.data); messages(S.data); } }
-  function acc(v){ S.account=v; S.status='all'; S.open=''; load(); }
-
-  window.SB={load:load, run:run, toggle:toggle, flt:flt, search:search, acc:acc};
-  var INIT=window.SB_INIT||{};
-  S.account=INIT.account||'';
-  load();
-})();
-"""
-
-_SUBSIDY_JOBS: dict[str, dict] = {}
-_SUBSIDY_LOCK = threading.Lock()
-
-
-def _subsidy_account(account: str | None) -> str:
-    keys = [a["key"] for a in settings.ACCOUNTS]
-    acc = account or settings.MAIN_ACCOUNT
-    return acc if acc in keys else settings.MAIN_ACCOUNT
-
-
-def _subsidy_state(acc: str) -> dict:
-    with _SUBSIDY_LOCK:
-        return dict(_SUBSIDY_JOBS.get(acc) or {})
-
-
-@app.get("/subsidy", response_class=HTMLResponse)
-def subsidy_page(request: Request):
-    """超级补贴：京麦消息 → 店铺 → 超级补贴，按 SKU 汇总补贴活动状态。"""
-    acc = _subsidy_account(request.query_params.get("account"))
-    opts = "".join(
-        f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
-    init = {"account": acc}
-    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>超级补贴 · 京东广告运营</title>
-<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{SUBSIDY_CSS}</style>
-</head><body>
-{report2.navtop("/subsidy")}
-<header class="top"><div class="wrap pagehead">
-  <div class="eyebrow">{report2.SPIKE_SVG}营销活动</div>
-  <h1>超级补贴</h1>
-  <div class="metaline">
-    <span>来源：京麦「消息 → 店铺 → 超级补贴」</span><span class="dot"></span>
-    <span>按 SKU 汇总最新补贴状态</span><span class="dot"></span>
-    <span>页面读本地缓存，点「重新抓取」才访问京东</span>
-  </div>
-  <div class="actions">
-    <a class="btn ghost mini" href="/activity">团长活动 →</a>
-    <a class="btn ghost mini" href="/price">SKU 前台价 →</a>
-  </div>
-</div></header>
-<div class="wrap">
-
-<div class="card">
-  <div class="toolbar">
-    <label class="fld">店铺 <select id="sbAcc" onchange="SB.acc(this.value)">{opts}</select></label>
-    <button class="btn" id="sbRun" onclick="SB.run()">重新抓取</button>
-    <span class="hint" id="sbMsg" style="margin:0">读取本地缓存…</span>
-    <span class="hint" id="sbAt" style="margin:0 0 0 auto"></span>
-  </div>
-</div>
-
-<div class="grid g4" id="sbKpis" style="display:none;margin-top:18px"></div>
-
-<div class="card" style="margin-top:18px">
-  <h2>SKU 补贴状态 <span class="tagline">点任意一行展开该 SKU 的完整消息时间线</span></h2>
-  <div class="sbstat" id="sbChips"></div>
-  <div class="toolbar">
-    <input id="sbQ" placeholder="搜索 SKU / 商品名 / 报名ID" oninput="SB.search(this.value)"
-           style="min-width:260px;padding:7px 10px;border-radius:8px;border:1px solid var(--hair)">
-    <span class="hint" id="sbCount" style="margin:0"></span>
-  </div>
-  <div class="tblwrap long">
-    <table class="sbtbl">
-      <thead><tr>
-        <th class="noSort l">状态</th><th class="noSort">SKU</th>
-        <th class="noSort l">商品名称</th><th class="noSort">补贴后价</th>
-        <th class="noSort">促销数量</th><th class="noSort">报名ID</th>
-        <th class="noSort">消息</th><th class="noSort">最近</th>
-      </tr></thead>
-      <tbody id="sbBody"></tbody>
-    </table>
-  </div>
-</div>
-
-<div class="card" style="margin-top:18px">
-  <h2>全部消息 <span class="tagline">未读优先展示 · 原样保留京东消息内容</span></h2>
-  <div class="sbmsg" id="sbMsgs"></div>
-</div>
-
-<div class="note" style="margin-top:18px">
-  <p><b>数据来源</b>：京麦工作台 <code>shop.jd.com/jdm/home</code> 右上角「消息」→ 顶部「店铺」页签
-     → 左侧分类「超级补贴」（消息分类 <code>marketing / 262</code>）。接口带 h5st 签名，
-     抓取时先让页面真实发一次请求、截获请求头再放大分页重放，因此一次能拿全历史消息（当前
-     {_e(str(len(settings.ACCOUNTS)))} 个店铺各抓各的）。</p>
-  <p><b>状态口径</b>：按消息时间从旧到新滚动，同一个 SKU 以<b>最后一条</b>业务消息为准。
-     「竞价成功」消息后紧跟的「已审核通过成为替补」与「在线转替补」都记为<b>替补</b>；
-     商品汰换下线、活动失效、促销删除、主动退出、竞价失败、上场失败分别单列。
-     一条竞价成功消息里同时出现 SKU、促销数量、补贴后价格、报名ID 时才会进上面的 SKU 表，
-     没有 SKU 的通知只保留在「全部消息」里。</p>
-  <p><b>补贴金额 / 补贴数量为 0</b>：近期消息里平台下发的补贴金额与补贴数量基本都是 0.00 / 0，
-     说明当前是商家自补的竞价活动（补贴后价格才是实际报名价），不要把它当成抓取缺失。</p>
-  <p><b>缓存</b>：每个店铺一份 <code>{_e(str(settings.REPORT_DIR))}/subsidy_&lt;账号&gt;.json</code>，
-     不自动过期；想更新点「重新抓取」，抓取与其它页面共用浏览器登录态锁，遇到夜间补数会排队等待。</p>
-</div>
-
-</div>
-<script>window.SB_INIT = {json.dumps(init, ensure_ascii=False)};</script>
-<script>{SUBSIDY_JS}</script>
-</body></html>""")
-
-
-@app.get("/api/subsidy")
-def api_subsidy(account: str | None = None):
-    """读某个店铺的超级补贴汇总缓存（纯本地）。"""
-    acc = _subsidy_account(account)
-    payload = subsidy.load_cache(acc)
-    if not payload:
-        return JSONResponse(
-            {"ok": False, "empty": True,
-             "error": "还没有抓取过该店铺的超级补贴消息，点「重新抓取」拉一次"},
-            headers={"Cache-Control": "no-store"})
-    return JSONResponse({"ok": True, **payload}, headers={"Cache-Control": "no-store"})
-
-
-@app.post("/api/subsidy/run")
-def api_subsidy_run(account: str | None = None):
-    """后台抓一次超级补贴消息（与其它抓取共用 Profile 锁）。"""
-    acc = _subsidy_account(account)
-    if _subsidy_state(acc).get("running"):
-        return {"ok": True, "running": True}
-    with _SUBSIDY_LOCK:
-        _SUBSIDY_JOBS[acc] = {"running": True, "progress": "排队中…", "error": None,
-                              "startedAt": settings.now_iso(), "finishedAt": None}
-
-    def _log(text: str) -> None:
-        with _SUBSIDY_LOCK:
-            job = _SUBSIDY_JOBS.get(acc)
-            if job is not None:
-                job["progress"] = str(text)[:140]
-
-    def _work() -> None:
-        try:
-            subsidy.run(account=acc, log=_log)
-            with _SUBSIDY_LOCK:
-                job = _SUBSIDY_JOBS.get(acc) or {}
-                job.update({"running": False, "progress": "完成", "error": None,
-                            "finishedAt": settings.now_iso()})
-        except Exception as exc:  # noqa: BLE001
-            with _SUBSIDY_LOCK:
-                job = _SUBSIDY_JOBS.get(acc) or {}
-                job.update({"running": False,
-                            "error": f"{type(exc).__name__}: {exc}"[:300],
-                            "finishedAt": settings.now_iso()})
-
-    threading.Thread(target=_work, daemon=True, name=f"subsidy-{acc}").start()
-    return {"ok": True, "running": True}
-
-
-@app.get("/api/subsidy/status")
-def api_subsidy_status(account: str | None = None):
-    st = _subsidy_state(_subsidy_account(account))
-    if not st:
-        return {"ok": True, "running": False}
-    return {"ok": True, **{k: st.get(k) for k in
-                           ("running", "progress", "error", "startedAt", "finishedAt")}}
 
 
 # ---------------------------------------------------------------- 竞品与关键词分析

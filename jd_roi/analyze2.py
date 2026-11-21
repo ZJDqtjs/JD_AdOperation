@@ -387,19 +387,14 @@ def account_totals(acct):
         else:
             m = _empty()
             m["source"] = "无数据"
-        # 全站营销（单品/新品推广）不在概览里：单独抓到的花费/成交必须并进账号总额，
-        # 否则总结页的「广告花费」会比京准通后台少这一大块（2026-11-20 起是主要花费）。
+        # 全站营销（单品/新品推广）**不并入**上面这套 ROI：它的「全站投产比/全站订单行」
+        # 与快车/智能投放的「点击后15天成交订单」不是同一口径，硬加会让 ROI 和订单数失真。
+        # 这里只单独挂一份，供总结页提示和「全站营销」独立页签使用。
         swa_rows = (w.get("swa") or {}).get("rows") or []
         if swa_rows:
-            sm = _sum_metrics(swa_rows)
-            base = m.get("source") or "无数据"
-            m = _metrics(m["imp"] + sm["imp"], m["clk"] + sm["clk"],
-                         m["cost"] + sm["cost"], m["ord"] + sm["ord"],
-                         m["amt"] + sm["amt"], m["cart"] + sm["cart"])
-            m["source"] = "全站营销" if base == "无数据" else f"{base}＋全站营销"
-            m["swa"] = sm
-            m["swaCost"] = sm["cost"]
-            m["swaAmt"] = sm["amt"]
+            m["swa"] = _sum_metrics(swa_rows)
+            m["swaCost"] = m["swa"]["cost"]
+            m["swaAmt"] = m["swa"]["amt"]
         m["extCost"] = round(_f(ext.get("cost")), 2)
         m["extAmt"] = round(_f(ext.get("totalOrderSum")), 2)
         m["extRoi"] = round(_f(ext.get("totalOrderROI")), 2)
@@ -422,7 +417,7 @@ def account_totals(acct):
             m["adShare"] = round(m["amt"] / m["sz"]["amt"] * 100, 1)
         else:
             m["adShare"] = None
-        m["plans"] = len(jzt.get("rows") or []) + len(swa_rows)
+        m["plans"] = len(jzt.get("rows") or [])
         out[wk] = m
     return out
 
@@ -441,13 +436,7 @@ def type_split(accts):
                 e["amt"] += _f(r.get("totalOrderSum"))
                 e["ord"] += _i(r.get("totalOrderCnt"))
                 e["n"] += 1
-            for r in (a["ds"]["wins"][wk].get("swa") or {}).get("rows", []):
-                t = TYPE_LABEL.get(_i(r.get("_swaType")), "全站营销")
-                e = by.setdefault(t, {"cost": 0.0, "amt": 0.0, "ord": 0, "n": 0})
-                e["cost"] += _f(r.get("cost"))
-                e["amt"] += _f(r.get("totalOrderSum"))
-                e["ord"] += _i(r.get("totalOrderCnt"))
-                e["n"] += 1
+
             for t, e in by.items():
                 e["cost"] = round(e["cost"], 2)
                 e["amt"] = round(e["amt"], 2)
@@ -551,15 +540,6 @@ def sku_rows(accts, model, costs=None):
     costs = costs or {}
     units = settings.costs_unit_map()
     spumap = spu_sku_maps(accts)
-    swamap = swa_sku_maps(accts)
-    # 全站营销接口只给 sxuId 级商品名，投放 SKU 的名字在 swa_skus.names 里；
-    # 商智没覆盖到的 SKU 用这份名字兜底，避免显示成「SPU 名 · SKU尾号」。
-    swaName: dict = {}
-    for _m in swamap.values():
-        for _info in _m.values():
-            for _sid, _nm in (_info.get("names") or {}).items():
-                if _nm:
-                    swaName.setdefault(_sid, _nm)
     kwCost = {wk: defaultdict(float) for wk in WKEYS}   # 已归因的关键词花费（按 SKU）
     aggAd = {wk: defaultdict(lambda: {"cost": 0.0, "amt": 0.0, "ord": 0, "imp": 0,
                                       "clk": 0, "cart": 0, "byAcct": {}, "plans": set()})
@@ -626,38 +606,6 @@ def sku_rows(accts, model, costs=None):
                     if r.get("campaignName"):
                         ac["plans"].add(r["campaignName"])
                         t["plans"].add(r["campaignName"])
-            # 全站营销（单品/新品推广）：概览和 jst 商品报表都不含这条线，按月/按天单独抓。
-            # 一行只到 sxuId（SPU），真正投放的 SKU 见 swa_skus；成交按各 SKU 商智成交占比拆，
-            # 花费没有 SKU 级依据、按生效 SKU 均分（详见 _swa_split）。
-            for r in (w.get("swa") or {}).get("rows", []):
-                spu = str(r.get("sxuId") or "").strip()
-                if not spu:
-                    continue
-                info = (swamap.get(k) or {}).get(spu) or {}
-                skus = [str(x) for x in (info.get("skus") or [])] or [spu]
-                c, am, o = _f(r.get("cost")), _f(r.get("totalOrderSum")), _i(r.get("totalOrderCnt"))
-                imp, clk, cart = (_i(r.get("impressions")), _i(r.get("clicks")),
-                                  _i(r.get("totalCartCnt")))
-                n = len(skus)
-                alloc = _swa_split(c, am, o, skus, w["sz"])
-                for sid in skus:
-                    cc, aa, oo = alloc.get(sid, (0.0, 0.0, 0))
-                    t = aggAd[wk][sid]
-                    t["cost"] += cc
-                    t["amt"] += aa
-                    t["ord"] += oo
-                    t["imp"] += int(imp / n)
-                    t["clk"] += int(clk / n)
-                    t["cart"] += int(cart / n)
-                    t["fromSwa"] = True
-                    ac = t["byAcct"].setdefault(k, {"cost": 0.0, "amt": 0.0, "ord": 0, "plans": set()})
-                    ac["cost"] += cc
-                    ac["amt"] += aa
-                    ac["ord"] += oo
-                    pname = ((info.get("names") or {}).get(sid)
-                             or str(r.get("adName") or f"全站营销-{spu}"))
-                    ac["plans"].add(pname)
-                    t["plans"].add(pname)
             # 关键词计划：kw 报表只有「计划 + 词」，行里没有 skuId；创意报表（kw_ad）按创意
             # 带落地页 SKU 和花费，这里直接按 SKU 加总。一个计划推多个 SKU 也能分开算；
             # 解析不到 SKU 的创意不摊分，留在 meta.kwSpend「未归因」。
@@ -734,8 +682,7 @@ def sku_rows(accts, model, costs=None):
         plans_any = (aggAd["w1"].get(sid, {}).get("plans") or aggAd["w2"].get(sid, {}).get("plans")
                      or aggAd["w0"].get(sid, {}).get("plans") or [])
         campaign = sorted(plans_any)[0] if plans_any else ""
-        name = (szInfo.get("name") or swaName.get(sid)
-                or (f"{campaign} · {sid[-6:]}" if campaign else f"SKU {sid}"))
+        name = szInfo.get("name") or (f"{campaign} · {sid[-6:]}" if campaign else f"SKU {sid}")
         aovRef = 0.0
         for wk in WKEYS:
             if per[wk]["szAmt"] and per[wk]["szOrders"]:
@@ -945,6 +892,98 @@ def _verdict(r):
             "reason": f"ROI {roi} < 本 SKU 保本 {be}，且扣掉广告费后整体估算为负"}
 
 
+# ---------------- 全站营销（独立口径） ----------------
+SWA_CALIBER = (
+    "全站营销（单品/新品推广）是独立口径：全站投产比 = 全站交易额 ÷ 花费；"
+    "全站订单行 = 全站归因订单行，与快车/智能投放的「点击后15天成交订单」不是同一套统计，"
+    "所以不与其它页的花费/订单/ROI 相加或直接对比。平台只给到 SPU 汇总；"
+    "「生效商品」来自计划二级页，成交/订单按各商品商智成交占比拆、花费按生效商品均分，"
+    "仅用于看结构，不能当成平台 SKU 级花费。"
+)
+
+
+def swa_rows(accts):
+    """全站营销独立页数据：SPU 计划 + 生效商品 + 未生效商品。
+
+    不进入 `plans` / `skus`（那两页是快车/智能投放口径），避免两种 ROI 混在一张表里。
+    """
+    swamap = swa_sku_maps(accts)
+    out = []
+    for a in accts:
+        k, label = a["key"], a["label"]
+        ids = {}
+        for wk in WKEYS:
+            w = a["ds"]["wins"][wk]
+            for r in (w.get("swa") or {}).get("rows", []):
+                spu = str(r.get("sxuId") or "").strip()
+                if not spu:
+                    continue
+                ctype = _i(r.get("_swaType")) or 101
+                cid = f"swa:{ctype}:{spu}"
+                e = ids.setdefault(cid, {
+                    "campaignId": cid, "spu": spu, "type": ctype,
+                    "name": r.get("adName") or f"全站营销-{spu}", "wins": {}})
+                e["wins"][wk] = _metrics(r.get("impressions"), r.get("clicks"), r.get("cost"),
+                                         r.get("totalOrderCnt"), r.get("totalOrderSum"),
+                                         r.get("totalCartCnt"))
+                e["wins"][wk]["newCustomers"] = _i(r.get("newCustomer180Days"))
+        for cid, e in ids.items():
+            for wk in WKEYS:
+                e["wins"].setdefault(wk, _empty())
+            pick = "w2" if e["wins"]["w2"]["cost"] > 0 else "w1"
+            latest = e["wins"][pick]
+            info = (swamap.get(k) or {}).get(e["spu"]) or {}
+            members = [str(x) for x in (info.get("skus") or [])] or [e["spu"]]
+            w = a["ds"]["wins"][pick] or {}
+            sz = {}
+            for s in w.get("sz") or []:
+                if s.get("__summary__"):
+                    continue
+                sz[str(s.get("skuId") or "")] = s
+            alloc = _swa_split(latest["cost"], latest["amt"], latest["ord"], members, w.get("sz"))
+            names = info.get("names") or {}
+            mem = []
+            for sid in members:
+                cc, aa, oo = alloc.get(sid, (0.0, 0.0, 0))
+                s = sz.get(sid) or {}
+                mem.append({"skuId": sid, "name": names.get(sid) or (e["name"] if sid == e["spu"]
+                                                                    else f"SKU {sid}"),
+                            "cost": round(cc, 2), "amt": round(aa, 2), "ord": int(oo),
+                            "roi": round(aa / cc, 2) if cc else 0.0,
+                            "szAmt": round(_f(s.get("amt")), 2), "szOrders": _i(s.get("orders")),
+                            "szQty": round(_f(s.get("qty")), 1),
+                            "szVisitors": _i(s.get("visitors"))})
+            mem.sort(key=lambda x: -_f(x.get("szAmt")))
+            inactive = []
+            for sid in info.get("inactive") or []:
+                inactive.append({"skuId": sid, "name": names.get(sid) or f"SKU {sid}"})
+            e.update({"account": k, "accountLabel": label,
+                      "typeLabel": TYPE_LABEL.get(e["type"], "全站营销"),
+                      "skuCount": len(members), "members": mem, "inactive": inactive,
+                      "newCustomers": _i(latest.get("newCustomers"))})
+            out.append(e)
+    out.sort(key=lambda p: (-_f(p["wins"]["w2"]["cost"]), -_f(p["wins"]["w1"]["cost"])))
+    totals = {}
+    for p in out:
+        if p["wins"]["w2"]["cost"] <= 0:
+            continue
+        t = totals.setdefault(p["account"], {"key": p["account"], "label": p["accountLabel"],
+                                             "cost": 0.0, "amt": 0.0, "ord": 0,
+                                             "newCustomers": 0, "plans": 0})
+        m = p["wins"]["w2"]
+        t["cost"] += _f(m["cost"])
+        t["amt"] += _f(m["amt"])
+        t["ord"] += _i(m["ord"])
+        t["newCustomers"] += _i(p.get("newCustomers"))
+        t["plans"] += 1
+    for t in totals.values():
+        t["cost"] = round(t["cost"], 2)
+        t["amt"] = round(t["amt"], 2)
+        t["roi"] = round(t["amt"] / t["cost"], 2) if t["cost"] else 0.0
+    return {"caliber": SWA_CALIBER, "plans": out,
+            "accounts": sorted(totals.values(), key=lambda x: -x["cost"])}
+
+
 # ---------------- 计划级 ----------------
 def plan_rows(accts, model, skus=None):
     """计划级分层。计划可能同时投多个 SKU，所以保本线用「该计划内各 SKU 按成交额加权的毛利率」，
@@ -952,7 +991,6 @@ def plan_rows(accts, model, skus=None):
     marginOf = {s["skuId"]: _f(s.get("margin")) for s in (skus or [])}
     srcOf = {s["skuId"]: (s.get("costSource") or "store") for s in (skus or [])}
     spumap = spu_sku_maps(accts)
-    swamap = swa_sku_maps(accts)
     skuAmt = defaultdict(dict)        # (account, campaignId) -> {skuId: 成交额}
     planBe = {}
     out = []
@@ -1005,54 +1043,12 @@ def plan_rows(accts, model, skus=None):
                 # 免得概览(jzt) 缺 campaignType 时被归进「其他」
                 if e.get("type") is None and _i(r.get("targetingType")) == 2:
                     e["type"] = 2
-            # 全站营销（单品/新品推广）：没有 campaignId，用 sxuId 做稳定 key；
-            # 成交额按实际投放 SKU 平分，这样计划保本线不会只落在某一个商品上。
-            for r in (w.get("swa") or {}).get("rows", []):
-                spu = str(r.get("sxuId") or "").strip()
-                if not spu:
-                    continue
-                ctype = _i(r.get("_swaType")) or 101
-                cid = f"swa:{ctype}:{spu}"
-                e = ids.setdefault(cid, {"campaignId": cid,
-                                         "name": r.get("adName") or f"全站营销-{spu}",
-                                         "type": ctype, "wins": {}})
-                e["wins"][wk] = _metrics(r.get("impressions"), r.get("clicks"), r.get("cost"),
-                                         r.get("totalOrderCnt"), r.get("totalOrderSum"),
-                                         r.get("totalCartCnt"))
-                info = (swamap.get(k) or {}).get(spu) or {}
-                members = [str(x) for x in (info.get("skus") or [])] or [spu]
-                # 计划 ≠ 一个商品：按二级页面的「生效投放商品」拆。成交/订单按各 SKU
-                # 商智成交占比，花费按生效 SKU 均分（平台没有 SKU 级花费）。
-                mw = e.setdefault("memberWins", {}).setdefault(wk, {})
-                c_all, a_all, o_all = (_f(r.get("cost")), _f(r.get("totalOrderSum")),
-                                       _i(r.get("totalOrderCnt")))
-                n = len(members)
-                alloc = _swa_split(c_all, a_all, o_all, members, w["sz"])
-                for sid in members:
-                    cc, aa, oo = alloc.get(sid, (0.0, 0.0, 0))
-                    rec = mw.setdefault(sid, {"skuId": sid, "name": (info.get("names") or {}).get(sid)
-                                              or (r.get("adName") if sid == spu else "")
-                                              or f"SKU {sid}", "cost": 0.0, "amt": 0.0, "ord": 0})
-                    rec["cost"] = round(rec["cost"] + cc, 2)
-                    rec["amt"] = round(rec["amt"] + aa, 2)
-                    rec["ord"] += oo
-                    cur = skuAmt[(k, cid)].setdefault(sid, 0.0)
-                    skuAmt[(k, cid)][sid] = cur + aa
-                e["spu"] = spu
-                e["skuCount"] = n
-                e["inactiveSkus"] = list(info.get("inactive") or [])
-                e["memberNames"] = dict(info.get("names") or {})
         for cid, e in ids.items():
             for wk in WKEYS:
                 e["wins"].setdefault(wk, _empty())
                 if e.get("jstWins"):
                     e["jstWins"].setdefault(wk, _empty())
             latest = e["wins"]["w2"] if e["wins"]["w2"]["cost"] > 0 else e["wins"]["w1"]
-            if e.get("memberWins"):
-                pick = "w2" if e["wins"]["w2"]["cost"] > 0 else "w1"
-                mem = list((e["memberWins"].get(pick) or {}).values())
-                mem.sort(key=lambda x: -_f(x.get("cost")))
-                e["members"] = mem
             # 该计划的保本线 = 计划内各 SKU 按成交额加权的毛利率的倒数
             pairs = skuAmt.get((k, cid)) or {}
             sm = global_margin(model)
@@ -1859,7 +1855,8 @@ def build(start=None, end=None, windows=None, accounts=None):
             "costCoverage": _cost_coverage(skus, costs),
             "kwSpend": kwSpend,
             "costUpdatedAt": costs.get("updatedAt") or "",
-            "caliber": ("广告=京准通概览＋全站营销(点击15天/成交订单口径)；智能投放=智能投放报表；"
+            "caliber": ("广告=京准通概览(点击15天/成交订单口径，不含全站营销)；智能投放=智能投放报表；"
+                        "全站营销=单独页签(全站投产比/全站订单行，不与广告 ROI 混算)；"
                         "商智=各店铺成交口径；商智客单价为真实值，产品成本按 Excel 成本率等比推算"),
             "accounts": [{"key": a["key"], "label": a["label"], "accountId": a["accountId"]} for a in accts],
             "generatedAt": settings.now_str("%Y-%m-%d %H:%M"),
@@ -1872,6 +1869,8 @@ def build(start=None, end=None, windows=None, accounts=None):
                       "totals": totals.get(a["key"]) or account_totals(a)} for a in accts],
         "plans": plans,
         "skus": skus,
+        # 全站营销单独一页：口径不同，绝不再混进 plans/skus/account_totals
+        "swa": swa_rows(active),
         "noAd": no_ad,
         "typeSplit": type_split(active),
         "targeting": targeting,

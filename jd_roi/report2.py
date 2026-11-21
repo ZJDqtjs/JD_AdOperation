@@ -24,13 +24,12 @@ SPIKE_SVG = (
     '</g></svg>'
 )
 
-_NAV_ITEMS = [("/", "控制台"), ("/report", "分析报表"), ("/activity", "团长活动"),
+_NAV_ITEMS = [("/", "控制台"), ("/report", "分析报表"),
               ("/ai", "AI 分析台"),
               ("广告情况", [("/paycomm", "CPS花费"), ("/paycomm/spend", "京准通花费"),
                            ("/cashflow", "广告费流水"),
                            ("/profit", "月度利润"), ("/maobao", "毛利诊断")]),
-              ("/price", "SKU前台价"), ("/subsidy", "超级补贴"),
-              ("/cache", "缓存"), ("/login", "登录")]
+              ("/price", "SKU前台价"), ("/activity", "团长活动")]
 
 
 def navtop(active: str = "", right: str = "") -> str:
@@ -1062,6 +1061,15 @@ def page_overview(d) -> str:
             sz_notes.append(f'{_e(a["label"])} 店铺访客 {int(_n(f.get("visitors"))):,}、'
                             f'浏览量 {int(_n(f.get("views"))):,}、转化率 {_n(f.get("cvr")):.2f}%')
 
+    swa = d.get("swa") or {}
+    swa_accts = swa.get("accounts") or []
+    swa_sum_rows = "".join(
+        f'<tr><td class="l"><b>{_e(a.get("label"))}</b></td>'
+        f'<td class="mono">{_money(a.get("cost"))}</td>'
+        f'<td class="mono">{_money(a.get("amt"))}</td>'
+        f'<td class="mono up">{_n(a.get("roi")):.2f}</td>'
+        f'<td class="mono">{int(_n(a.get("ord")))}</td></tr>' for a in swa_accts)
+
     return f"""
 <div class="card">
   <h2>核心结论 <span class="tagline">{_e(_acct_scope(d))}合并口径</span></h2>
@@ -1069,6 +1077,8 @@ def page_overview(d) -> str:
 </div>
 
 <div class="grid g3">{kpis}</div>
+<p class="hint">以上「广告花费 / 成交 / ROI」为快车 + 智能投放 + 关键词口径，<b>不含全站营销</b>；
+  全站营销是另一套全站归因口径，单独见下方卡片和「⑤ 全站营销」页。</p>
 
 <div class="card" style="margin-top:16px">
   <h2>三期趋势 <span class="tagline">前两期 / 前一期 / 所选区间</span></h2>
@@ -1089,6 +1099,20 @@ def page_overview(d) -> str:
   <h2>流量与转化大盘</h2>
   <p class="hint">店铺访客来自商智；广告点击/订单来自京准通。若访客远大于广告点击，说明自然流量占比高。</p>
   {_chart_html("chFlow")}
+</div>
+
+<div class="card">
+  <h2>全站营销 <span class="tagline">单独口径，未并入上方花费 / ROI / 订单</span></h2>
+  <p class="hint">
+    全站营销（单品/新品推广）的「全站投产比 / 全站订单行」与快车、智能投放不是同一套统计，
+    硬加进上面的广告 ROI 会让两边都对不上，所以单独列在这里，详细计划与生效商品见「⑤ 全站营销」。
+  </p>
+  <div class="tblwrap short">
+    <table><thead><tr><th class="l noSort">账号</th><th data-num="1">花费</th>
+      <th data-num="1">全站交易额</th><th data-num="1">全站投产比</th>
+      <th data-num="1">全站订单行</th></tr></thead>
+      <tbody>{swa_sum_rows or '<tr><td class="l" colspan="5">所选区间没有全站营销数据</td></tr>'}</tbody></table>
+  </div>
 </div>
 
 <div class="card">
@@ -1156,11 +1180,14 @@ def _cost_tip(s) -> str:
 
 
 def _cost_split_tip(s, cur) -> str:
-    """花费的来源拆分：智能投放 / 全站智能推广 / 全站营销 / 关键词计划（按创意 SKU 归因）。"""
+    """花费的来源拆分：智能投放 / 全站智能推广 / 关键词计划（按创意 SKU 归因）。
+
+    全站营销不在本页：它的全站投产比/全站订单行是另一套口径，单独放「⑤ 全站营销」。
+    """
     kw = _n((s.get("kwCost") or {}).get(_latest_key(s)))
     if kw <= 0:
-        return "花费＝智能投放商品报表 ＋ 全站智能推广 ＋ 全站营销（本商品本期没有归到关键词计划）"
-    return (f"花费＝智能投放 ＋ 全站智能推广 ＋ 全站营销 ＋ 关键词计划；"
+        return "花费＝智能投放商品报表 ＋ 全站智能推广（本商品本期没有归到关键词计划）"
+    return (f"花费＝智能投放 ＋ 全站智能推广 ＋ 关键词计划；"
             f"其中关键词/商品定向 ¥{_money(kw)}"
             f"（按快车创意报表的落地页 SKU 归因，推广管理创意接口兜底）")
 
@@ -1346,6 +1373,8 @@ def page_sku(d) -> str:
     「商智成交」会补：商智的成交额/件数在 T+1 只结算约一半，T+2~T+3 才定稿
     （流量指标不受影响），所以最近 15 天每晚重抓，更早的天不再变动；
     最近 1~2 天的成交会低于商智当前值，属正常滞后。{kw_note}
+    <br><b>全站营销（单品/新品推广）不在本页</b>：它的全站投产比/全站订单行是另一套口径，
+    硬混进来会让 ROI 和订单数失真，请到「⑤ 全站营销」页单独看。
   </p>
   <div class="toolbar" id="skuChips">{chips}<span style="width:14px"></span>{achips}
     <span style="width:10px"></span>
@@ -1501,22 +1530,8 @@ def page_plan(d) -> str:
     for i, p in enumerate(plans):
         m = p["wins"]["w2"]
         roi, be = _n(m["roi"]), _n(p["breakeven"])
-        # 全站营销是 SPU 级计划：必须把「生效投放商品」列出来，避免看起来像只投了一个商品
-        members = p.get("members") or []
-        mem_html = ""
-        if members:
-            chips = "".join(
-                f'<span title="SKU {_e(x.get("skuId"))}｜花费 ¥{_money(x.get("cost"))}'
-                f'｜成交 ¥{_money(x.get("amt"))}">{_e((x.get("name") or "")[:18])}'
-                f' ¥{_money(x.get("cost"))}</span>' for x in members[:8])
-            mem_html = (f'<div class="mini" style="margin-top:2px">'
-                        f'生效商品 {len(members)} 个（花费均分、成交按商智占比）：{chips}'
-                        f'{" …" if len(members) > 8 else ""}</div>')
-        group_tag = (f' <span class="mini">SPU · {len(members)}个生效商品</span>'
-                     if members else "")
         head = (f'<td class="mono">{i + 1}</td>'
-                f'<td class="l"><b>{_e(p["name"])}</b>{group_tag}'
-                f'<div class="sid">{_e(p["campaignId"])}</div>{mem_html}</td>'
+                f'<td class="l"><b>{_e(p["name"])}</b><div class="sid">{_e(p["campaignId"])}</div></td>'
                 f'<td class="l">{_e(p["accountLabel"])}</td>'
                 f'<td class="l">{_e(p["typeLabel"])}</td>')
         tail = f'<td class="l" title="{_e(_plan_advice(p))}">{_badge(p["tier"])}</td></tr>'
@@ -1559,9 +1574,8 @@ def page_plan(d) -> str:
     </span>
   </h2>
   <p class="hint">
-    「概览」里的计划包含智能化 / 关键词 / 全站智能推广三种类型；全站营销（单品/新品推广）单独抓取后并入，
-    它是 SPU 级计划，花费/成交已按二级页面的「生效投放商品」拆到各 SKU
-    （花费按生效商品均分、成交按各商品商智成交占比；下方列出每个商品的金额），口径与智能投放报表略有差异（订单口径）。
+    「概览」里的计划包含智能化 / 关键词 / 全站智能推广三种类型，口径与智能投放报表略有差异（订单口径）。
+    全站营销（单品/新品推广）的 ROI 与订单行是另一套口径，<b>不并入本页</b>，请到「⑤ 全站营销」页单独看。
     放大 {tier_count.get("放大", 0)} 个 · 优化 {tier_count.get("优化", 0)} 个 ·
     止损 {tier_count.get("止损", 0)} 个 · 未投放 {tier_count.get("未投放", 0)} 个。
     默认「区间详细」只看所选区间的花费 / 成交 / ROI；切到「三期趋势」看 w0 / w1 / w2 的环比与走势。
@@ -1593,6 +1607,117 @@ def page_plan(d) -> str:
     </tr></thead><tbody>{''.join(trend_rows) or empty_trend}</tbody></table>
   </div>
 </div>
+"""
+
+
+# ---------------------------------------------------------------- 页面：全站营销
+def page_swa(d) -> str:
+    """全站营销独立页：平台口径的 SPU 计划 + 生效商品 + 未生效商品。
+
+    不放进商品ROI/计划明细：全站投产比、全站订单行的统计口径与快车/智能投放不同，
+    混在一起会让 ROI 和订单数对不上。
+    """
+    swa = d.get("swa") or {}
+    plans = [p for p in (swa.get("plans") or []) if _n(p["wins"]["w2"]["cost"]) > 0]
+    accts = swa.get("accounts") or []
+    tot_cost = round(sum(_n(p["wins"]["w2"]["cost"]) for p in plans), 2)
+    tot_amt = round(sum(_n(p["wins"]["w2"]["amt"]) for p in plans), 2)
+    tot_ord = int(sum(_n(p["wins"]["w2"]["ord"]) for p in plans))
+    tot_roi = round(tot_amt / tot_cost, 2) if tot_cost else 0.0
+
+    acct_rows = "".join(
+        f'<tr><td class="l"><b>{_e(a.get("label"))}</b></td>'
+        f'<td class="mono">{_money(a.get("cost"))}</td>'
+        f'<td class="mono">{_money(a.get("amt"))}</td>'
+        f'<td class="mono up">{a.get("roi", 0):.2f}</td>'
+        f'<td class="mono">{int(a.get("ord") or 0)}</td>'
+        f'<td class="mono">{int(a.get("newCustomers") or 0)}</td>'
+        f'<td class="mono">{int(a.get("plans") or 0)}</td></tr>'
+        for a in accts)
+
+    plan_rows = "".join(
+        f'<tr><td class="l"><b>{_e(p.get("name"))}</b>'
+        f'<div class="sid">SPU {_e(p.get("spu"))} · {_e(p.get("typeLabel"))}</div></td>'
+        f'<td class="l">{_e(p.get("accountLabel"))}</td>'
+        f'<td class="mono">{_money(p["wins"]["w2"]["cost"])}</td>'
+        f'<td class="mono">{_money(p["wins"]["w2"]["amt"])}</td>'
+        f'<td class="mono up">{_n(p["wins"]["w2"]["roi"]):.2f}</td>'
+        f'<td class="mono">{int(_n(p["wins"]["w2"]["ord"]))}</td>'
+        f'<td class="mono">{_num(p["wins"]["w2"]["cpa"], 2)}</td>'
+        f'<td class="mono">{int(_n(p["wins"]["w2"]["imp"]))}</td>'
+        f'<td class="mono">{int(_n(p["wins"]["w2"]["clk"]))}</td>'
+        f'<td class="mono">{_num(p["wins"]["w2"]["ctr"], 2)}%</td>'
+        f'<td class="mono">{_num(p["wins"]["w2"]["cpc"], 2)}</td>'
+        f'<td class="mono">{int(_n(p.get("newCustomers")))}</td>'
+        f'<td class="mono">{int(_n(p.get("skuCount")))}</td></tr>'
+        for p in plans)
+
+    blocks = []
+    for p in plans:
+        mem_rows = "".join(
+            f'<tr><td class="l">{_e(x.get("name"))}</td>'
+            f'<td class="mono">{_e(x.get("skuId"))}</td>'
+            f'<td class="mono">{_money(x.get("szAmt"))}</td>'
+            f'<td class="mono">{int(_n(x.get("szOrders")))}</td>'
+            f'<td class="mono">{_num(x.get("szQty"), 1)}</td>'
+            f'<td class="mono" title="平台只给 SPU 汇总，这里按生效商品均分">{_money(x.get("cost"))}</td>'
+            f'<td class="mono" title="按该商品商智成交占比分摊">{_money(x.get("amt"))}</td>'
+            f'<td class="mono">{_num(x.get("roi"), 2)}</td></tr>'
+            for x in (p.get("members") or []))
+        inactive = p.get("inactive") or []
+        inact_html = ""
+        if inactive:
+            inact_html = ("<p class='hint'>未生效商品（黑名单 / 供应商简码不一致等，不参与投放）："
+                          + "；".join(f'{_e(x.get("name"))}（{_e(x.get("skuId"))}）'
+                                     for x in inactive) + "</p>")
+        blocks.append(f"""
+<div class="card" style="margin-top:14px">
+  <h3>{_e(p.get("name"))} <span class="mini">SPU {_e(p.get("spu"))} · {len(p.get("members") or [])} 个生效商品</span></h3>
+  <div class="tblwrap">
+    <table><thead><tr>
+      <th class="l noSort">生效商品</th><th class="noSort">SKU</th>
+      <th data-num="1">商智成交额</th><th data-num="1">商智订单</th><th data-num="1">商智件数</th>
+      <th data-num="1">分摊花费<br><span class="mini">生效商品均分</span></th>
+      <th data-num="1">分摊成交<br><span class="mini">按商智占比</span></th>
+      <th data-num="1">分摊ROI<br><span class="mini">仅参考</span></th>
+    </tr></thead><tbody>{mem_rows or '<tr><td class="l" colspan="8">没有拿到该 SPU 的生效商品列表</td></tr>'}</tbody></table>
+  </div>
+  <p class="hint">分摊值只用于看商品结构；平台没有 SKU 级花费/成交，计划真实效果以上方 SPU 计划行为准。</p>
+  {inact_html}
+</div>""")
+
+    return f"""
+<div class="card">
+  <h2>全站营销 <span class="tagline">独立口径，不与快车/智能投放混算</span></h2>
+  <div class="warn" style="line-height:1.8">{_e(swa.get("caliber") or "")}</div>
+  <p class="hint">
+    本页合计：花费 <b>¥{_money(tot_cost)}</b>、全站交易额 <b>¥{_money(tot_amt)}</b>、
+    全站投产比 <b>{tot_roi:.2f}</b>、全站订单行 <b>{tot_ord}</b>。
+    计划名/推广位展示的只是 SPU 的代表商品，实际可能同时投多个生效商品，
+    所以下面按 SPU 计划 + 生效商品两层展示。
+  </p>
+  <div class="tblwrap">
+    <table><thead><tr>
+      <th class="l noSort">账号</th><th data-num="1">花费</th><th data-num="1">全站交易额</th>
+      <th data-num="1">全站投产比</th><th data-num="1">全站订单行</th>
+      <th data-num="1">180天新客</th><th data-num="1">计划数</th>
+    </tr></thead><tbody>{acct_rows or '<tr><td class="l" colspan="7">所选区间没有全站营销数据</td></tr>'}</tbody></table>
+  </div>
+</div>
+<div class="card" style="margin-top:14px">
+  <h3>SPU 计划明细</h3>
+  <p class="hint">全站投产比 = 全站交易额 ÷ 花费；全站订单行是全站归因订单，不要和「④ 计划明细」的促成订单直接相加。</p>
+  <div class="tblwrap">
+    <table><thead><tr>
+      <th class="l noSort">计划 / SPU</th><th class="l noSort">账号</th>
+      <th data-num="1">花费</th><th data-num="1">全站交易额</th><th data-num="1">全站投产比</th>
+      <th data-num="1">全站订单行</th><th data-num="1">全站订单成本</th>
+      <th data-num="1">展现</th><th data-num="1">点击</th><th data-num="1">CTR</th><th data-num="1">CPC</th>
+      <th data-num="1">180天新客</th><th data-num="1">生效商品</th>
+    </tr></thead><tbody>{plan_rows or '<tr><td class="l" colspan="13">所选区间没有全站营销计划</td></tr>'}</tbody></table>
+  </div>
+</div>
+{''.join(blocks)}
 """
 
 
@@ -2338,8 +2463,8 @@ def _coverage_notice(d) -> str:
 
 # ---------------------------------------------------------------- 组装
 TABS = [("p-ov", "① 总结"), ("p-sku", "② 商品ROI"), ("p-adj", "③ 调整复盘"),
-        ("p-plan", "④ 计划明细"), ("p-word", "⑤ 搜索词诊断"), ("p-sop", "⑥ 快车SOP体检"),
-        ("p-act", "⑦ 行动清单"), ("p-ind", "⑧ 行业大盘")]
+        ("p-plan", "④ 计划明细"), ("p-swa", "⑤ 全站营销"), ("p-word", "⑥ 搜索词诊断"),
+        ("p-sop", "⑦ 快车SOP体检"), ("p-act", "⑧ 行动清单"), ("p-ind", "⑨ 行业大盘")]
 
 
 _ECHARTS_CACHE: dict = {"src": None}
@@ -2675,7 +2800,7 @@ function genAi(btn, start, end, keys){
 }
 """
 
-# 行业大盘补齐的「补完自动刷新」：只轮询、且仅在⑧行业大盘页签且用户没在输入时才刷新。
+# 行业大盘补齐的「补完自动刷新」：只轮询、且仅在⑨行业大盘页签且用户没在输入时才刷新。
 # 以前用 <meta http-equiv="refresh" content="20"> 无条件整页刷新，用户正在搜索框里打字、
 # 或者正在看别的页签，20 秒一到页面就被刷掉（输入和滚动位置全丢）。
 IND_JS = """
@@ -3209,7 +3334,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
     ind = d.get("industry") or {}
     # 行业大盘补齐时**不能**再用 <meta http-equiv="refresh">：那是整页定时刷新，
     # 会把用户正在输入的搜索框、滚动位置一起刷掉（表现为「打字几秒后页面自己刷新」）。
-    # 改成 JS 轮询 + 三重条件：正在看⑧行业大盘、没在输入框里、补齐任务真的结束了才刷新。
+    # 改成 JS 轮询 + 三重条件：正在看⑨行业大盘、没在输入框里、补齐任务真的结束了才刷新。
     ind_pending = _industry_pending(ind)
     refresh_meta = ""
     tabs = "".join(
@@ -3221,6 +3346,7 @@ def render(d, ui: str = "", title: str = "京东广告运营分析 · 跨账号 
         ("p-sku", page_sku(d)),
         ("p-adj", page_adj(d)),
         ("p-plan", page_plan(d)),
+        ("p-swa", page_swa(d)),
         ("p-word", page_word(d)),
         ("p-sop", page_playbook(d)),
         ("p-act", page_action(d)),

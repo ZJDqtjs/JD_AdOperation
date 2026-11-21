@@ -60,8 +60,9 @@ AGG = {
            "keep": ["campaignName", "groupName", "keywordName", "targetingType"]},
     # 关键词创意按 SKU：报表中心创意报表（含已删计划）按天拆出来的花费，用来把关键词的钱归到商品
     "kw_ad": {"key": ["skuId"], "sum": AD_SUM, "keep": ["adName", "campaignId", "campaignName"]},
-    # 全站营销（单品/新品推广）：一行是一个 sxuId（SPU），花费/成交要按实际投放 SKU 平分
-    "swa_campaign": {"key": ["sxuId", "_swaType"], "sum": AD_SUM,
+    # 全站营销（单品/新品推广）：一行是一个 sxuId（SPU），花费/成交要按实际投放 SKU 拆分
+    "swa_campaign": {"key": ["sxuId", "_swaType"],
+                     "sum": AD_SUM + ["newCustomer180Days"],
                      "keep": ["adName", "sxuId", "_swaType"]},
     # 人群：按 DMP 人群包 × 计划 汇总（人群包名挂在 dmpName）
     "crowd": {"key": ["crowdId", "campaignId"], "sum": AD_SUM + CROWD_EXTRA_SUM,
