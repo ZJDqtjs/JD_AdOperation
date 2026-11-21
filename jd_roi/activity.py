@@ -513,6 +513,26 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                                     f"orders {day}: 本次不完整 {od.get('total')}/{od.get('expected')}，保留旧数据")
                             time.sleep(2)
                         log(f"[{label}] 订单明细 {rec.get('orderDays', 0)} 天")
+                        # 补漏：被限流/会话断开时可能连续多天没写成，整段跑完再重载页面补一遍
+                        _odir = acct_dir(key) / "orders"
+                        _missing = [d for d in _days(perf_start, perf_end)
+                                    if not (_odir / f"{d}.json").exists()]
+                        if _missing:
+                            log(f"[{label}] 补漏 {len(_missing)} 天：{_missing[0]} ~ {_missing[-1]}")
+                            try:
+                                page.reload()
+                                page.wait_for_timeout(9000)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            for day in _missing:
+                                try:
+                                    od = fetch_order_day(page, day)
+                                    if od.get("total") or od.get("complete"):
+                                        _write(_odir / f"{day}.json", od)
+                                        rec["orderDays"] = rec.get("orderDays", 0) + 1
+                                except Exception as exc:  # noqa: BLE001
+                                    rec["errors"].append(f"orders repair {day}: {exc}")
+                                time.sleep(2)
                     except Exception as exc:  # noqa: BLE001
                         rec["errors"].append(f"orders page: {exc}")
                         log(f"[{label}] 订单明细页打开失败：{exc}")
