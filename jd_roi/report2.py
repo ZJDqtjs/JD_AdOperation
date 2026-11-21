@@ -1156,11 +1156,11 @@ def _cost_tip(s) -> str:
 
 
 def _cost_split_tip(s, cur) -> str:
-    """花费的来源拆分：智能投放 / 全站智能推广 / 关键词计划（按创意 SKU 归因）。"""
+    """花费的来源拆分：智能投放 / 全站智能推广 / 全站营销 / 关键词计划（按创意 SKU 归因）。"""
     kw = _n((s.get("kwCost") or {}).get(_latest_key(s)))
     if kw <= 0:
-        return "花费＝智能投放商品报表 ＋ 全站智能推广（本商品本期没有归到关键词计划）"
-    return (f"花费＝智能投放 ＋ 全站智能推广 ＋ 关键词计划；"
+        return "花费＝智能投放商品报表 ＋ 全站智能推广 ＋ 全站营销（本商品本期没有归到关键词计划）"
+    return (f"花费＝智能投放 ＋ 全站智能推广 ＋ 全站营销 ＋ 关键词计划；"
             f"其中关键词/商品定向 ¥{_money(kw)}"
             f"（按快车创意报表的落地页 SKU 归因，推广管理创意接口兜底）")
 
@@ -1501,8 +1501,22 @@ def page_plan(d) -> str:
     for i, p in enumerate(plans):
         m = p["wins"]["w2"]
         roi, be = _n(m["roi"]), _n(p["breakeven"])
+        # 全站营销是 SPU 级计划：必须把「生效投放商品」列出来，避免看起来像只投了一个商品
+        members = p.get("members") or []
+        mem_html = ""
+        if members:
+            chips = "".join(
+                f'<span title="SKU {_e(x.get("skuId"))}｜花费 ¥{_money(x.get("cost"))}'
+                f'｜成交 ¥{_money(x.get("amt"))}">{_e((x.get("name") or "")[:18])}'
+                f' ¥{_money(x.get("cost"))}</span>' for x in members[:8])
+            mem_html = (f'<div class="mini" style="margin-top:2px">'
+                        f'生效商品 {len(members)} 个（花费均分、成交按商智占比）：{chips}'
+                        f'{" …" if len(members) > 8 else ""}</div>')
+        group_tag = (f' <span class="mini">SPU · {len(members)}个生效商品</span>'
+                     if members else "")
         head = (f'<td class="mono">{i + 1}</td>'
-                f'<td class="l"><b>{_e(p["name"])}</b><div class="sid">{_e(p["campaignId"])}</div></td>'
+                f'<td class="l"><b>{_e(p["name"])}</b>{group_tag}'
+                f'<div class="sid">{_e(p["campaignId"])}</div>{mem_html}</td>'
                 f'<td class="l">{_e(p["accountLabel"])}</td>'
                 f'<td class="l">{_e(p["typeLabel"])}</td>')
         tail = f'<td class="l" title="{_e(_plan_advice(p))}">{_badge(p["tier"])}</td></tr>'
@@ -1545,7 +1559,9 @@ def page_plan(d) -> str:
     </span>
   </h2>
   <p class="hint">
-    「概览」里的计划包含智能化 / 关键词 / 全站智能推广三种类型，口径与智能投放报表略有差异（订单口径）。
+    「概览」里的计划包含智能化 / 关键词 / 全站智能推广三种类型；全站营销（单品/新品推广）单独抓取后并入，
+    它是 SPU 级计划，花费/成交已按二级页面的「生效投放商品」拆到各 SKU
+    （花费按生效商品均分、成交按各商品商智成交占比；下方列出每个商品的金额），口径与智能投放报表略有差异（订单口径）。
     放大 {tier_count.get("放大", 0)} 个 · 优化 {tier_count.get("优化", 0)} 个 ·
     止损 {tier_count.get("止损", 0)} 个 · 未投放 {tier_count.get("未投放", 0)} 个。
     默认「区间详细」只看所选区间的花费 / 成交 / ROI；切到「三期趋势」看 w0 / w1 / w2 的环比与走势。

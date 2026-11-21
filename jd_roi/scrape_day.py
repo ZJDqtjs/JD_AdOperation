@@ -500,6 +500,54 @@ def fetch_jst_multiday(page, kind: str, start: str, end: str) -> dict:
     return by_day
 
 
+def fetch_swa_multiday(page, start: str, end: str,
+                       types: tuple = (101, 117)) -> dict:
+    """全站营销（单品推广 101 / 新品推广 117）：一次 isDaily 请求拿区间每天，按天拆分。
+
+    概览接口（msa/promolist/overview/campaign）**不返回全站营销**，所以这条线必须单独抓，
+    否则商品ROI / 计划明细会漏掉这部分花费（2026-11-19 起账号 b/main 的日花费大头都在这）。
+    118 全店推广已经在 jst 商品报表里以「全店推广计划」出现，这里不重复抓，避免双算。
+    """
+    from .paycomm import SWA_PLAN_API, _post_report
+    # 接口硬限制：开始~结束最多 31 天（2026-11-21 实测 400「最大支持31天」）。
+    # 夜间默认只回刷 15 天，但手动补历史时必须自己分段，否则整段直接失败。
+    d0 = dt.date.fromisoformat(start)
+    d1 = dt.date.fromisoformat(end)
+    chunks = []
+    cur = d0
+    while cur <= d1:
+        wend = min(cur + dt.timedelta(days=30), d1)
+        chunks.append((cur.isoformat(), wend.isoformat()))
+        cur = wend + dt.timedelta(days=1)
+    by_day: dict = {}
+    for cstart, cend in chunks:
+        for ctype in types:
+            pno = 1
+            while pno <= 20:
+                payload = {
+                    "platform": "", "campaignTypes": [ctype], "province": "",
+                    "startDay": cstart, "endDay": cend, "orderStatus": "", "giftFlag": "",
+                    "clickOrOrderDay": 15, "clickOrOrderCaliber": 0, "sxuId": "", "obys": "",
+                    "isDaily": True, "orderStatusCategory": 1,
+                    "dateValues": [{"startDay": cstart, "endDay": cend}],
+                    "pageNum": pno, "pageSize": 200, "requestFrom": 0,
+                }
+                d = _post_report(page, SWA_PLAN_API, payload)
+                batch = ((d.get("data") or {}).get("rows") or [])
+                for r in batch:
+                    r["_swaType"] = ctype
+                    day = _parse_day(str(r.get("date") or "")[:8]) \
+                        or _parse_day(r.get("date") or r.get("clickDate"))
+                    if day:
+                        by_day.setdefault(day, []).append(r)
+                if len(batch) < 200:
+                    break
+                pno += 1
+                time.sleep(settings.PAGE_SLEEP)
+            time.sleep(settings.PAGE_SLEEP)
+    return by_day
+
+
 def fetch_jst_day(page, kind: str, day: str, max_rows: int | None = None) -> dict:
     cols = COLS_SW if kind == "searchword" else COLS_ACCOUNT
     obys = "cost|desc" if kind == "searchword" else "impressions|desc"
@@ -738,6 +786,10 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
             # 所以只要请求里带了 kw/kw_ad，就把这些天都放进待办（其余数据源会各自跳过）。
             if "kw" in kinds or "kw_ad" in kinds:
                 todo = sorted(set(todo) | set(days))
+            # 全站营销不在概览里，_day_complete 不看它；只要本次要抓它就覆盖整个请求区间，
+            # 否则已经「齐全」的昨天会被跳过，报表继续漏全站营销花费。
+            if "swa_campaign" in kinds:
+                todo = sorted(set(todo) | set(days))
             # 分时(hourly)是「可选」数据源，_day_complete 刻意不看它（否则历史天永远算不完整）。
             # 这里单独把需要抓分时的天补进待办，否则「只抓分时」或「历史天齐全但缺昨天分时」会被整体跳过。
             if h_days:
@@ -829,6 +881,41 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
                     except Exception as exc:  # noqa: BLE001
                         acc_sum["errors"].append(f"kw_ad: {exc}")
                         log(f"[{label}] 关键词创意报表失败：{exc}")
+
+                # --- 全站营销（单品推广/新品推广）：概览接口不返回，必须单独抓。
+                #     一次 isDaily 请求覆盖整个区间 → 按天落盘；同时存一份「sxuId → 实际投放 SKU」
+                #     映射，报表用它把 SPU 级花费/成交平分到商品。
+                if "swa_campaign" in kinds:
+                    try:
+                        by_day = fetch_swa_multiday(p_jzt, start, end)
+                        for day in days:
+                            ds.save_day(key, day, "swa_campaign",
+                                        {"rows": by_day.get(day, []),
+                                         "dateStart": day, "dateEnd": day})
+                            acc_sum["days"].setdefault(day, []).append("swa_campaign")
+                        n = sum(len(v) for v in by_day.values())
+                        cost = round(sum(float(r.get("cost") or 0)
+                                         for v in by_day.values() for r in v), 2)
+                        log(f"[{label}] 全站营销按天拆分：{len(by_day)} 天 / {n} 行 / ¥{cost:,.2f}")
+                        try:
+                            from .paycomm import fetch_swa_delivery
+                            mp = fetch_swa_delivery(p_jzt, start, end)
+                            if mp:
+                                store.save("swa_skus", {
+                                    "fetchedAt": settings.now_str("%Y-%m-%d %H:%M:%S"),
+                                    "map": {str(k): {
+                                        "skus": [int(x) for x in (v.get("skus") or [])],
+                                        "names": {str(k2): nm for k2, nm in
+                                                  (v.get("names") or {}).items()},
+                                        "inactive": [int(x) for x in (v.get("inactive") or [])]}
+                                        for k, v in mp.items()}}, key)
+                                log(f"[{label}] 全站营销投放 SKU 映射：{len(mp)} 个 sxuId")
+                        except Exception as exc:  # noqa: BLE001
+                            acc_sum["errors"].append(f"swa_skus: {exc}")
+                            log(f"[{label}] 全站营销 SKU 映射失败（花费仍按 sxuId 记）：{exc}")
+                    except Exception as exc:  # noqa: BLE001
+                        acc_sum["errors"].append(f"swa_campaign: {exc}")
+                        log(f"[{label}] 全站营销抓取失败：{exc}")
 
                 # 商智的会话（动态签名头）复用到整个账号：以前每天新建一次 SzFetcher，
                 # 等于每天白等两次 14 秒的 capture；回刷 80 天时这一项就多花半小时。

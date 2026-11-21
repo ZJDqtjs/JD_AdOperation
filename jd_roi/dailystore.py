@@ -15,6 +15,7 @@ kind 取值：
     sz_flow      商智-流量概况      oplog       京准通操作日志
     crowd        定向-人群(DMP)     area        定向-地域
     hourly       京准通分时曲线（列表行「趋势」背后的数据；只抓昨天，见 OPTIONAL_KINDS）
+    swa_campaign 全站营销-单品/新品推广（按天；不在概览接口里，需要单独抓）
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ from . import settings
 from .indicators import FLOW_SUM, PRODUCT_SUM, SRC_AMT, SRC_UV, SZ_AMT, SZ_ORDN, SZ_UV
 
 KINDS = ["jzt_campaign", "jst_campaign", "jst_sku", "jst_searchword", "kw", "kw_ad",
-         "sz_product", "sz_flow", "oplog", "crowd", "area", "hourly"]
+         "swa_campaign", "sz_product", "sz_flow", "oplog", "crowd", "area", "hourly"]
 
 # 「可选」数据源：不是每天都能/都需要抓（分时只在夜间随抓取跑一次、只抓昨天）。
 # `_day_complete` 判定「这天抓全了没」时会忽略它们，否则历史天永远算「不完整」。
@@ -38,7 +39,7 @@ KINDS = ["jzt_campaign", "jst_campaign", "jst_sku", "jst_searchword", "kw", "kw_
 # 注意：当日实时快照（sz_product_rt）**故意不列在 KINDS 里**。它是「今天 00:00 到此刻」
 # 的口径，跟 day 参数无关；如果混进 KINDS，夜间 kinds=None 时会给区间里每一天都抓一遍，
 # 反而把每天的文件都写成今天的数据。它只由显式 kinds=["sz_product_rt"] 触发。
-OPTIONAL_KINDS = {"hourly", "kw_ad"}
+OPTIONAL_KINDS = {"hourly", "kw_ad", "swa_campaign"}
 
 # 广告类报表可相加的字段
 AD_SUM = ["impressions", "clicks", "cost", "totalOrderCnt", "totalOrderSum", "totalCartCnt"]
@@ -59,6 +60,9 @@ AGG = {
            "keep": ["campaignName", "groupName", "keywordName", "targetingType"]},
     # 关键词创意按 SKU：报表中心创意报表（含已删计划）按天拆出来的花费，用来把关键词的钱归到商品
     "kw_ad": {"key": ["skuId"], "sum": AD_SUM, "keep": ["adName", "campaignId", "campaignName"]},
+    # 全站营销（单品/新品推广）：一行是一个 sxuId（SPU），花费/成交要按实际投放 SKU 平分
+    "swa_campaign": {"key": ["sxuId", "_swaType"], "sum": AD_SUM,
+                     "keep": ["adName", "sxuId", "_swaType"]},
     # 人群：按 DMP 人群包 × 计划 汇总（人群包名挂在 dmpName）
     "crowd": {"key": ["crowdId", "campaignId"], "sum": AD_SUM + CROWD_EXTRA_SUM,
               "keep": ["dmpName", "campaignName"]},
