@@ -6,7 +6,7 @@
 
 页面：
     /            控制台（区间选择、数据覆盖、立即抓取、扫码登录）
-    /report      任意区间的聚合分析报表（自带区间选择器；⑧行业大盘页签）
+    /report      任意区间的聚合分析报表（自带区间选择器；⑨行业大盘页签）
     /ai          独立 AI 分析台：每日 AI 报告 + 可追问对话框（含思考过程流式展示）
     /paycomm     CPS 花费：按 SKU 看付款佣金金额，可导出 Excel
     /paycomm/spend  京准通花费：按 SKU 看广告花费（智能投放 + 全站智能推广），可导出 Excel
@@ -29,6 +29,12 @@ API：
     POST /api/ai/chat           对话框追问（后台线程，返回 jobId，**立即返回**）
     GET  /api/ai/stream         SSE：某 job 的 phase/reasoning/content/done 事件流（可续传）
     GET  /api/ai/jobs           最近 AI 任务快照（刷新后找回未完成生成）
+    GET  /api/compete           SKU 竞品/关键词分析缓存（前台价页右侧面板）
+    POST /api/compete/run       后台抓取某个 SKU 的同款/行业词/京东推词
+    GET  /api/compete/status    竞品抓取进度
+    POST /api/compete/ai        用现有 LLM 配置解读竞品与关键词数据
+    POST /api/price/probe       探寻降价商品的前台原因（商品页价 + 活动标识，后台线程）
+    GET  /api/price/probe/status 商品页探寻进度
     GET  /api/tasks             任务中心：运行中 + 历史任务
     GET  /api/tasks/{id}        单个任务详情（含完整日志）
     POST /api/tasks/{id}/cancel 取消该任务（仅运行中的可取消）
@@ -55,9 +61,9 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse, Response, StreamingResponse)
 
-from . import (aijobs, ai_page, analyze2, analyze_ai, cashflow, config,
-               dailystore as ds, industry, paycomm, pricewatch, profit, report2,
-               scrape_day, settings)
+from . import (activity, aijobs, ai_page, analyze2, analyze_ai, cashflow, compete, config,
+               dailystore as ds, industry, itemprobe, llm, maobao, paycomm, pricewatch,
+               profit, report2, scrape_day, settings, vs)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -74,7 +80,7 @@ URL_PREFIX = (os.getenv("JD_URL_PREFIX", "") or "").rstrip("/")
 _ATTR_RE = re.compile(r'\b(href|src|action)=(["\'])/(?!/)')
 # 只给已知的首段路径补前缀，避免误伤 JS 里的 split('/') 之类的普通字符串
 _URL_STR_RE = re.compile(
-    r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico'
+    r'(["\'])/(?=(?:api|login|report|vs|ai|assets|healthz|favicon\.ico'
     r'|cashflow|paycomm|profit|price|cache)\b)')
 
 
@@ -103,7 +109,8 @@ async def _prefix_urls(request: Request, call_next):
 
 KINDS_UI = [("jzt_campaign", "概览计划"), ("jst_campaign", "投放计划"),
             ("jst_sku", "投放商品"), ("jst_searchword", "搜索词"),
-            ("kw", "关键词"), ("kw_ad", "关键词创意(按品)"), ("sz_product", "商智商品"),
+            ("kw", "关键词"), ("kw_ad", "关键词创意(按品)"),
+            ("swa_campaign", "全站营销"), ("sz_product", "商智商品"),
             ("sz_flow", "商智流量"), ("oplog", "操作日志"),
             ("hourly", "分时")]
 
@@ -431,7 +438,8 @@ def dashboard(request: Request):
 </div>
 
 <div class="card" style="margin-top:18px">
-  <h2>数据覆盖 <span class="tagline">按天入库</span></h2>
+  <h2>数据覆盖 <span class="tagline">按天入库</span>
+    <a class="btn ghost mini" style="margin-left:auto" href="/cache">缓存管理 →</a></h2>
   <p class="hint">按天入库；<b>只要某天缺数据，区间分析就会按 0 计入</b>。缺哪几天可以用下方「立即抓取」补。</p>
   <div class="note">补数策略：<b>{gap_html}</b>。定时任务会把「停机期间的空洞」和「最近 {settings.REFRESH_DAYS} 天回刷」合并成一次抓取。</div>
   <div class="grid g2">{cal}</div>
@@ -806,6 +814,7 @@ def report(request: Request):
             status_code=200)
     ui = _range_bar(start, end, keys, "/report",
                     extra='<a href="/">← 控制台</a>'
+                          '<a href="/vs?preset=switch">史上最强vs现代最强 →</a>'
                           '<a href="/ai?start=%s&end=%s&accounts=%s">AI 分析台（可追问）→</a>'
                           '<a href="/api/analysis?start=%s&end=%s&accounts=%s" target="_blank">看 JSON</a>'
                           % (_e(start), _e(end), _e(",".join(keys)),
@@ -819,6 +828,76 @@ def report(request: Request):
           f"render {time.time() - t1:.2f}s 成本={(settings.COSTS_SOURCE or {}).get('kind')}",
           flush=True)
     return HTMLResponse(html_out)
+
+
+# ================================================================ 史上最强 vs 现代最强
+@app.get("/vs", response_class=HTMLResponse)
+def vs_page(request: Request):
+    """任意两区间对比：A=史上最强、B=现代最强，统一用商智成交额看费比。"""
+    q = request.query_params
+    preset = (q.get("preset") or "").strip()
+    yday = _today() - dt.timedelta(days=1)
+    if preset == "switch":
+        a_start, a_end = "2026-11-06", "2026-11-17"
+        b_start, b_end = "2026-11-19", "2026-11-20"
+    elif preset == "week":
+        b_end_d = yday
+        b_start_d = b_end_d - dt.timedelta(days=6)
+        a_end_d = b_start_d - dt.timedelta(days=1)
+        a_start_d = a_end_d - dt.timedelta(days=6)
+        a_start, a_end = a_start_d.isoformat(), a_end_d.isoformat()
+        b_start, b_end = b_start_d.isoformat(), b_end_d.isoformat()
+    else:
+        a_start = q.get("a_start") or vs.DEFAULT_A[0]
+        a_end = q.get("a_end") or vs.DEFAULT_A[1]
+        b_start = q.get("b_start") or vs.DEFAULT_B[0]
+        b_end = q.get("b_end") or vs.DEFAULT_B[1]
+    a_start, a_end = ds.norm_day(a_start), ds.norm_day(a_end)
+    b_start, b_end = ds.norm_day(b_start), ds.norm_day(b_end)
+    if a_start > a_end:
+        a_start, a_end = a_end, a_start
+    if b_start > b_end:
+        b_start, b_end = b_end, b_start
+    keys = q.getlist("accounts")
+    if keys:
+        accounts = account_list(keys)
+    else:
+        # 默认只看做过切换的两个账号；其他账号可在页面上勾选
+        accounts = [a for a in settings.ACCOUNTS if a.get("key") in ("main", "b")] or settings.ACCOUNTS
+    try:
+        data = vs.build(a_start, a_end, b_start, b_end, accounts)
+    except FileNotFoundError as exc:
+        return HTMLResponse(vs.error_page(str(exc)), status_code=200)
+    return HTMLResponse(vs.render(data, accounts_all=settings.ACCOUNTS, preset=preset))
+
+
+@app.post("/api/vs/insight")
+def vs_insight(payload: dict | None = None):
+    """用现有 LLM 接口解读当前 A/B 对比（同步调用，页面按钮触发）。"""
+    p = payload or {}
+    a_start = ds.norm_day(p.get("a_start") or vs.DEFAULT_A[0])
+    a_end = ds.norm_day(p.get("a_end") or vs.DEFAULT_A[1])
+    b_start = ds.norm_day(p.get("b_start") or vs.DEFAULT_B[0])
+    b_end = ds.norm_day(p.get("b_end") or vs.DEFAULT_B[1])
+    if a_start > a_end:
+        a_start, a_end = a_end, a_start
+    if b_start > b_end:
+        b_start, b_end = b_end, b_start
+    keys = p.get("accounts") or ["main", "b"]
+    accounts = [settings.get_account(k) for k in keys if settings.get_account(k)]
+    if not accounts:
+        return JSONResponse({"ok": False, "error": "没有可用账号"}, status_code=400)
+    try:
+        data = vs.build(a_start, a_end, b_start, b_end, accounts)
+        text = llm.chat([
+            {"role": "system",
+             "content": "你是京东广告投放分析师。只输出中文结论，条目化，不要客套，不要编造数据。"},
+            {"role": "user", "content": vs.insight_prompt(data)},
+        ], max_tokens=900, timeout=90)
+        return {"ok": True, "text": text}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                            status_code=500)
 
 
 # ================================================================ AI 分析台
@@ -1689,11 +1768,13 @@ def api_paycomm_spend_cache_delete(account: str | None = None, start: str = "", 
 # ================================================================ 缓存管理（二级页）
 # 四类缓存各自的落盘文件：paycomm_*.json / paycomm_spend_*.json / profit_*.json / industry_*.json
 CACHE_KINDS = [("all", "全部"), ("cps", "CPS 花费"), ("spend", "京准通花费"),
-               ("profit", "月度利润"), ("industry", "行业大盘")]
+               ("profit", "月度利润"), ("industry", "行业大盘"),
+               ("cashflow", "广告费流水")]
 CACHE_LABELS = {"cps": "CPS 花费", "spend": "京准通花费",
-                "profit": "月度利润", "industry": "行业大盘"}
+                "profit": "月度利润", "industry": "行业大盘",
+                "cashflow": "广告费流水"}
 CACHE_HREF = {"cps": "/paycomm", "spend": "/paycomm/spend",
-              "profit": "/profit", "industry": "/report"}
+              "profit": "/profit", "industry": "/report", "cashflow": "/cashflow"}
 
 CACHE_CSS = """
 .cgGrp{margin-bottom:18px}
@@ -1744,7 +1825,7 @@ function rowsHtml(list, withKind){
       + '<td class="l">'+esc(en.accountLabel || en.account)+badges(en)+'</td>'
       + '<td class="l">'+esc(en.start)+' ~ '+esc(en.end)+'</td>'
       + '<td class="n">'+esc(en.rows)+'</td>'
-      + '<td class="n" title="'+(en.kind==='profit'?'净利合计':(en.kind==='cps'?'付款佣金合计':(en.kind==='industry'?'本店广告花费（行业数据为指数，不计费）':'京准通花费合计')))+'">'
+      + '<td class="n" title="'+(en.kind==='profit'?'净利合计':(en.kind==='cps'?'付款佣金合计':(en.kind==='industry'?'本店广告花费（行业数据为指数，不计费）':(en.kind==='cashflow'?'区间消费合计':'京准通花费合计'))))+'">'
       + money(en.total)+(en.kind==='profit'?' <span class="cgBadge">净利</span>':'')+'</td>'
       + '<td class="l">'+esc(en.savedAt)+'</td>'
       + '<td class="n">'+fmtKB(en.sizeKB)+'</td>'
@@ -1825,7 +1906,7 @@ function load(){
     if(!j.ok){ $('cgMsg').textContent = '读取缓存清单失败' + (j.error ? '：' + j.error : ''); return; }
     ALL = j.entries || [];
     var parts = [];
-    ['cps','spend','profit','industry'].forEach(function(k){
+    ['cps','spend','profit','industry','cashflow'].forEach(function(k){
       var n = (j.counts || {})[k] || 0;
       if(n) parts.push((LABEL[k] || k) + ' ' + n + ' 份');
     });
@@ -1859,7 +1940,7 @@ load();
 
 @app.get("/api/cache/list")
 def api_cache_list():
-    """四类缓存合成一张清单：花费两份 + 利润 + 行业大盘，条目自带 kind。"""
+    """各类缓存合成一张清单：花费两份 + 利润 + 行业大盘 + 广告费流水，条目自带 kind。"""
     entries: list[dict] = []
     for en in _paycomm.cache_entries():
         en["kind"] = "cps"
@@ -1873,7 +1954,10 @@ def api_cache_list():
     for en in industry.cache_entries():
         en["kind"] = "industry"
         entries.append(en)
-    counts = {"cps": 0, "spend": 0, "profit": 0, "industry": 0}
+    for en in cashflow.cache_entries():
+        en["kind"] = "cashflow"
+        entries.append(en)
+    counts = {"cps": 0, "spend": 0, "profit": 0, "industry": 0, "cashflow": 0}
     for en in entries:
         en["kindLabel"] = CACHE_LABELS.get(en["kind"], en["kind"])
         counts[en["kind"]] = counts.get(en["kind"], 0) + 1
@@ -1893,7 +1977,10 @@ def api_cache_delete(kind: str = "", account: str = "", start: str = "",
         return profit.delete_cache(start, end, file=file)
     if kind == "industry":
         return industry.delete_cache(account, start, end)
-    return {"ok": False, "error": "未知的缓存类型（kind 只能是 cps / spend / profit / industry）"}
+    if kind == "cashflow":
+        return cashflow.delete_cache(account, start, end)
+    return {"ok": False,
+            "error": "未知的缓存类型（kind 只能是 cps / spend / profit / industry / cashflow）"}
 
 
 @app.get("/cache", response_class=HTMLResponse)
@@ -1927,6 +2014,7 @@ def cache_page(request: Request):
     <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
     <a class="btn ghost mini" href="/profit">月度利润 →</a>
     <a class="btn ghost mini" href="/report">行业大盘（报表页签）</a>
+    <a class="btn ghost mini" href="/cashflow">广告费流水 →</a>
   </div>
 </div></header>
 <div class="wrap">
@@ -1961,7 +2049,8 @@ def cache_page(request: Request):
 
 # ================================================================ 广告费流水
 # 数据在 jd_roi/cashflow.py：逐账号抓「账户中心 → 财务记录」的充值/消费/分配/冻结，
-# 这里只做页面与接口。页面直接读本地缓存（不发请求），要新数据点「重新抓取」。
+# 这里只做页面与接口。页面查询时按天拼接本地缓存（不发请求）；「抓取」只补缓存里
+# 缺的日期，缓存清单统一在 /cache 页看。
 CASHFLOW_CSS = """
 .cfkpi{margin:14px 0 4px}
 .cfchart{background:var(--canvas);border:1px solid var(--hair);border-radius:var(--r-md);
@@ -2024,6 +2113,11 @@ window.CFRUN = function(){
     .then(function(r){ return r.json(); })
     .then(function(j){
       if(!j.ok){ msg(j.error || '启动失败', true); if(btn) btn.disabled=false; return; }
+      if(j.nothing){
+        msg(j.message || '该区间每一天都有缓存，无需补抓');
+        if(btn) btn.disabled=false;
+        return;
+      }
       poll();
     })
     .catch(function(e2){ msg('启动失败：' + e2, true); if(btn) btn.disabled=false; });
@@ -2037,6 +2131,14 @@ window.CFSET = function(days){
   location.href = '/cashflow?start=' + iso(s) + '&end=' + iso(e);
 };
 window.CFSPAN = function(b, e){
+  location.href = '/cashflow?start=' + b + '&end=' + e;
+};
+/* 查询：按输入框里的区间重新拼缓存（不发请求） */
+window.CFQUERY = function(){
+  var bEl = $('cfStart'), eEl = $('cfEnd');
+  var b = (bEl && bEl.value) || '', e = (eEl && eEl.value) || '';
+  if(!b || !e){ msg('请先选好起止日期', true); return; }
+  if(b > e){ msg('结束日不能早于开始日', true); return; }
   location.href = '/cashflow?start=' + b + '&end=' + e;
 };
 if(window.CF_RUNNING) poll();
@@ -2055,7 +2157,8 @@ def _cf_money(v) -> str:
 def cashflow_page(request: Request):
     """广告费流水：余额、充值/消费柱状图、每日流水（读本地缓存，不触发抓取）。
 
-    区间由 URL 的 start/end 决定，默认近 30 天；缓存按区间分开存，补抓历史不会覆盖别的区间。
+    区间由 URL 的 start/end 决定，默认近 30 天；各账号的缓存分片按天拼接，
+    所以查任意区间都能出结果；「抓取」只补缓存里缺的日期。
     """
     q = request.query_params
     d_begin, d_end = cashflow.default_range(30)
@@ -2070,23 +2173,21 @@ def cashflow_page(request: Request):
     lm_end_d = first - dt.timedelta(days=1)
     lm_start, lm_end = lm_end_d.replace(day=1).isoformat(), lm_end_d.isoformat()
 
-    # 已抓过的区间：点一下切过去看（补过的历史不用每次重抓）
-    rg = snap.get("ranges") or []
-    range_chips = "".join(
-        f'<a class="chip{" on" if r["begin"] == begin and r["end"] == end else ""}" '
-        f'href="/cashflow?start={_e(r["begin"])}&end={_e(r["end"])}">'
-        f'{_e(r["begin"][5:])} ~ {_e(r["end"][5:])}'
-        f'<span style="color:var(--muted2)"> · {len(r["accounts"])} 个账号</span></a>'
-        for r in rg[:12])
+    gap_days = int(snap.get("gapDays") or 0)
+    gap_txt = ""
+    if gap_days:
+        gr = snap.get("gapRange") or []
+        gap_txt = (f"{_e(gr[0])} ~ {_e(gr[1])}" if len(gr) == 2 and gr[0] != gr[1]
+                   else _e(gr[0]) if gr else "")
 
     if snap.get("empty"):
+        lack = f"还缺 {gap_days} 天数据" if gap_days else "这个区间还没抓过"
         meta = (f"<span>{begin} ~ {end}</span><span class='dot'></span>"
-                "<span>这个区间还没抓过</span>")
+                f"<span>{lack}</span>")
         kpis = ""
         body = ('<div class="card"><p class="hint">该区间还没有流水数据。点右上角「抓取」，'
-                f'会依次登录各账号拉一遍财务记录（{begin} ~ {end}）。</p>'
-                '<p class="hint">已抓过的区间可以直接点下方标签切换，不用重抓：</p>'
-                f'<div class="toolbar" style="margin-top:8px">{range_chips or "<span class=hint>暂无</span>"}</div></div>')
+                f'只补缓存里缺的日期（{begin} ~ {end}），已有的日期不会重抓。</p>'
+                '<p class="hint">缓存清单（区间 / 大小 / 删除）都在「缓存」页。</p></div>')
     else:
         accs = snap["accounts"]
         begin, end = snap["begin"], snap["end"]
@@ -2095,7 +2196,9 @@ def cashflow_page(request: Request):
         cover = round(totals["cash"] / day_avg, 1) if day_avg else None
         meta = (f"<span>{begin} ~ {end}</span><span class='dot'></span>"
                 f"<span>抓取于 {snap['fetched_at'][:16].replace('T', ' ')}</span>"
-                f"<span class='dot'></span><span>来源：京准通 → 账户中心 → 财务记录</span>")
+                f"<span class='dot'></span><span>来源：京准通 → 账户中心 → 财务记录</span>"
+                + (f"<span class='dot'></span><span>还缺 {gap_days} 天</span>"
+                   if gap_days else ""))
         kpis = (
             '<div class="grid g4 cfkpi">'
             f'<div class="kpi"><div class="lbl">可用余额合计</div>'
@@ -2171,13 +2274,10 @@ def cashflow_page(request: Request):
             '<p class="hint">次日 08:45 左右批量扣款，所以「今天的消耗」要到明早才从余额里扣掉。'
             '逐笔明细（充值/分配/冻结）在导出的 Excel 里。</p></div>')
 
-        range_bar = (f'<div class="toolbar" style="margin-top:4px">'
-                     f'<span class="mini" style="color:var(--muted)">已抓区间</span>{range_chips}</div>'
-                     ) if len(rg) > 1 else ""
-        body = range_bar + kpis + table + charts + daily_table
-        if snap.get("ranges_mixed"):
-            body = ('<div class="cfwarn">各账号的缓存区间不一致（可能只抓了部分账号），'
-                    '点「重新抓取」可统一。</div>' + body)
+        body = kpis + table + charts + daily_table
+        if gap_days:
+            body = (f'<div class="cfwarn">本区间还缺 {gap_days} 天缓存'
+                    f'（{gap_txt}），点「抓取」只补这些天，已有日期不会重抓。</div>' + body)
 
     run_hint = f'<span id="cfMsg" style="font-size:12px;color:var(--muted)">{"抓取中…" if running else ""}</span>'
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -2200,8 +2300,12 @@ def cashflow_page(request: Request):
     <button class="btn ghost mini" onclick="CFSET(7)">近7天</button>
     <button class="btn ghost mini" onclick="CFSET(30)">近30天</button>
     <button class="btn ghost mini" onclick="CFSPAN('{lm_start}','{lm_end}')">上月</button>
-    <button class="btn" id="cfRun" onclick="CFRUN()" {"disabled" if running else ""}>抓取</button>
+    <button class="btn" id="cfRun" onclick="CFRUN()" {"disabled" if running else ""}
+            title="只补缓存里缺的日期，已有的日期不重抓">抓取</button>
     <a class="btn ghost mini" href="/api/cashflow/export?start={begin}&end={end}">导出 Excel</a>
+    <button class="btn ghost mini" onclick="CFQUERY()"
+            title="用已有缓存拼接出这个区间，不发请求">查询</button>
+    <a class="btn ghost mini" href="/cache?kind=cashflow">缓存管理 →</a>
     <a class="btn ghost mini" href="/paycomm/spend">京准通花费 →</a>
     {run_hint}
   </div>
@@ -2212,7 +2316,8 @@ def cashflow_page(request: Request):
   <p><b>口径</b>：交易日期 = 广告实际消耗日；记账时间 = 次日 08:45 左右批量扣款；
   结余取接口原值，接口不返回结余的账号按「期初 + 充值 − 消费」逐日滚动推算。</p>
   <p><b>分配</b>是同一资金户内「商家账户 ↔ 投放子账户」的划转，不改变账户现金总额，不计入余额滚动。</p>
-  <p>缓存<b>按区间分开存</b>：补抓某段历史不会覆盖别的区间，切换区间直接读本地文件，不会重新请求京东。要新数据点「抓取」。</p>
+  <p>本地缓存<b>按天拼接</b>：查询任意区间都会用已有缓存拼出结果，不会重新请求京东；
+  「抓取」只补缓存里缺的日期。缓存清单在「缓存」页，要强制刷新可先在那里删掉对应区间再抓。</p>
 </div>
 </div>
 <script>window.CF_RUNNING = {"true" if running else "false"};</script>
@@ -2538,8 +2643,144 @@ function sort(k){
   else SORT = {k:k, d:(k==='itemName'||k==='skuId'||k==='category')?1:-1};
   render();
 }
+
+/* ---------------- 毛保诊断（京东毛保） ---------------- */
+function mbConf(){ return (INIT.maobao || {}); }
+function mbRules(){
+  var key = $('pfAcc').value;
+  return (mbConf().rules || {})[key] || null;
+}
+function mbTemp(r){
+  var C = mbConf(), sid = String(r.skuId == null ? '' : r.skuId);
+  if((C.skuTypes || {})[sid]) return C.skuTypes[sid];
+  var nm = String(r.itemName || ''), i;
+  for(i=0;i<(C.normalWords || []).length;i++){
+    if(nm.indexOf(C.normalWords[i]) >= 0) return 'normal';
+  }
+  for(i=0;i<(C.frozenWords || []).length;i++){
+    if(nm.indexOf(C.frozenWords[i]) >= 0) return 'frozen';
+  }
+  return 'normal';
+}
+function mbPct(v){
+  var n = num(v); if(n===null) return '—';
+  return (n*100).toFixed(2) + '%';
+}
+function mbGroupCard(g, rules){
+  var line = (rules && g.threshold!=null) ? mbPct(g.threshold) : '未配置';
+  var verdict;
+  if(!rules || g.threshold==null) verdict = '<span class="badge b-idle">未配置毛保线</span>';
+  else if(g.settle<=0) verdict = '<span class="badge b-idle">无结算数据</span>';
+  else if(g.triggered) verdict = '<span class="badge b-bad">触发毛保</span>';
+  else verdict = '<span class="badge b-ok">达标</span>';
+  return '<div class="card" style="margin-top:0">'
+    + '<h2 style="margin:0 0 10px;font-size:16px">'+esc(g.label)
+      + ' <span class="tagline">毛保线 '+esc(line)+'</span> '+verdict+'</h2>'
+    + '<div class="tm" style="margin:0">'
+      + '<span>成交件数 <b>'+fmt(g.qty,'int')+'</b></span>'
+      + '<span>前台成交额 <b>¥'+fmt(g.sale,'money')+'</b></span>'
+      + '<span>结算采购额 <b>¥'+fmt(g.settle,'money')+'</b></span>'
+      + '<span>京东毛利额 <b>¥'+fmt(g.profit,'money')+'</b></span>'
+      + '<span>京东毛利率 <b>'+mbPct(g.margin)+'</b></span>'
+      + (rules && g.triggered ? '<span>需补利润 <b style="color:var(--redink)">¥'+fmt(g.shortfall,'money')+'</b></span>' : '')
+    + '</div></div>';
+}
+function mbTable(groups){
+  var rows = [];
+  groups.forEach(function(g){ g.items.forEach(function(it){ rows.push(it); }); });
+  if(!rows.length) return '<div class="hint" style="padding:12px 0">没有可用于测算的 SKU：需要同时有平均前台价与扣点后采购价。</div>';
+  var h = '<div class="tblwrap long" style="margin-top:14px"><table><thead><tr>'
+    + '<th class="l noSort">温层</th><th class="l noSort">SKU</th><th class="l noSort">商品名称</th>'
+    + '<th class="n noSort">成交件数</th><th class="n noSort">平均前台价</th><th class="n noSort">扣点后采购价</th>'
+    + '<th class="n noSort">京东毛利/件</th><th class="n noSort">京东毛利额</th><th class="n noSort">结算采购额</th>'
+    + '<th class="n noSort">毛利率</th></tr></thead><tbody>';
+  rows.forEach(function(it){
+    h += '<tr><td class="l">'+(it.temp==='frozen'?'冷冻':'常温')+'</td>'
+      + '<td class="l"><b>'+esc(it.skuId)+'</b></td>'
+      + '<td class="l nm" title="'+esc(it.itemName)+'">'+esc(it.itemName||'—')+'</td>'
+      + '<td class="n">'+fmt(it.qty,'int')+'</td>'
+      + '<td class="n">¥'+fmt(it.frontPrice,'money')+'</td>'
+      + '<td class="n">¥'+fmt(it.supply,'money')+'</td>'
+      + '<td class="n">¥'+fmt(it.unitProfit,'money')+'</td>'
+      + '<td class="n">¥'+fmt(it.profit,'money')+'</td>'
+      + '<td class="n">¥'+fmt(it.settle,'money')+'</td>'
+      + '<td class="n">'+mbPct(it.margin)+'</td></tr>';
+  });
+  return h+'</tbody></table></div>';
+}
+function maobao(){
+  if(!ROWS.length){ msg('先查询出利润明细，再做毛保诊断','bad'); return; }
+  var acc = $('pfAcc').value;
+  if(acc === 'all'){ msg('毛保诊断按账号结算，请先选择具体账号（例如雨润禾）','bad'); return; }
+  var rules = mbRules();
+  var groups = {
+    frozen:{temp:'frozen',label:'冷冻品',qty:0,sale:0,settle:0,profit:0,items:[]},
+    normal:{temp:'normal',label:'常温品',qty:0,sale:0,settle:0,profit:0,items:[]}
+  };
+  var skipped = [];
+  ROWS.forEach(function(r){
+    var qty = num(r.qty) || 0, front = num(r.frontPrice) || 0, supply = num(r.supply) || 0;
+    if(qty <= 0) return;
+    if(front <= 0 || supply <= 0){ skipped.push(r); return; }
+    var t = mbTemp(r);
+    var sale = qty*front, settle = qty*supply, profit = sale - settle;
+    var it = {skuId:r.skuId, itemName:r.itemName||'', temp:t, qty:qty,
+              frontPrice:front, supply:supply, unitProfit:front-supply,
+              sale:sale, settle:settle, profit:profit,
+              margin: settle>0 ? profit/settle : null};
+    var g = groups[t];
+    g.qty += qty; g.sale += sale; g.settle += settle; g.profit += profit; g.items.push(it);
+  });
+  ['frozen','normal'].forEach(function(k){
+    var g = groups[k];
+    g.margin = g.settle>0 ? g.profit/g.settle : null;
+    g.threshold = rules ? rules[k] : null;
+    g.triggered = !!(rules && g.threshold!=null && g.margin!=null && g.margin < g.threshold);
+    g.shortfall = g.triggered ? Math.max(0, g.threshold*g.settle - g.profit) : 0;
+    g.items.sort(function(a,b){ return b.profit - a.profit; });
+  });
+  var tot = {qty:0, sale:0, settle:0, profit:0};
+  ['frozen','normal'].forEach(function(k){
+    var g = groups[k];
+    tot.qty += g.qty; tot.sale += g.sale; tot.settle += g.settle; tot.profit += g.profit;
+  });
+  tot.margin = tot.settle>0 ? tot.profit/tot.settle : null;
+  var shortfall = groups.frozen.shortfall + groups.normal.shortfall;
+
+  var accLabel = (INIT.labels || {})[acc] || acc;
+  $('mbMeta').textContent = accLabel + ' · ' + $('pfStart').value + ' ~ ' + $('pfEnd').value;
+  var warn = '';
+  if(!rules){
+    warn = '<div class="warn" style="margin:0 0 14px">当前账号「'+esc(accLabel)+'」没有配置毛保线，下面只测算京东毛利，不判定触发。'
+      + '已配置：雨润禾（常温 &lt; 10%、冷冻 &lt; 18%）。</div>';
+  } else if(skipped.length){
+    warn = '<div class="warn" style="margin:0 0 14px">'+skipped.length+' 个 SKU 缺平均前台价或扣点后采购价，未计入测算：'
+      + skipped.slice(0,5).map(function(r){ return esc(r.skuId)+' '+esc(String(r.itemName||'').slice(0,16)); }).join('、')
+      + (skipped.length>5?' 等':'') + '。可先点「只更新 ERP 成本」再试。</div>';
+  }
+  $('mbBody').innerHTML = warn
+    + '<div class="grid g2">'+mbGroupCard(groups.frozen,rules)+mbGroupCard(groups.normal,rules)+'</div>'
+    + '<div class="tm" style="margin-top:14px"><span>合计：成交 <b>'+fmt(tot.qty,'int')+'</b> 件</span>'
+      + '<span>前台成交额 <b>¥'+fmt(tot.sale,'money')+'</b></span>'
+      + '<span>结算采购额 <b>¥'+fmt(tot.settle,'money')+'</b></span>'
+      + '<span>京东毛利额 <b>¥'+fmt(tot.profit,'money')+'</b></span>'
+      + '<span>京东毛利率 <b>'+mbPct(tot.margin)+'</b></span>'
+      + '<span>触发补差合计 <b>¥'+fmt(shortfall,'money')+'</b></span></div>'
+    + mbTable([groups.frozen, groups.normal])
+    + '<div class="note" style="margin-top:16px">'
+      + '<p><b>口径</b>：平均前台价取利润行；扣点后采购价 = ERP 到手结算价 supply。'
+      + '京东毛利/件 = 平均前台价 − 扣点后采购价；毛利率 = 京东毛利合计 ÷ 结算给我们的扣点后采购价合计。</p>'
+      + '<p><b>毛保</b>：雨润禾常温品低于 10%、冷冻品低于 18% 触发。'
+      + '需补利润 = 毛保线 × 结算采购额 − 实际毛利额，即京东要补到毛保线还差的利润。</p>'
+      + '<p><b>温层判定</b>：已登记 SKU 按登记表；未登记的按商品名关键词（冷冻/速冻/解冻/薯条/什锦/杂菜/毛豆/青豆/纳豆 → 冷冻，'
+      + '冻干 → 常温），都没有按常温。</p></div>';
+  $('mbModal').classList.add('open');
+  msg('毛保诊断：' + accLabel + '，触发补差 ¥' + fmt(shortfall,'money'));
+}
+function closeMaobao(){ var m = $('mbModal'); if(m) m.classList.remove('open'); }
 window.PF = {run:run, refetch:refetch, exp:exp, expView:expView, dim:dim, sort:sort,
-             render:render, switchAcc:switchAcc, reprice:reprice, quick:quick};
+             render:render, switchAcc:switchAcc, reprice:reprice, quick:quick,
+             maobao:maobao, closeMaobao:closeMaobao};
 function boot(){
   poll();
   // 从「缓存管理」点「查看」带区间打开：自动查一次，有缓存就直接秒出
@@ -2581,7 +2822,8 @@ def profit_page(request: Request):
             "auto": bool(q.get("start") and q.get("end")),
             "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
-            "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"]}
+            "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"],
+            "maobao": maobao.page_rules(settings.ACCOUNTS)}
     quick_html = _quick_html("PF")
     today_iso = _today().isoformat()
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -2628,7 +2870,11 @@ def profit_page(request: Request):
 <div class="grid g4" id="pfKpis" style="display:none;margin-top:18px"></div>
 
 <div class="card" id="pfTableCard" style="display:none">
-  <h2><span id="pfTableTitle">SKU 明细</span> <span class="tagline">点表头可换排序</span></h2>
+  <h2><span id="pfTableTitle">SKU 明细</span> <span class="tagline">点表头可换排序</span>
+    <button class="btn sec mini" id="pfMaobao" onclick="PF.maobao()"
+            style="margin-left:12px"
+            title="按「平均前台价 − 扣点后采购价」测算京东毛利，判断是否触发毛保">毛保诊断</button>
+  </h2>
   <div class="toolbar">
     <span class="tabs" style="margin:0 12px 8px 0">
       <button type="button" class="tab active" id="pfDimSku" onclick="PF.dim('sku')">按 SKU</button>
@@ -2645,6 +2891,17 @@ def profit_page(request: Request):
 
 <div class="note" id="pfNotes" style="display:none;margin-top:16px"></div>
 
+<div class="modal" id="mbModal" onclick="if(event.target===this)PF.closeMaobao()">
+  <div class="modal-card" style="max-width:1120px">
+    <div class="modal-head">
+      <h2>毛保诊断 · 京东毛保测算</h2>
+      <span class="hint" id="mbMeta" style="margin:0"></span>
+      <button class="btn sec mini" onclick="PF.closeMaobao()">关闭</button>
+    </div>
+    <div class="modal-body" id="mbBody"></div>
+  </div>
+</div>
+
 <div class="note" style="margin-top:18px">
   <p><b>到手金额</b> = 商智成交件数 × ERP「到手结算价 supply」（京东结算给我们的每件金额，已扣点）。</p>
   <p><b>毛利</b> = 成交件数 × 「毛利/件」= 到手结算价 − 货款 − 运费 − 包材 − 人工（<b>未扣广告</b>），
@@ -2658,6 +2915,9 @@ def profit_page(request: Request):
      这里也能看到件数与毛利（悬停可看「成交账号」）。两个账号的商智都没有它时，才是 0 件数、毛利 0 的纯花费行。</p>
   <p>注意：同一个 SKU 若两个账号都在投，会同时出现在两张表里且各自带全额成交，跨账号相加会重复计成交与毛利，
      按账号单独看才准。</p>
+  <p><b>毛保诊断</b>（「SKU 明细」右侧按钮）：京东毛利 = 平均前台价 − 扣点后采购价，
+     毛利率 = 京东毛利合计 ÷ 结算给我们的扣点后采购价合计。雨润禾账号常温品低于 10%、冷冻品低于 18% 触发毛保，
+     诊断里给出触发温层与需补利润（= 毛保线 × 结算采购额 − 实际毛利额）。</p>
 </div>
 
 </div>
@@ -2666,6 +2926,179 @@ def profit_page(request: Request):
 <script>window.PC_INIT = {json.dumps(init, ensure_ascii=False)};</script>
 <script>{PROFIT_JS}</script>
 </body></html>""")
+
+
+def _mb_num(v, kind: str = "money") -> str:
+    if v is None or v == "":
+        return "—"
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if kind == "int":
+        return f"{int(n):,}"
+    if kind == "pct":
+        return f"{n * 100:.2f}%"
+    return f"{n:,.2f}"
+
+
+def _mb_group_card(g: dict) -> str:
+    threshold = g.get("threshold")
+    if threshold is None:
+        badge = '<span class="badge b-idle">未配置毛保线</span>'
+    elif (g.get("settle") or 0) <= 0:
+        badge = '<span class="badge b-idle">无结算数据</span>'
+    elif g.get("triggered"):
+        badge = '<span class="badge b-bad">触发毛保</span>'
+    else:
+        badge = '<span class="badge b-ok">达标</span>'
+    line = _mb_num(threshold, "pct") if threshold is not None else "未配置"
+    shortfall = (f'<span>需补利润 <b style="color:var(--redink)">¥{_mb_num(g.get("shortfall"))}</b></span>'
+                 if g.get("triggered") else "")
+    return (
+        '<div class="card" style="margin-top:0">'
+        f'<h2 style="margin:0 0 10px;font-size:16px">{_e(g.get("label"))}'
+        f' <span class="tagline">毛保线 {_e(line)}</span> {badge}</h2>'
+        '<div class="tm" style="margin:0">'
+        f'<span>成交件数 <b>{_mb_num(g.get("qty"), "int")}</b></span>'
+        f'<span>前台成交额 <b>¥{_mb_num(g.get("sale"))}</b></span>'
+        f'<span>结算采购额 <b>¥{_mb_num(g.get("settle"))}</b></span>'
+        f'<span>京东毛利额 <b>¥{_mb_num(g.get("profit"))}</b></span>'
+        f'<span>京东毛利率 <b>{_mb_num(g.get("margin"), "pct")}</b></span>'
+        f'{shortfall}</div></div>'
+    )
+
+
+def _mb_html(diag: dict, acc_label: str, start: str, end: str, saved_at: str = "") -> str:
+    groups = diag.get("groups") or []
+    total = diag.get("total") or {}
+    skipped = diag.get("skipped") or []
+    shortfall = sum(float(g.get("shortfall") or 0) for g in groups)
+
+    warn = ""
+    if not diag.get("rules"):
+        warn = ('<div class="warn">当前账号「' + _e(acc_label) + '」没有配置毛保线，下面只测算京东毛利，不判定触发。'
+                '已配置：雨润禾（常温 &lt; 10%、冷冻 &lt; 18%）。</div>')
+    elif skipped:
+        names = "、".join(f'{_e(x.get("skuId"))} {_e(str(x.get("itemName") or "")[:16])}'
+                         for x in skipped[:5])
+        warn = (f'<div class="warn">{len(skipped)} 个 SKU 缺平均前台价或扣点后采购价，未计入测算：'
+                f'{names}{" 等" if len(skipped) > 5 else ""}。可先到「月度利润」点「只更新 ERP 成本」再试。</div>')
+
+    rows = []
+    for g in groups:
+        for it in (g.get("items") or []):
+            rows.append(
+                '<tr>'
+                f'<td class="l">{"冷冻" if it.get("temp") == "frozen" else "常温"}</td>'
+                f'<td class="l"><b>{_e(it.get("skuId"))}</b></td>'
+                f'<td class="l nm" title="{_e(it.get("itemName"))}">{_e(it.get("itemName") or "—")}</td>'
+                f'<td class="n">{_mb_num(it.get("qty"), "int")}</td>'
+                f'<td class="n">¥{_mb_num(it.get("frontPrice"))}</td>'
+                f'<td class="n">¥{_mb_num(it.get("supply"))}</td>'
+                f'<td class="n">¥{_mb_num(it.get("unitProfit"))}</td>'
+                f'<td class="n">¥{_mb_num(it.get("profit"))}</td>'
+                f'<td class="n">¥{_mb_num(it.get("settle"))}</td>'
+                f'<td class="n">{_mb_num(it.get("margin"), "pct")}</td>'
+                '</tr>')
+    table = ('<div class="tblwrap long" style="margin-top:14px"><table><thead><tr>'
+             '<th class="l">温层</th><th class="l">SKU</th><th class="l">商品名称</th>'
+             '<th class="n">成交件数</th><th class="n">平均前台价</th><th class="n">扣点后采购价</th>'
+             '<th class="n">京东毛利/件</th><th class="n">京东毛利额</th><th class="n">结算采购额</th>'
+             '<th class="n">毛利率</th></tr></thead><tbody>'
+             + ("".join(rows) or '<tr><td class="l" colspan="10">没有可用于测算的 SKU：需要同时有平均前台价与扣点后采购价。</td></tr>')
+             + '</tbody></table></div>')
+
+    return (
+        f'<div class="hint" style="margin:0 0 12px">{_e(acc_label)} · {_e(start)} ~ {_e(end)}'
+        + (f' · 利润缓存 {_e(saved_at)}' if saved_at else '') + '</div>'
+        + warn
+        + '<div class="grid g2">' + "".join(_mb_group_card(g) for g in groups) + '</div>'
+        + '<div class="tm" style="margin-top:14px">'
+        f'<span>合计：成交 <b>{_mb_num(total.get("qty"), "int")}</b> 件</span>'
+        f'<span>前台成交额 <b>¥{_mb_num(total.get("sale"))}</b></span>'
+        f'<span>结算采购额 <b>¥{_mb_num(total.get("settle"))}</b></span>'
+        f'<span>京东毛利额 <b>¥{_mb_num(total.get("profit"))}</b></span>'
+        f'<span>京东毛利率 <b>{_mb_num(total.get("margin"), "pct")}</b></span>'
+        f'<span>触发补差合计 <b>¥{_mb_num(shortfall)}</b></span></div>'
+        + table
+    )
+
+
+@app.get("/maobao", response_class=HTMLResponse)
+def maobao_page(request: Request):
+    """毛保诊断（京东毛保）独立页：读本地利润缓存，按温层判定是否触发毛保。"""
+    q = request.query_params
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS}
+    acc = q.get("account") or next((k for k in keys if maobao.rules_for(k)), settings.MAIN_ACCOUNT)
+    if acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    start, end = _last_month_range()
+    if q.get("start") and q.get("end"):
+        try:
+            start, end = profit.norm_range(q.get("start"), q.get("end"))
+        except ValueError:
+            pass
+
+    opts = "".join(
+        f'<option value="{_e(k)}"{" selected" if k == acc else ""}>{_e(labels[k])}'
+        f'{"（未配置毛保线）" if not maobao.rules_for(k) else ""}</option>'
+        for k in keys)
+
+    data = _profit.load_cached(acc, start, end)
+    if not data:
+        body = ('<div class="warn">本地没有 '
+                f'{_e(start)} ~ {_e(end)} 的 {_e(labels.get(acc, acc))} 利润缓存。先到 '
+                f'<a href="/profit?account={_e(acc)}&start={_e(start)}&end={_e(end)}">月度利润</a>'
+                ' 查询这个区间（有缓存秒出），再回本页诊断。</div>')
+    else:
+        diag = maobao.diagnose(data.get("rows") or [], acc, labels.get(acc))
+        body = _mb_html(diag, data.get("accountLabel") or labels.get(acc, acc),
+                        start, end, data.get("savedAt") or "")
+
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>毛保诊断 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
+</head><body>
+{report2.navtop("/maobao")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}毛保</div>
+  <h1>毛保诊断 · 京东毛保测算</h1>
+  <div class="metaline">
+    <span>京东毛利 = 平均前台价 − 扣点后采购价</span><span class="dot"></span>
+    <span>数据与「月度利润」同一份本地缓存</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/profit?account={_e(acc)}&start={_e(start)}&end={_e(end)}">月度利润 →</a>
+    <a class="btn ghost mini" href="/cache?kind=profit">缓存管理 →</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="card">
+  <form class="toolbar" method="get" action="/maobao">
+    <label class="fld">账号 <select name="account" onchange="this.form.submit()">{opts}</select></label>
+    <label class="fld">起 <input type="date" name="start" value="{_e(start)}"></label>
+    <label class="fld">止 <input type="date" name="end" value="{_e(end)}"></label>
+    <button class="btn" type="submit">查询</button>
+  </form>
+  <div class="hint" style="margin-bottom:0">只读本地缓存，不触发抓取；缓存缺失或过期时去「月度利润」重算。</div>
+</div>
+
+<div style="margin-top:18px">{body}</div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>口径</b>：平均前台价取利润行（商智成交额 ÷ 成交件数）；扣点后采购价 = ERP 到手结算价。
+     京东毛利/件 = 平均前台价 − 扣点后采购价；毛利率 = 京东毛利合计 ÷ 结算给我们的扣点后采购价合计。</p>
+  <p><b>毛保</b>：雨润禾常温品低于 10%、冷冻品低于 18% 触发。
+     需补利润 = 毛保线 × 结算采购额 − 实际毛利额，即京东要补到毛保线还差的利润。</p>
+  <p><b>温层判定</b>：已登记 SKU 按登记表；未登记的按商品名关键词（冷冻 / 速冻 / 解冻 / 薯条 / 什锦蔬菜 /
+     欧式杂菜 / 毛豆 / 青豆 / 纳豆 → 冷冻，冻干 → 常温），都没有按常温。</p>
+</div>
+
+</div></body></html>""")
 
 
 @app.post("/api/profit/run")
@@ -2722,6 +3155,989 @@ def api_profit_export(job: str | None = None, account: str | None = None,
         headers={"Content-Disposition": disp, "Cache-Control": "no-store"})
 
 
+# ================================================================ 团长招商活动
+ACTIVITY_CSS = """
+.acttabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 14px}
+.acttabs a{padding:6px 14px;border-radius:9999px;border:1px solid var(--hair);
+  color:var(--muted);text-decoration:none;font-size:12.5px;background:var(--canvas)}
+.acttabs a.on{background:var(--surface-card);color:var(--ink);border-color:var(--cream);font-weight:600}
+.actrow{display:grid;grid-template-columns:74px 1fr 64px 64px;gap:10px;align-items:center;
+  font-size:12.5px;padding:3px 0;border-bottom:1px dashed var(--hair2)}
+.actrow:last-child{border-bottom:none}
+.actrow .bar{height:10px;border-radius:9999px;background:var(--hair);overflow:hidden}
+.actrow .bar i{display:block;height:100%;background:var(--primary);border-radius:9999px}
+.actrow .n{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+.actsec{margin-top:26px;display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.actsec h2{font-family:var(--serif);font-weight:400;font-size:22px;color:var(--ink);margin:0}
+.actsec .hint{margin:0}
+td.sku{max-width:340px}
+td.sku .nm{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td.sku .sub,td.act .sub{font-size:11.5px;color:var(--muted2)}
+td.act{max-width:260px}
+td.act .nm{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td.act .sub{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tagb{display:inline-block;padding:1px 8px;border-radius:9999px;font-size:11px;font-weight:600;
+  white-space:nowrap}
+.tagb.on{background:var(--greenbg);color:var(--greenink)}
+.tagb.end{background:var(--soft);color:var(--muted)}
+.tagb.wait{background:var(--amberbg);color:var(--amberink)}
+.tagb.off{background:var(--redbg);color:var(--redink)}
+tr.rowlink{cursor:pointer}
+tr.rowlink:hover td{background:var(--soft)}
+tr.selrow td{background:#fbf1eb}
+/* 效果区紧凑化：5 个 KPI 一行、卡片留白收窄、表格行高压缩 */
+.grid.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
+#effectWrap .actsec{margin-top:18px}
+#effectWrap .kpi{padding:12px 14px}
+#effectWrap .kpi .lbl{font-size:11px}
+#effectWrap .kpi .val{font-size:22px}
+#effectWrap .kpi .sub{font-size:11.5px}
+#effectWrap .card{padding:16px 18px}
+#effectWrap .toolbar{margin-bottom:10px}
+#effectWrap th,#effectWrap td{padding:7px 9px;font-size:12.5px}
+#effectWrap .actrow{padding:2px 0}
+#effectWrap .tblwrap{max-height:320px}
+#effectWrap .acttabs{margin-bottom:8px}
+#effectWrap .acttabs a{padding:4px 12px;font-size:12px}
+#effectWrap .warn{margin:8px 0}
+.actctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+.actctl .toolbar{margin:0}
+.inpq{width:190px;height:30px;border:1px solid var(--hair);border-radius:8px;padding:0 10px;
+  font-size:12.5px;background:#fff;color:var(--ink);outline:none}
+.inpq:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(196,90,59,.10)}
+@media(max-width:1100px){.grid.g5{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:760px){.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))}}
+/* 报名日历（日历直觉）：行=周，列=周一~周日 */
+.hmwrap{display:flex;flex-direction:column;gap:18px;align-items:stretch}
+.hm{display:grid;grid-template-columns:52px repeat(7,34px);gap:5px;justify-content:start;
+  align-items:center}
+.hmhd{display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted)}
+.hmwk{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;
+  padding:0 2px;font-size:11px;font-weight:600;color:var(--strong);line-height:1.25;
+  white-space:nowrap}
+.hmwk span{font-weight:400;color:var(--muted2);font-size:9px}
+.hmcell{display:flex;justify-content:center;align-items:center;width:34px;height:34px;
+  padding:0 4px;border-radius:7px;border:1px solid var(--hair);text-decoration:none;
+  color:var(--ink);background:var(--soft);transition:transform .12s,box-shadow .12s}
+.hmcell .hmd{font-size:10px;color:var(--muted)}
+.hmcell .hmc{font-family:var(--serif);font-size:14px;line-height:1}
+.hmcell.lv0{background:var(--soft);color:var(--muted2)}
+.hmcell.lv1{background:#dcece1;border-color:#c7e0cf}
+.hmcell.lv2{background:#cfe6d5;border-color:#b4d9bf}
+.hmcell.lv3{background:#9ed3ac;border-color:#86c898}
+.hmcell.lv4{background:#5db872;border-color:#4aa463;color:#fff}
+.hmcell.lv4 .hmd{color:#eaf5ec}
+.hmcell.today{box-shadow:inset 0 0 0 2px var(--primary)}
+.hmcell.sel{outline:2px solid var(--primary);outline-offset:2px}
+.hmcell.future{border-style:dashed}
+.hmcell:hover{transform:translateY(-1px);box-shadow:var(--shadow-soft)}
+/* 近 21 天报名分布：日历下方单独一行 */
+.hmside{width:100%}
+.hmside-h{font-size:12px;font-weight:600;color:var(--strong);margin-bottom:12px}
+.hmchart{display:flex;align-items:flex-end;gap:4px;justify-content:space-between}
+.hmbar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;
+  min-width:0;max-width:34px}
+.hmbar i{display:block;width:100%;border-radius:3px 3px 0 0;background:var(--soft);
+  border:1px solid var(--hair);border-bottom:none}
+.hmbar i.lv1{background:#dcece1;border-color:#c7e0cf}
+.hmbar i.lv2{background:#cfe6d5;border-color:#b4d9bf}
+.hmbar i.lv3{background:#9ed3ac;border-color:#86c898}
+.hmbar i.lv4{background:#5db872;border-color:#4aa463}
+.hmbar i.today{box-shadow:inset 0 0 0 2px var(--primary)}
+.hmbar b{font-size:9.5px;font-weight:400;color:var(--muted2);line-height:14px}
+.hmbar .hmv{font-size:10px;font-weight:600;color:var(--muted);line-height:13px;height:13px}
+.hmmeta{display:flex;flex-wrap:wrap;gap:16px;margin-top:10px;font-size:11.5px;color:var(--muted)}
+.hmmeta b{color:var(--strong);font-weight:600}
+.hmfoot{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  flex-wrap:wrap;margin-top:12px}
+.hmleg{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--muted)}
+.hmleg i{display:block;width:14px;height:14px;border-radius:4px;border:1px solid var(--hair)}
+.hmleg i.lv0{background:var(--soft)}
+.hmleg i.lv1{background:#dcece1;border-color:#c7e0cf}
+.hmleg i.lv2{background:#cfe6d5;border-color:#b4d9bf}
+.hmleg i.lv3{background:#9ed3ac;border-color:#86c898}
+.hmleg i.lv4{background:#5db872;border-color:#4aa463}
+"""
+
+ACT_JS = r"""
+(function(){
+  var TIMER = null;
+  function tip(s, cls){
+    var el = document.getElementById('actTip');
+    if(!el) return;
+    el.className = 'note' + (cls ? ' ' + cls : '');
+    el.style.display = s ? 'block' : 'none';
+    el.textContent = s || '';
+  }
+  window.actRun = function(){
+    var b = document.getElementById('actRunBtn');
+    if(b){ b.disabled = true; b.textContent = '抓取中…'; }
+    tip('已提交抓取任务，等待后台执行…');
+    fetch('/api/activity/run', {method:'POST'}).then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){
+          tip('启动失败：' + (j.error || '未知错误'));
+          if(b){ b.disabled = false; b.textContent = '立即抓取'; }
+          return;
+        }
+        if(TIMER) clearInterval(TIMER);
+        TIMER = setInterval(poll, 3000);
+      }).catch(function(e){
+        tip('启动失败：' + e);
+        if(b){ b.disabled = false; b.textContent = '立即抓取'; }
+      });
+  };
+  function poll(){
+    fetch('/api/activity/status').then(function(r){ return r.json(); }).then(function(s){
+      if(s.active){ tip('抓取中：' + (s.progress || '执行中…')); return; }
+      if(TIMER){ clearInterval(TIMER); TIMER = null; }
+      var b = document.getElementById('actRunBtn');
+      if(b){ b.disabled = false; b.textContent = '立即抓取'; }
+      if(s.error){ tip('抓取失败：' + s.error); return; }
+      tip('抓取完成，正在刷新…');
+      setTimeout(function(){ location.reload(); }, 600);
+    }).catch(function(){});
+  }
+  if(window.ACT_RUNNING){ TIMER = setInterval(poll, 3000); }
+
+  // 报名明细整行可点：AJAX 局部刷新「活动效果」，不跳 URL、不刷新整页
+  function actParam(over){
+    var p = {}, base = window.ACT_CTX || {};
+    Object.keys(base).forEach(function(k){ p[k] = base[k]; });
+    Object.keys(over || {}).forEach(function(k){ p[k] = over[k]; });
+    var out = [];
+    Object.keys(p).forEach(function(k){
+      var v = p[k];
+      if(v !== '' && v !== null && v !== undefined){
+        out.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+      }
+    });
+    return out.join('&');
+  }
+  window.actLoad = function(opts, tr){
+    opts = opts || {};
+    var ctx = window.ACT_CTX || {};
+    var over = {act: ('act' in opts) ? opts.act : (ctx.act || ''),
+                sku: ('sku' in opts) ? opts.sku : (ctx.sku || '')};
+    if(opts.start || opts.end){
+      over.start = opts.start || '';
+      over.end = opts.end || '';
+      over.days = '';
+    } else if(opts.days){
+      over.days = String(opts.days);
+      over.start = '';
+      over.end = '';
+    }
+    var wrap = document.getElementById('effectWrap');
+    if(!wrap) return;
+    wrap.style.opacity = '.45';
+    fetch('/api/activity/effect?' + actParam(over))
+      .then(function(r){ return r.text(); })
+      .then(function(html){
+        wrap.innerHTML = html;
+        wrap.style.opacity = '1';
+        // 记住当前活动与区间，后续点行 / 切区间都沿用，不会回到“今天”
+        ctx.act = over.act;
+        ctx.sku = over.sku;
+        if('start' in over){ ctx.start = over.start; ctx.end = over.end; ctx.days = ''; }
+        if('days' in over){ ctx.days = over.days; ctx.start = ''; ctx.end = ''; }
+        var rs = document.querySelectorAll('tr.rowlink');
+        for(var i = 0; i < rs.length; i++){ rs[i].classList.remove('selrow'); }
+        if(tr){ tr.classList.add('selrow'); }
+        try{ wrap.scrollIntoView({behavior: 'smooth', block: 'start'}); }catch(e){}
+      })
+      .catch(function(){ wrap.style.opacity = '1'; });
+  };
+  window.actShowAll = function(){ window.actLoad({act: '', sku: ''}); };
+  window.actFilterRows = function(){
+    var box = document.getElementById('signupQ');
+    var tb = document.querySelector('#signup tbody');
+    if(!box || !tb) return;
+    var q = (box.value || '').trim().toLowerCase();
+    var rs = tb.querySelectorAll('tr'), n = 0;
+    for(var i = 0; i < rs.length; i++){
+      var tr = rs[i];
+      // 只匹配「商品」和「团长」两列
+      var txt = ((tr.cells[2] ? tr.cells[2].innerText : '') + ' ' +
+                 (tr.cells[4] ? tr.cells[4].innerText : '')).toLowerCase();
+      var ok = !q || txt.indexOf(q) >= 0;
+      tr.style.display = ok ? '' : 'none';
+      if(ok) n++;
+    }
+    var c = document.getElementById('signupCount');
+    if(c) c.textContent = n;
+  };
+  window.actRange = function(d){ window.actLoad({days: d}); };
+  window.actRangeCustom = function(){
+    var wrap = document.getElementById('effectWrap');
+    if(!wrap) return;
+    var form = wrap.querySelector('form');
+    if(!form) return;
+    var s = form.querySelector('input[name="start"]');
+    var e = form.querySelector('input[name="end"]');
+    if(!s || !e || !s.value || !e.value) return;
+    window.actLoad({start: s.value, end: e.value});
+  };
+  document.querySelectorAll('tr.rowlink[data-act]').forEach(function(tr){
+    tr.addEventListener('click', function(e){
+      if(e.target.closest('a,button,input,select')) return;
+      e.preventDefault();
+      var s = tr.getAttribute('data-start') || '';
+      var en = tr.getAttribute('data-end') || '';
+      var opts = {act: tr.getAttribute('data-act'), sku: tr.getAttribute('data-sku')};
+      if(s && en){ opts.start = s; opts.end = en; }   // 直接定位到该商品的活动起止
+      window.actLoad(opts, tr);
+    });
+  });
+})();
+"""
+
+
+def _an(v, digits: int = 0) -> str:
+    try:
+        f = float(v or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if digits:
+        return f"{f:,.{digits}f}"
+    return f"{int(round(f)):,}"
+
+
+def _amoney(v) -> str:
+    return _an(v, 2)
+
+
+def _act_sku_names(keys: list) -> dict:
+    """从本地商智商品明细拼 skuId→商品名（报名日志里只有 SKU）。"""
+    names: dict = {}
+    for key in keys:
+        try:
+            days = ds.days_for(key, "sz_product")[-7:]
+        except Exception:  # noqa: BLE001
+            days = []
+        for day in reversed(days):
+            payload = ds.load_day(key, day, "sz_product") or {}
+            for r in payload.get("rows") or []:
+                sid = str(r.get("sku_id") or "").strip()
+                if sid and sid != "合计" and r.get("name"):
+                    names.setdefault(sid, str(r.get("name")))
+    return names
+
+
+def _act_status(start: str, end: str) -> tuple:
+    day = _today().isoformat()
+    if start and day < start:
+        return ("未开始", "wait")
+    if end and day > end:
+        return ("已结束", "end")
+    if start or end:
+        return ("进行中", "on")
+    return ("—", "end")
+
+
+@app.get("/activity", response_class=HTMLResponse)
+def activity_page(request: Request):
+    q = request.query_params
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS}
+    sel = q.get("account") or ""
+    acc_keys = [sel] if sel in keys else keys
+
+    # 效果区间：默认昨天；支持 days=1/7/30 或自定义 start/end
+    start, end = resolve_range(q.get("start"), q.get("end"), q.get("days") or 1)
+    since = q.get("since") or (_today() - dt.timedelta(days=90)).isoformat()
+    kw = (q.get("q") or "").strip()
+    union_sel = q.get("union") or ""
+
+    signups = activity.load_signups(acc_keys, since=since)
+    acts = activity.load_activities(acc_keys)
+    items, unions = acts.get("items") or {}, acts.get("unions") or {}
+    sku_names = _act_sku_names(acc_keys)
+
+    # 团长筛选选项（报名记录里出现过的 + 本地活动快照里的）
+    union_opts = {}
+    for r in signups:
+        uid = str(r.get("cpUnionId") or "")
+        if uid:
+            union_opts[uid] = r.get("cpUnionName") or (unions.get(uid) or {}).get("name") or uid
+    for uid, u in unions.items():
+        union_opts.setdefault(uid, u.get("name") or uid)
+
+    # 报名日历：start = 按该商品活动开始日（含未来/预报名），signup = 按报名操作时间
+    hm_mode = q.get("hm") if q.get("hm") in ("start", "signup") else "start"
+    day_sel = (q.get("day") or "").strip()
+    act_sel = (q.get("act") or "").strip()
+    sku_sel = (q.get("sku") or "").strip()
+
+    filtered = []
+    for r in signups:
+        if union_sel and str(r.get("cpUnionId") or "") != union_sel:
+            continue
+        name = sku_names.get(str(r.get("skuId"))) or ""
+        hay = " ".join(str(r.get(x) or "") for x in
+                       ("skuId", "activityName", "activityId", "cpUnionName", "activityName"))
+        if kw and kw.lower() not in (hay + " " + name).lower():
+            continue
+        filtered.append((r, name))
+
+    def _hm_day(r) -> str:
+        if hm_mode == "signup":
+            return str(r.get("optTime") or "")[:10]
+        return str(r.get("startDate") or "")
+
+    hm_counts: dict = {}
+    for r, _n in filtered:
+        d = _hm_day(r)
+        if d:
+            hm_counts[d] = hm_counts.get(d, 0) + 1
+
+    # 点击报名行 → 只看这个活动的数据（按该活动报名过的 SKU 归集）
+    act_all = [r for r in signups if str(r.get("activityId")) == act_sel] if act_sel else []
+    act_skus = {str(r.get("skuId")) for r in act_all if r.get("skuId")}
+    if sku_sel:
+        act_skus.add(sku_sel)
+    act_info = (items.get(act_sel) or {}) if act_sel else {}
+    act_union_ids = {str(r.get("cpUnionId")) for r in act_all if r.get("cpUnionId")}
+    if act_info.get("cpUnionId"):
+        act_union_ids.add(str(act_info["cpUnionId"]))
+    act_title = act_info.get("title") or (act_all[0].get("activityName") if act_all else "") or sku_sel
+
+    rows = filtered
+    if act_sel:
+        rows = [(r, n) for r, n in rows if str(r.get("activityId")) == act_sel]
+    if day_sel:
+        rows = [(r, n) for r, n in rows if _hm_day(r) == day_sel]
+
+    n_sku = len({r.get("skuId") for r, _ in rows})
+    n_union = len({r.get("cpUnionId") for r, _ in rows if r.get("cpUnionId")})
+    n_act = len({r.get("activityId") for r, _ in rows})
+
+    # ---- 近 21 天报名日历（上周 / 本周 / 下周）----
+    from urllib.parse import quote
+    today_iso = _today().isoformat()
+    monday = _today() - dt.timedelta(days=_today().weekday())
+    weeks = [monday - dt.timedelta(days=7), monday, monday + dt.timedelta(days=7)]
+    wk_labels = ["上周", "本周", "下周"]
+    days_q = q.get("days") or ""
+
+    def _qlink(**over) -> str:
+        base = {"account": sel, "since": since, "q": kw, "union": union_sel,
+                "days": days_q, "hm": hm_mode, "day": day_sel,
+                "act": act_sel, "sku": sku_sel}
+        base.update(over)
+        return "?" + "&".join(f"{k}={quote(str(v))}" for k, v in base.items()
+                              if v not in (None, ""))
+
+    max_c = max([hm_counts.get((ws + dt.timedelta(days=i)).isoformat(), 0)
+                 for ws in weeks for i in range(7)] or [0]) or 1
+    wd_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    # 横向日历：表头周一到周日，下面三行分别是上周 / 本周 / 下周
+    hm_head = '<div class="hmhd"></div>' + "".join(
+        f'<div class="hmhd">{wd}</div>' for wd in wd_names)
+    hm_cells = ""
+    for lab, ws in zip(wk_labels, weeks):
+        hm_cells += (f'<div class="hmwk" title="{ws.isoformat()} ~ '
+                     f'{(ws + dt.timedelta(days=6)).isoformat()}">{lab}'
+                     f'<span>{ws.month:02d}/{ws.day:02d}</span></div>')
+        for i in range(7):
+            d = ws + dt.timedelta(days=i)
+            ds_iso = d.isoformat()
+            c = hm_counts.get(ds_iso, 0)
+            lv = 0 if not c else max(1, min(4, int(round(c / max_c * 4)) or 1))
+            cls = f"lv{lv}"
+            if ds_iso == today_iso:
+                cls += " today"
+            if ds_iso == day_sel:
+                cls += " sel"
+            if ds_iso > today_iso:
+                cls += " future"
+            href = _qlink(day="" if ds_iso == day_sel else ds_iso) + "#signup"
+            tip = f"{ds_iso} · {c} 条报名" + ("（未来开始，预报名）" if ds_iso > today_iso else "")
+            hm_cells += (f'<a class="hmcell {cls}" href="{href}" title="{_e(tip)}">'
+                         f'<span class="hmd">{d.day}</span></a>')
+
+    # 右侧：近 21 天报名分布条 + 概览
+    days_all = [weeks[0] + dt.timedelta(days=i) for i in range(21)]
+    bars = []
+    for d in days_all:
+        ds_iso = d.isoformat()
+        c = hm_counts.get(ds_iso, 0)
+        lv = 0 if not c else max(1, min(4, int(round(c / max_c * 4)) or 1))
+        cls = f"lv{lv}" if c else "lv0"
+        if ds_iso == today_iso:
+            cls += " today"
+        hpx = max(3, round(c / max_c * 118)) if c else 3
+        tip = f"{ds_iso} · {c} 条报名" + ("（未来开始，预报名）" if ds_iso > today_iso else "")
+        bars.append(f'<div class="hmbar" title="{_e(tip)}">'
+                    f'<b class="hmv">{c if c else ""}</b>'
+                    f'<i class="{cls}" style="height:{hpx}px"></i>'
+                    f'<b>{d.day}</b></div>')
+    active_days = sum(1 for d in days_all if hm_counts.get(d.isoformat(), 0))
+    week_cnt = sum(hm_counts.get((monday + dt.timedelta(days=i)).isoformat(), 0)
+                   for i in range(7))
+    peak = max(days_all, key=lambda d: hm_counts.get(d.isoformat(), 0), default=None)
+    peak_c = hm_counts.get(peak.isoformat(), 0) if peak else 0
+    peak_txt = f"峰值 {peak.isoformat()[5:]} · {peak_c} 条" if peak_c else "暂无报名"
+    hm_side = (
+        '<div class="hmside">'
+        '<div class="hmside-h">近 21 天报名分布</div>'
+        f'<div class="hmchart">{"".join(bars)}</div>'
+        '<div class="hmmeta">'
+        f'<span>本周 <b>{week_cnt}</b> 条</span>'
+        f'<span>有报名 <b>{active_days}</b> 天</span>'
+        f'<span>{peak_txt}</span></div></div>')
+
+    total_hm = sum(hm_counts.values())
+    future_cnt = (sum(1 for r, _n in filtered
+                      if str(r.get("startDate") or "") > today_iso) if hm_mode == "start" else 0)
+    no_start = (sum(1 for r, _n in filtered if not r.get("startDate"))
+                if hm_mode == "start" else 0)
+    hm_tabs = (
+        f'<a class="chip{" on" if hm_mode == "start" else ""}" '
+        f'href="{_qlink(hm="start", day="")}">按活动开始日（含预报名）</a>'
+        f'<a class="chip{" on" if hm_mode == "signup" else ""}" '
+        f'href="{_qlink(hm="signup", day="")}">按报名时间</a>')
+    hm_card = (
+        '<div class="card" style="margin-top:16px">'
+        '<div class="toolbar" style="justify-content:space-between;margin-bottom:12px">'
+        f'<div><b>报名日历</b> <span class="hint" style="margin:0">近 21 天 · 共 {total_hm} 条'
+        f'{"（未来开始 " + str(future_cnt) + " 条预报名）" if future_cnt else ""}</span></div>'
+        f'<div class="toolbar" style="margin:0">{hm_tabs}</div></div>'
+        f'<div class="hmwrap"><div class="hm">{hm_head}{hm_cells}</div>{hm_side}</div>'
+        '<div class="hmfoot"><span class="hint" style="margin:0">点击格子筛选当天明细，再点一次取消；'
+        '虚线格 = 未来日期（预报名）'
+        + (f'；官方活动无开始日，未计入 {no_start} 条' if no_start and hm_mode == "start" else "")
+        + '</span><span class="hmleg">少 <i class="lv0"></i><i class="lv1"></i>'
+        '<i class="lv2"></i><i class="lv3"></i><i class="lv4"></i> 多</span></div>'
+        '</div>')
+
+    # ---- 报名明细 ----
+    trs = []
+    for r, name in rows[:800]:
+        st_txt, st_cls = _act_status(r.get("startDate") or "", r.get("endDate") or "")
+        act_sub = ""
+        if r.get("actStart") or r.get("actEnd"):
+            act_sub = (f'<span class="sub">活动期 {_e(r.get("actStart") or "?")} ~ '
+                       f'{_e(r.get("actEnd") or "?")}</span>')
+        union_txt = r.get("cpUnionName") or ""
+        if not union_txt and r.get("cpUnionId"):
+            union_txt = (unions.get(str(r.get("cpUnionId"))) or {}).get("name") or ""
+        union_id_html = (f'<br><span class="sub">ID {_e(r.get("cpUnionId"))}</span>'
+                         if r.get("cpUnionId") else "")
+        trs.append(
+            f'<tr class="rowlink{" selrow" if str(r.get("activityId")) == act_sel and str(r.get("skuId")) == sku_sel else ""}"'
+            f' data-act="{_e(r.get("activityId"))}" data-sku="{_e(r.get("skuId"))}"'
+            f' data-start="{_e(r.get("startDate") or "")}" data-end="{_e(r.get("endDate") or "")}"'
+            f' data-href="{_e(_qlink(act=r.get("activityId"), sku=r.get("skuId")))}#effect">'
+            f'<td class="n mono" style="white-space:nowrap">{_e(str(r.get("optTime") or "")[5:16])}</td>'
+            f'<td class="l">{_e(r.get("accountLabel") or labels.get(r.get("account"), ""))}</td>'
+            f'<td class="l sku"><span class="nm" title="{_e(name)}">{_e(name or "—")}</span>'
+            f'<span class="sub">SKU {_e(r.get("skuId"))}</span></td>'
+            f'<td class="l act"><span class="nm">{_e(r.get("activityName") or "—")}</span>'
+            f'<span class="sub">ID {_e(r.get("activityId"))}'
+            f'{" · 官方活动" if r.get("official") else ""}</span>{act_sub}</td>'
+            f'<td class="l">{_e(union_txt or "—")}{union_id_html}</td>'
+            f'<td class="n" style="white-space:nowrap">{_e(r.get("startDate") or "—")}'
+            f'<br><span class="sub">至 {_e(r.get("endDate") or "—")}</span></td>'
+            f'<td class="n">{_e(r.get("commission") if r.get("commission") is not None else "—")}%'
+            f'<br><span class="sub">服务费 {_e(r.get("serviceFee") if r.get("serviceFee") is not None else "—")}%</span></td>'
+            f'<td class="n"><span class="tagb {st_cls}">{st_txt}</span></td>'
+            '</tr>')
+    if not trs:
+        trs.append('<tr><td colspan="8" class="l hint" style="padding:18px">'
+                   '本地还没有报名记录。点右上角「立即抓取」，或等凌晨自动任务抓完后刷新。</td></tr>')
+
+    day_note = ""
+    if day_sel:
+        metric = "活动开始" if hm_mode == "start" else "报名时间"
+        day_note = (f' · <b>{metric} {_e(day_sel)}</b> '
+                    f'<a class="btn ghost mini" href="{_qlink(day="")}">清除筛选</a>')
+    act_note = ""
+    if act_sel:
+        act_note = (f' · <b>活动 {_e(act_title)}</b> '
+                    f'<a class="btn ghost mini" href="{_qlink(act="", sku="")}">查看全部</a>')
+    signup_card = (
+        '<div class="card" id="signup">'
+        '<div class="toolbar" style="justify-content:space-between">'
+        '<div><b>报名明细</b> <span class="hint" style="margin:0">'
+        f'<span id="signupCount">{len(rows)}</span> 条 · 报名时间 ≥ {_e(since)}'
+        f'{" · 关键词「" + _e(kw) + "」" if kw else ""}{act_note}{day_note}</span></div>'
+        '<div style="display:flex;gap:10px;align-items:center">'
+        '<input id="signupQ" class="inpq" placeholder="搜商品 / 团长" oninput="actFilterRows()">'
+        '<span class="hint" style="margin:0">点击任意一行 → 查看该活动自己的效果数据</span></div></div>'
+        '<div class="tblwrap long" style="max-height:64vh"><table><thead><tr>'
+        '<th class="l">报名时间</th><th class="l">账号</th><th class="l">商品</th>'
+        '<th class="l">活动</th><th class="l">团长</th><th class="n">活动起止（该商品）</th>'
+        '<th class="n">佣金 / 服务费</th><th class="n">状态</th>'
+        '</tr></thead><tbody>' + "".join(trs) + '</tbody></table></div></div>')
+
+    # ---- 效果数据 ----
+    perf = activity.load_perf(acc_keys, start, end)
+    days = perf.get("days") or []
+    tot = {"click": 0.0, "order": 0.0, "gmv": 0.0, "fee": 0.0}
+    cp_map: dict = {}
+    sku_map: dict = {}
+    daily: dict = {}
+    daily_act: dict = {}
+    for d in days:
+        s = d.get("summary") or {}
+        tot["click"] += float(s.get("clickCnt") or 0)
+        tot["order"] += float(s.get("inOrderCnt") or 0)
+        day = d.get("date") or ""
+        cur = daily.setdefault(day, {"click": 0.0, "order": 0.0})
+        cur["click"] += float(s.get("clickCnt") or 0)
+        cur["order"] += float(s.get("inOrderCnt") or 0)
+        for row in d.get("cp") or []:
+            uid = str(row.get("cpUnionId") or "")
+            e = cp_map.setdefault(uid, {"name": row.get("cpUnionName") or
+                                       (unions.get(uid) or {}).get("name") or uid,
+                                       "accounts": set(), "click": 0.0, "order": 0.0,
+                                       "gmv": 0.0, "fee": 0.0, "skus": set()})
+            e["accounts"].add(d.get("account") or "")
+            e["click"] += float(row.get("clickCnt") or 0)
+            e["order"] += float(row.get("estimateOrderCnt") or 0)
+            e["gmv"] += float(row.get("estimateGMV") or 0)
+            e["fee"] += float(row.get("estimateFee") or 0)
+            for spu in row.get("spuList") or []:
+                e["skus"].add(str(spu))
+        for row in d.get("sku") or []:
+            sid = str(row.get("skuId") or "")
+            e = sku_map.setdefault(sid, {"name": row.get("skuName") or sku_names.get(sid) or sid,
+                                         "click": 0.0, "order": 0.0, "gmv": 0.0,
+                                         "fee": 0.0, "unions": set()})
+            e["click"] += float(row.get("clickCnt") or 0)
+            e["order"] += float(row.get("estimateOrderCnt") or 0)
+            e["gmv"] += float(row.get("estimateGMV") or 0)
+            e["fee"] += float(row.get("estimateFee") or 0)
+            if float(row.get("estimateOrderCnt") or 0) > 0:
+                e["unions"].add(str(d.get("account")))
+            if act_sel and sid in act_skus:
+                ca = daily_act.setdefault(day, {"click": 0.0, "order": 0.0})
+                ca["click"] += float(row.get("clickCnt") or 0)
+                ca["order"] += float(row.get("estimateOrderCnt") or 0)
+        tot["gmv"] += sum(float(r.get("estimateGMV") or 0) for r in d.get("sku") or [])
+        tot["fee"] += sum(float(r.get("estimateFee") or 0) for r in d.get("sku") or [])
+
+    sku_items = [(sid, e) for sid, e in sku_map.items()
+                 if not act_sel or sid in act_skus]
+    cp_items = [(uid, e) for uid, e in cp_map.items()
+                if not act_sel or uid in act_union_ids]
+
+    # 活动视图优先用订单明细：每单带 cpActId，能精确算“这个活动自己的订单/GMV/费用”
+    act_ord = None
+    order_days: dict = {}
+    order_cov = 0
+    if act_sel:
+        odata = activity.load_orders(acc_keys, start, end)
+        order_cov = len({x.get("date") for x in odata.get("days") or []})
+        if order_cov:
+            act_ord = {"orders": 0, "qty": 0, "gmv": 0.0, "fee": 0.0, "skus": {}}
+            for x in odata["days"]:
+                a = (x.get("acts") or {}).get(act_sel)
+                if not a:
+                    continue
+                day = x.get("date") or ""
+                day_fee = float(a.get("cosFee") or 0) + float(a.get("cpFee") or 0)
+                act_ord["orders"] += int(a.get("orders") or 0)
+                act_ord["qty"] += int(a.get("qty") or 0)
+                act_ord["gmv"] += float(a.get("gmv") or 0)
+                act_ord["fee"] += day_fee
+                dcur = order_days.setdefault(day, {"orders": 0.0, "gmv": 0.0})
+                dcur["orders"] += int(a.get("orders") or 0)
+                dcur["gmv"] += float(a.get("gmv") or 0)
+                for sid, sk in (a.get("skus") or {}).items():
+                    sid = str(sid)
+                    e = act_ord["skus"].setdefault(sid, {
+                        "name": sk.get("name") or sku_names.get(sid) or sid,
+                        "orders": 0, "qty": 0, "gmv": 0.0, "fee": 0.0})
+                    e["orders"] += int(sk.get("orders") or 0)
+                    e["qty"] += int(sk.get("qty") or 0)
+                    e["gmv"] += float(sk.get("gmv") or 0)
+                    e["fee"] += float(sk.get("cosFee") or 0) + float(sk.get("cpFee") or 0)
+    use_orders = bool(act_sel and act_ord is not None)
+    if act_sel and not use_orders:
+        # 没有订单明细缓存时，退回按“报名商品”维度估算
+        tot = {
+            "click": sum(e["click"] for _sid, e in sku_items),
+            "order": sum(e["order"] for _sid, e in sku_items),
+            "gmv": sum(e["gmv"] for _sid, e in sku_items),
+            "fee": sum(e["fee"] for _sid, e in sku_items),
+        }
+    roi = (tot["gmv"] / tot["fee"]) if tot["fee"] else 0.0
+    act_roi = ((act_ord["gmv"] / act_ord["fee"]) if (act_ord and act_ord["fee"]) else 0.0)
+    act_sku_cnt = len([e for e in (act_ord or {}).get("skus", {}).values() if e["orders"] > 0])
+    n_order_union = len([e for _u, e in cp_items if e["order"] > 0])
+    n_order_sku = len([e for _s, e in sku_items if e["order"] > 0])
+
+    trend_src = order_days if use_orders else (daily_act if act_sel else daily)
+    day_rows = []
+    max_order = max([v.get("orders", v.get("order", 0)) for v in trend_src.values()] or [0]) or 1
+    for day in ds.day_span(start, end):
+        v = trend_src.get(day) or {"orders": 0.0, "order": 0.0, "click": 0.0, "gmv": 0.0}
+        od = v.get("orders", v.get("order", 0))
+        w = 0 if not od else max(int(round(od / max_order * 100)), 3)
+        right = _amoney(v.get("gmv") or 0) if use_orders else f'{_an(v.get("click") or 0)} 点'
+        day_rows.append(
+            f'<div class="actrow"><div>{day[5:]}</div>'
+            f'<div class="bar"><i style="width:{w}%"></i></div>'
+            f'<div class="n">{_an(od)} 单</div>'
+            f'<div class="n">{right}</div></div>')
+    trend_hint = ("条形 = 该活动有效订单量；右侧为 GMV（订单明细口径）" if use_orders
+                  else "条形 = 预估订单量；右侧为点击量")
+    trend_card = ('<div class="card"><h3 style="margin-top:0">每日走势</h3>'
+                  f'<div class="hint">{trend_hint}</div>'
+                  + "".join(day_rows) + '</div>')
+
+    cp_rows = sorted(cp_items, key=lambda kv: kv[1]["gmv"], reverse=True)
+    cp_html = "".join(
+        '<tr>'
+        f'<td class="l">{_e(e["name"])}<span class="sub">ID {_e(uid)}</span></td>'
+        f'<td class="l">{_e(" / ".join(sorted(labels.get(k, k) for k in e["accounts"] if k)))}</td>'
+        f'<td class="n">{_an(e["click"])}</td><td class="n">{_an(e["order"])}</td>'
+        f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
+        f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td>'
+        f'<td class="n">{len(e["skus"])}</td></tr>'
+        for uid, e in cp_rows) or (
+        '<tr><td colspan="8" class="l hint" style="padding:18px">'
+        + (('该团长在所选区间没有出单数据' if act_union_ids
+            else '该活动没有团长归因（官方活动）') if act_sel else '该区间没有出单团长数据')
+        + '</td></tr>')
+
+    if use_orders:
+        sku_head = ('<th class="l">商品</th><th class="n">订单量</th><th class="n">件数</th>'
+                    '<th class="n">预估 GMV</th><th class="n">预估费用</th><th class="n">ROI</th>')
+        _ord_rows = sorted((act_ord or {}).get("skus", {}).items(),
+                           key=lambda kv: kv[1]["gmv"], reverse=True)
+        sku_html = "".join(
+            '<tr>'
+            f'<td class="l sku"><span class="nm" title="{_e(e["name"])}">{_e(e["name"])}</span>'
+            f'<span class="sub">SKU {_e(sid)}</span></td>'
+            f'<td class="n">{_an(e["orders"])}</td><td class="n">{_an(e["qty"])}</td>'
+            f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
+            f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td></tr>'
+            for sid, e in _ord_rows) or (
+            '<tr><td colspan="6" class="l hint" style="padding:18px">'
+            '该活动在所选区间没有有效订单</td></tr>')
+    else:
+        sku_head = ('<th class="l">商品</th><th class="n">点击量</th><th class="n">预估订单</th>'
+                    '<th class="n">预估 GMV</th><th class="n">预估费用</th><th class="n">ROI</th>'
+                    '<th class="n">出单团长数</th>')
+        sku_rows = sorted(sku_items, key=lambda kv: kv[1]["gmv"], reverse=True)
+        sku_html = "".join(
+            '<tr>'
+            f'<td class="l sku"><span class="nm" title="{_e(e["name"])}">{_e(e["name"])}</span></td>'
+            f'<td class="n">{_an(e["click"])}</td><td class="n">{_an(e["order"])}</td>'
+            f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
+            f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td>'
+            f'<td class="n">{len(e["unions"])}</td></tr>'
+            for _sid, e in sku_rows) or (
+            '<tr><td colspan="7" class="l hint" style="padding:18px">'
+            + ('该活动报名的商品在这个区间没有出单' if act_sel else '该区间没有商品出单数据')
+            + '</td></tr>')
+
+    # 活动视图的标题与横幅
+    eff_title = "活动效果"
+    eff_hint = f"{_e(start)} ~ {_e(end)} · 出单概览 / 出单团长 / 商品效果（按天累加）"
+    cp_title = "出单团长"
+    sku_title = "商品效果"
+    act_banner = ""
+    if act_sel:
+        unames = "、".join((unions.get(u) or {}).get("name") or u
+                           for u in sorted(act_union_ids)) or "—"
+        period = ""
+        if act_info.get("startTime") or act_info.get("endTime"):
+            period = f" · 活动期 {act_info.get('startTime') or '?'} ~ {act_info.get('endTime') or '?'}"
+        cp_tot = {"click": 0.0, "order": 0.0, "gmv": 0.0, "fee": 0.0}
+        for _u, e in cp_items:
+            for k in cp_tot:
+                cp_tot[k] += e[k]
+        if cp_items:
+            cp_roi = cp_tot["gmv"] / cp_tot["fee"] if cp_tot["fee"] else 0
+            only_union = sorted(act_union_ids)[0] if len(act_union_ids) == 1 else ""
+            cp_link = (f' <a class="btn ghost mini" href="{_qlink(act="", sku="", union=only_union)}">'
+                       '只看团长 →</a>') if only_union else ""
+            cp_line = (f"所属团长整体（团长诊断口径，含其他活动）：{_an(cp_tot['click'])} 点击 · "
+                       f"{_an(cp_tot['order'])} 单 · GMV {_amoney(cp_tot['gmv'])} · "
+                       f"费用 {_amoney(cp_tot['fee'])} · ROI {_an(cp_roi, 2)}{cp_link}")
+        else:
+            cp_line = "所属团长在所选区间没有出单数据"
+        eff_title = "活动效果 · " + _e(act_title)
+        if use_orders:
+            eff_hint = (f"{_e(start)} ~ {_e(end)} · 订单明细按活动ID精确归集"
+                        f"（覆盖 {order_cov} 天）")
+            sku_title = "商品效果（该活动有效订单）"
+        else:
+            eff_hint = (f"{_e(start)} ~ {_e(end)} · 暂无订单明细缓存，"
+                        f"按系统记录的报名商品（{len(act_skus)} 个）估算")
+            sku_title = "商品效果（系统记录的该活动报名商品）"
+        cp_title = "出单团长（该团长整体，含其他活动）"
+        banner_note = ("点击/订单/GMV/费用来自订单明细（每单按 cpActId 归集到本活动）；"
+                       "团长表是该团长整体数据，含其他活动。")
+        if not use_orders:
+            banner_note = ("当前区间没有订单明细缓存，先按系统记录的报名商品估算；"
+                           "团长表是该团长整体数据。")
+        act_banner = (
+            '<div class="card" id="effect" style="margin-top:16px;border-color:var(--primary)">'
+            '<div class="toolbar" style="justify-content:space-between;margin-bottom:4px">'
+            f'<div><b>正在查看：{_e(act_title)}</b>'
+            f'<span class="hint" style="margin:0"> · 活动ID {_e(act_sel)} · 团长 {_e(unames)}{_e(period)}</span></div>'
+            f'<div style="display:flex;gap:8px"><a class="btn ghost mini" href="#signup">看报名明细 ↑</a>'
+            '<a class="btn sec mini" href="javascript:void(0)" '
+            'onclick="actShowAll();return false;">查看全部</a></div></div>'
+            f'<div class="hint" style="margin:0">{banner_note}</div>'
+            f'<div class="hint" style="margin:6px 0 0;color:var(--ink)">{cp_line}</div>'
+            '</div>')
+
+    acc_opts = '<option value="">全部账号</option>' + "".join(
+        f'<option value="{_e(k)}"{" selected" if k == sel else ""}>{_e(labels[k])}</option>'
+        for k in keys)
+    union_list_opts = '<option value="">全部团长</option>' + "".join(
+        f'<option value="{_e(uid)}"{" selected" if uid == union_sel else ""}>{_e(name)}</option>'
+        for uid, name in sorted(union_opts.items(), key=lambda kv: kv[1]))
+
+    days_param = q.get("days") or ("1" if (start == end and end == _yesterday().isoformat()) else "")
+    chips = []
+    for d, lab in ((1, "昨天"), (7, "近 7 天"), (30, "近 30 天")):
+        on = " on" if str(days_param) == str(d) else ""
+        chips.append(f'<a class="chip{on}" href="javascript:void(0)" data-days="{d}" '
+                     f'onclick="actRange({d});return false;">{lab}</a>')
+
+    last_state = {}
+    for k in acc_keys:
+        st = activity._read(activity.acct_dir(k) / "state.json", {}) if k else {}
+        if st.get("lastRun") and (not last_state.get("lastRun")
+                                  or st["lastRun"] > last_state["lastRun"]):
+            last_state = st
+    run_state = activity.runtime_status()
+    wait_days = max(len(ds.day_span(start, end)) - len({d.get("date") for d in days}), 0)
+    warn = ""
+    if not days:
+        warn = ('<div class="warn">本地还没有这个区间的效果数据。点「立即抓取」补抓，'
+                '或等凌晨自动任务；默认只回刷最近 '
+                f'{settings.REFRESH_DAYS} 天。</div>')
+    elif wait_days:
+        warn = (f'<div class="hint">该区间有 {wait_days} 天还没有效果数据（可能超出回刷窗口）。</div>')
+    act_warn = ""
+    if act_sel and act_info:
+        a_s = str(act_info.get("startTime") or "")
+        a_e = str(act_info.get("endTime") or "")
+        if a_s and a_e and (a_e < start or a_s > end):
+            act_warn = (f'<div class="hint">该活动期为 {_e(a_s)} ~ {_e(a_e)}，与当前统计区间 '
+                        f'{_e(start)} ~ {_e(end)} 不重叠；可切换「近 30 天」或自定义区间查看。</div>')
+    act_zero = ""
+    if use_orders and act_ord["orders"] == 0:
+        act_zero = (f'<div class="warn">该活动在 {_e(start)} ~ {_e(end)} 没有有效订单'
+                    '（订单明细口径，已按活动ID精确归集）。'
+                    '若活动刚开始/还没开始，0 属正常；可切换更长区间查看。</div>')
+    elif act_sel and not use_orders and tot["click"] == 0 and tot["order"] == 0:
+        act_zero = (f'<div class="warn">系统记录的该活动报名商品在 {_e(start)} ~ {_e(end)} 没有出单'
+                    '（活动可能刚开始、还没开始，或这段时间没有推客成交）。'
+                    '上面的 KPI 为 0 属正常；可切换「近 30 天」看更长区间，'
+                    '或参考横幅里的「所属团长整体」数据。</div>')
+    order_warn = ""
+    if act_sel:
+        total_days = len(ds.day_span(start, end))
+        if use_orders and order_cov < total_days:
+            order_warn = (f'<div class="hint">订单明细覆盖 {order_cov}/{total_days} 天'
+                          f'（夜间只回刷最近 {settings.REFRESH_DAYS} 天），更早的日期没有活动维度数据。</div>')
+        elif not use_orders:
+            order_warn = ('<div class="hint">该区间没有订单明细缓存，活动数据暂按报名商品维度估算；'
+                          f'切换近 {settings.REFRESH_DAYS} 天或点「立即抓取」可拿到精确的活动订单。</div>')
+
+    if use_orders:
+        kpi_html = (
+            '<div class="grid g5" style="margin-top:12px">'
+            f'<div class="kpi"><div class="lbl">出单商品数</div><div class="val">{act_sku_cnt}</div>'
+            '<div class="sub">该活动有效订单</div></div>'
+            f'<div class="kpi"><div class="lbl">引入订单量</div><div class="val">{_an(act_ord["orders"])}</div>'
+            f'<div class="sub">件数 {_an(act_ord["qty"])}</div></div>'
+            f'<div class="kpi"><div class="lbl">预估 GMV</div><div class="val">{_amoney(act_ord["gmv"])}</div>'
+            '<div class="sub">商品金额合计</div></div>'
+            f'<div class="kpi"><div class="lbl">预估费用</div><div class="val">{_amoney(act_ord["fee"])}</div>'
+            '<div class="sub">佣金 + 团长服务费</div></div>'
+            f'<div class="kpi"><div class="lbl">ROI</div><div class="val">{_an(act_roi, 2)}</div>'
+            '<div class="sub">GMV ÷ 预估费用</div></div>'
+            '</div>')
+    else:
+        kpi_html = (
+            '<div class="grid g5" style="margin-top:12px">'
+            f'<div class="kpi"><div class="lbl">点击量</div><div class="val">{_an(tot["click"])}</div></div>'
+            f'<div class="kpi"><div class="lbl">引入订单量</div><div class="val">{_an(tot["order"])}</div>'
+            f'<div class="sub">出单团长 {n_order_union} · 出单商品 {n_order_sku}</div></div>'
+            f'<div class="kpi"><div class="lbl">预估 GMV</div><div class="val">{_amoney(tot["gmv"])}</div></div>'
+            f'<div class="kpi"><div class="lbl">预估费用</div><div class="val">{_amoney(tot["fee"])}</div>'
+            '<div class="sub">佣金 + 团长服务费</div></div>'
+            f'<div class="kpi"><div class="lbl">ROI</div><div class="val">{_an(roi, 2)}</div>'
+            '<div class="sub">GMV ÷ 预估费用</div></div>'
+            '</div>')
+
+    act_ctx_json = json.dumps({
+        "account": sel, "since": since, "q": kw, "union": union_sel,
+        "hm": hm_mode, "day": day_sel, "start": start, "end": end,
+        "days": days_param or "", "act": act_sel, "sku": sku_sel,
+    }, ensure_ascii=False).replace("</", "<\\/")
+
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>团长招商活动 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{ACTIVITY_CSS}</style>
+</head><body>
+{report2.navtop("/activity")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}团长招商</div>
+  <h1>团长招商活动 · 报名与效果</h1>
+  <div class="metaline">
+    <span>报名明细来自操作日志「活动」(businessType=32)</span><span class="dot"></span>
+    <span>效果来自团长招商页 · 团长诊断</span><span class="dot"></span>
+    <span>每天 {settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d} 自动抓取</span>
+  </div>
+  <div class="actions">
+    <button class="btn" id="actRunBtn" onclick="actRun()">立即抓取</button>
+    <a class="btn ghost mini" href="https://jzt.jd.com/jtk/#/activity-cp" target="_blank">团长招商页 ↗</a>
+  </div>
+</div></header>
+<div class="wrap">
+
+<div class="note" id="actTip" style="display:{'block' if run_state.get('active') else 'none'}">
+  {('抓取中：' + _e(run_state.get('progress') or '执行中…')) if run_state.get('active') else ''}
+</div>
+
+<div class="card">
+  <form class="toolbar" method="get" action="/activity">
+    <label class="fld">账号 <select name="account">{acc_opts}</select></label>
+    <label class="fld">团长 <select name="union">{union_list_opts}</select></label>
+    <label class="fld">报名起始 <input type="date" name="since" value="{_e(since)}"></label>
+    <label class="fld">关键词 <input type="text" name="q" value="{_e(kw)}" placeholder="SKU / 活动名 / 团长"></label>
+    <input type="hidden" name="days" value="{_e(days_param or 1)}">
+    <button class="btn" type="submit">查询</button>
+  </form>
+  <div class="hint" style="margin-bottom:0">
+    最近一次抓取：{_e(last_state.get('lastRun') or '尚未执行')}
+    {('· 报名库存 ' + str(last_state.get('signupRows')) + ' 条') if last_state.get('signupRows') else ''}
+    · 自动任务每天回刷最近 {settings.REFRESH_DAYS} 天效果 + 最近 30 天报名日志
+  </div>
+</div>
+
+<div class="grid g4" style="margin-top:16px">
+  <div class="kpi"><div class="lbl">报名记录</div><div class="val">{len(rows)}</div>
+    <div class="sub">按商品拆开的报名条数</div></div>
+  <div class="kpi"><div class="lbl">报名商品</div><div class="val">{n_sku}</div>
+    <div class="sub">去重 SKU</div></div>
+  <div class="kpi"><div class="lbl">合作团长</div><div class="val">{n_union}</div>
+    <div class="sub">去重团长</div></div>
+  <div class="kpi"><div class="lbl">参与活动</div><div class="val">{n_act}</div>
+    <div class="sub">去重活动</div></div>
+</div>
+
+<div style="margin-top:16px">{hm_card}</div>
+
+<div style="margin-top:16px">{signup_card}</div>
+
+<div id="effectWrap">
+<!--EFFECT_START-->
+<div class="actsec">
+  <h2>{eff_title}</h2>
+  <span class="hint">{eff_hint}</span>
+</div>
+{act_banner}
+<div class="actctl">
+  <div class="acttabs">{''.join(chips)}</div>
+  <form class="toolbar" onsubmit="return false" method="get" action="/activity">
+    <input type="hidden" name="account" value="{_e(sel)}">
+    <input type="hidden" name="since" value="{_e(since)}">
+    <input type="hidden" name="q" value="{_e(kw)}">
+    <input type="hidden" name="union" value="{_e(union_sel)}">
+    <input type="hidden" name="act" value="{_e(act_sel)}">
+    <input type="hidden" name="sku" value="{_e(sku_sel)}">
+    <label class="fld">起 <input type="date" name="start" value="{_e(start)}"></label>
+    <label class="fld">止 <input type="date" name="end" value="{_e(end)}"></label>
+    <button class="btn sec" type="button" onclick="actRangeCustom()">查询区间</button>
+  </form>
+</div>
+{warn}
+{act_warn}
+{act_zero}
+{order_warn}
+
+{kpi_html}
+
+<div class="card" style="margin-top:12px">
+  <h3 style="margin-top:0">{cp_title}</h3>
+  <div class="tblwrap short"><table><thead><tr>
+    <th class="l">团长</th><th class="l">账号</th><th class="n">点击量</th>
+    <th class="n">预估订单</th><th class="n">预估 GMV</th><th class="n">预估费用</th>
+    <th class="n">ROI</th><th class="n">出单商品数</th>
+  </tr></thead><tbody>{cp_html}</tbody></table></div>
+</div>
+
+<div class="card" style="margin-top:12px">
+  <h3 style="margin-top:0">{sku_title}</h3>
+  <div class="tblwrap short"><table><thead><tr>
+    {sku_head}
+  </tr></thead><tbody>{sku_html}</tbody></table></div>
+</div>
+
+<div style="margin-top:12px">{trend_card}</div>
+<!--EFFECT_END-->
+</div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>数据口径</b>：报名明细逐条解析自京准通「操作日志 → 活动」的“报名团长招商活动 /
+     报名cps官方活动”，活动起止是该商品自己的提报时段（同一活动里不同 SKU 可能不同）；
+     团长由「已报名活动」接口的活动 ID → 团长 ID 映射，再用团长信息接口补名称。</p>
+  <p><b>效果口径</b>：出单概览 / 出单团长 / 商品效果与团长招商页「团长诊断」一致；
+     预估费用含佣金与团长服务费，ROI = 预估 GMV ÷ 预估费用。按天入库后区间内直接相加。</p>
+  <p><b>活动视图</b>：点击报名明细某一行后，优先用「订单明细」里每单的 cpActId 汇总该活动的
+     有效订单（订单量 / GMV / 佣金 + 团长服务费 / ROI 都是活动自己的数）；点击量平台没有活动维度，
+     用所属团长的整体点击作参考。没有订单明细缓存的日期会退回“按报名商品估算”。</p>
+  <p><b>注意</b>：CPS 是点击后 15 天归因，最近 15 天的数据每晚会被回刷修正。</p>
+</div>
+
+</div>
+<script>window.ACT_RUNNING = {'true' if run_state.get('active') else 'false'};</script>
+<script>window.ACT_CTX = {act_ctx_json};</script>
+<script>{ACT_JS}</script>
+</body></html>""", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/activity/run")
+def api_activity_run(start: str = "", end: str = "", days: int = 0, perf_days: int = 0):
+    s, e = None, None
+    if start and end:
+        s, e = ds.norm_day(start), ds.norm_day(end)
+    elif days:
+        e = _today().isoformat()
+        s = (_today() - dt.timedelta(days=max(int(days), 1) - 1)).isoformat()
+    pd = min(max(int(perf_days), 1), 90) if perf_days else None
+    return activity.run_background(accounts=settings.ACCOUNTS, start=s, end=e,
+                                   perf_days=pd, log=_log_progress)
+
+
+@app.get("/api/activity/status")
+def api_activity_status():
+    return activity.runtime_status()
+
+
+@app.get("/api/activity/effect")
+def api_activity_effect(act: str = "", sku: str = "", start: str = "", end: str = "",
+                        days: str = "", account: str = "", since: str = "",
+                        q: str = "", union: str = "", hm: str = "start", day: str = ""):
+    """局部刷新用：只返回「活动效果」那一段 HTML，点击行不再整页跳转。"""
+    from urllib.parse import urlencode
+    params = {"act": act, "sku": sku, "start": start, "end": end, "days": days,
+              "account": account, "since": since, "q": q, "union": union,
+              "hm": hm, "day": day}
+    qs = urlencode({k: v for k, v in params.items() if v not in ("", None)})
+    req = Request({"type": "http", "method": "GET", "path": "/activity",
+                   "query_string": qs.encode(), "headers": [],
+                   "scheme": "http", "server": ("127.0.0.1", 80), "root_path": ""})
+    html = activity_page(req).body.decode("utf-8")
+    if "<!--EFFECT_START-->" not in html:
+        return HTMLResponse("<div class='hint'>加载失败，请刷新页面重试</div>")
+    frag = html.split("<!--EFFECT_START-->", 1)[1].split("<!--EFFECT_END-->", 1)[0]
+    return HTMLResponse(frag, headers={"Cache-Control": "no-store"})
+
+
 # ================================================================ SKU 前台价
 # 数据只读本地按天入库的商智商品明细（jd_roi/pricewatch.py），不发任何请求。
 # 前台件单价 = 成交金额 ÷ 成交件数，所以「有成交才有价」：某天 0 件，这天就没有价。
@@ -2741,6 +4157,15 @@ PRICE_CSS = """
   text-overflow:ellipsis;white-space:nowrap}
 .pwsku .id{font-size:11px;color:var(--muted2);font-family:var(--mono)}
 .pwcur{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+.pwrt{color:var(--primary);font-weight:600}
+.pwq{display:inline-block;width:11px;height:11px;line-height:11px;text-align:center;
+  font-size:8px;border-radius:50%;background:var(--hair);color:var(--muted2);
+  cursor:help;vertical-align:1px}
+.skulink{color:var(--muted2);text-decoration:none;border-bottom:1px dashed var(--hair)}
+.skulink:hover{color:var(--primary);border-bottom-color:var(--primary)}
+.pwrtlist{max-height:302px;overflow:auto;border:1px solid var(--hair);
+  border-radius:var(--r-md);margin-top:10px}
+.pwrtlist thead th{position:sticky;top:0;z-index:2;background:var(--soft)}
 .pwsub{font-size:11px;color:var(--muted2);font-variant-numeric:tabular-nums;line-height:1.5;
   white-space:nowrap}
 .pwspark{width:118px;height:26px;display:block;margin-left:auto}
@@ -2752,6 +4177,13 @@ tr.pwrow.on td{background:var(--surface-card)}
   color:var(--muted);margin:2px 0 0}
 .pwcover b{color:var(--ink)}
 .pwempty{color:var(--muted);font-size:13px;padding:26px 0;text-align:center}
+/* 商品页探寻：只保留秒杀图标 */
+.pwbadges{display:inline-flex;gap:3px;flex-wrap:wrap;vertical-align:middle}
+.pwbadge{display:inline-block;padding:0 6px;border-radius:4px;font-size:10.5px;line-height:17px;
+  font-weight:600;border:1px solid transparent;white-space:nowrap}
+.pb-seckill{background:#fdeaea;color:#c0272d;border-color:#f6c9c9}
+.pwreason{font-size:11.5px;line-height:1.5;color:var(--body);white-space:normal;max-width:260px}
+.pwreason .bad{color:var(--redink)}
 """
 
 PRICE_JS = r"""
@@ -2759,12 +4191,15 @@ PRICE_JS = r"""
 var INIT = window.PW_INIT || {};
 var API = INIT.api || '/api/price';
 var DAYS = [], ROWS = [], TOT = {}, SEL = null, LAST = null, CH = null;
+var RT = null, SNAP = null, PROBE_BUSY = false;
+var PENDING = [], PENDING_FORCE = false;
 var SORT = {k:'amt', d:-1};
 
 var COLS = [
   {k:'__item',  t:'商品',      l:1},
   {k:'priceLatest', t:'最新前台价'},
-  {k:'changeDodPct', t:'较上日'},
+  {k:'changeDodPct', t:'较上日',
+   hint:'真的是紧邻的上一天：今天对比昨天同一时刻；中间有 0 成交的天就不给涨跌幅'},
   {k:'changePct', t:'较区间初'},
   {k:'priceAvg', t:'区间均价'},
   {k:'__band',  t:'区间价带'},
@@ -2783,6 +4218,56 @@ function fx(v,dec){ var n=num(v); if(n===null) return '—';
   return n.toLocaleString('zh-CN',{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
 function money(v){ var n=num(v); return n===null?'—':('¥'+fx(n,2)); }
 function cnt(v){ var n=num(v); return n===null?'—':n.toLocaleString('zh-CN'); }
+/* SKU 编号 → 京东商品页；新标签打开，且不触发行点击（行点击是看曲线） */
+function skuLink(sid){
+  var s = String(sid == null ? '' : sid);
+  return '<a class="skulink" href="https://item.jd.com/' + esc(s) + '.html"'
+       + ' target="_blank" rel="noopener noreferrer"'
+       + ' onclick="event.stopPropagation()" title="在新标签打开京东商品页">'
+       + esc(s) + '</a>';
+}
+/* 活动图标：只展示秒杀 */
+var PB_LBL = {seckill:'秒杀'};
+function badges(list, ms){
+  list = (list || []).filter(function(b){ return b && b.key === 'seckill'; });
+  var sp = (ms && num(ms.price) !== null) ? num(ms.price) : null;
+  if(!list.length && sp === null) return '<span class="flat">—</span>';
+  if(!list.length) list = [{key:'seckill', label:'秒杀', text:'京东秒杀'}];
+  return '<span class="pwbadges">' + list.map(function(b){
+    return '<span class="pwbadge pb-seckill" title="'
+      + esc((b.text || b.label || '') + (sp !== null ? (' · 秒杀价 ¥' + fx(sp,2)) : '')) + '">'
+      + esc(b.label || PB_LBL[b.key] || b.key)
+      + (sp !== null ? ' ¥' + fx(sp,2) : '') + '</span>';
+  }).join('') + '</span>';
+}
+/* 探寻原因：秒杀标识 + 商品页价与昨日同刻的价差 */
+function probeReason(r){
+  if(r.probeError) return '<span class="bad">' + esc(r.probeError) + '</span>';
+  if(!r.probeAt) return '<span class="flat">未探寻</span>';
+  var pp = num(r.probePrice), cp = num(r.cmpPrice), bits = [];
+  var ms = r.probeSeckill || {};
+  var acts = (r.probeBadges || []).filter(function(b){ return b.key === 'seckill'; })
+    .map(function(b){ return b.label; });
+  if(acts.length) bits.push(acts.join(' + '));
+  if(ms.on){
+    var sp = num(ms.price);
+    bits.push('秒杀价 ' + (sp !== null ? money(sp) : '—')
+      + (num(ms.finalPrice) !== null && num(ms.finalPrice) !== sp
+          ? ('（到手 ' + money(ms.finalPrice) + '）') : '')
+      + (ms.remainSeconds ? ('，剩余 ' + fx(ms.remainSeconds / 3600, 1) + ' 小时') : ''));
+  }
+  if(pp !== null && cp !== null && cp){
+    var d = pp - cp;
+    if(d < -0.01){
+      bits.push('商品页价较昨日同刻低 ' + money(-d) + '（' + fx(d / cp * 100, 1) + '%）');
+    } else if(d > 0.01){
+      bits.push('商品页价较昨日同刻高 ' + money(d));
+    } else {
+      bits.push('商品页价与昨日同刻持平');
+    }
+  }
+  return bits.join('；') || '—';
+}
 function msg(s,bad){ var el=$('pwMsg'); if(!el) return; el.textContent=s||'';
   el.style.color = bad ? 'var(--redink)' : 'var(--muted)'; }
 
@@ -2830,8 +4315,10 @@ function head(){
   var h = '<tr>';
   COLS.forEach(function(c){
     var mark = (SORT.k === c.k) ? (SORT.d<0 ? ' ↓' : ' ↑') : '';
-    h += '<th class="'+(c.l?'l ':'')+'noSort" data-key="'+c.k+'" onclick="PW.sort(\''+c.k+'\')">'
-       + esc(c.t) + mark + '</th>';
+    h += '<th class="'+(c.l?'l ':'')+'noSort" data-key="'+c.k+'"'
+       + (c.hint ? ' title="'+esc(c.hint)+'"' : '')
+       + ' onclick="PW.sort(\''+c.k+'\')">'
+       + esc(c.t) + (c.hint ? ' <span class="pwq">?</span>' : '') + mark + '</th>';
   });
   return h + '</tr>';
 }
@@ -2842,14 +4329,23 @@ function rowHtml(r){
   var dod = num(r.changeDod), chg = num(r.change);
   var dodExtra = dod===null ? '' : ((dod>0?'+':'')+fx(dod,2)+' 元');
   var chgExtra = chg===null ? '' : ((chg>0?'+':'')+fx(chg,2)+' 元');
+  var dodSub = r.prevSameTime ? 'vs 昨天同刻'
+             : (dod !== null ? 'vs ' + String(r.prevDay||'').slice(5)
+                             : (r.prevDay ? '上次有价 ' + String(r.prevDay).slice(5) : '仅 1 天有价'));
+  // 有商品页价就用商品页价，不再展示商智最新价
+  var pp = num(r.probePrice);
+  var showPrice = pp !== null ? pp : r.priceLatest;
   return '<tr class="pwrow'+on+'" data-sku="'+esc(r.skuId)+'" onclick="PW.pick(this)">'
     + '<td class="l"><div class="pwsku">'+img
       + '<div><div class="nm" title="'+esc(r.itemName)+'">'+esc(r.itemName||'—')+'</div>'
-      + '<div class="id">'+esc(r.skuId)+'</div></div></div></td>'
-    + '<td><span class="pwcur">'+money(r.priceLatest)+'</span>'
+      + '<div class="id">'+skuLink(r.skuId)+'</div></div></div></td>'
+    + '<td><span class="pwcur">'+money(showPrice)+'</span>'
+      + (pp !== null ? ' '+badges(r.probeBadges, r.probeSeckill) : '')
       + '<div class="pwsub">'+esc(String(r.latestDay||'').slice(5))
+      + (r.realtime ? ' <span class="pwrt">实时</span>' : '')
       + ' · '+cnt(r.priceDays)+'天有价</div></td>'
-    + '<td>'+pctCell(r.changeDodPct, dodExtra)+'</td>'
+    + '<td>'+pctCell(r.changeDodPct, dodExtra)
+      + '<div class="pwsub">'+esc(dodSub)+'</div></td>'
     + '<td>'+pctCell(r.changePct, chgExtra)+'</td>'
     + '<td>'+money(r.priceAvg)+'</td>'
     + '<td>'+money(r.priceMin)+'~'+money(r.priceMax)
@@ -2937,6 +4433,9 @@ function cover(){
   var t = TOT || {}, bits = [];
   bits.push('区间 <b>'+esc(LAST.start)+' ~ '+esc(LAST.end)+'</b>');
   bits.push('商智明细已入库 <b>'+cnt(t.dataDays)+'</b>/'+cnt(t.rangeDays)+' 天');
+  if(LAST.realtimeDay){
+    bits.push('今天 <b>'+esc(String(LAST.realtimeDay).slice(5))+'</b> 用实时快照（未结算）');
+  }
   var miss = (LAST.missingDays || []), empty = (LAST.emptyDays || []);
   if(miss.length){
     bits.push('缺 <b>'+miss.length+'</b> 天未抓：'+esc(miss.slice(0,4).join('、'))
@@ -2957,21 +4456,32 @@ function cover(){
 function detail(r){
   $('pwDetail').style.display = '';
   $('pwDTitle').textContent = r.itemName || r.skuId;
-  $('pwDSub').innerHTML = 'SKU '+esc(r.skuId)
-    + '　最新 <b>'+money(r.priceLatest)+'</b>（'+esc(r.latestDay||'—')+'）'
+  var pp = num(r.probePrice);
+  $('pwDSub').innerHTML = 'SKU '+skuLink(r.skuId)
+    + '　最新 <b>'+money(pp!==null?pp:r.priceLatest)+'</b>'
+    + '（'+(pp!==null?'商品页 · ':'')+esc(r.latestDay||'—')
+    + (r.realtime ? ' 实时' : '') + '）'
     + '　区间均价 <b>'+money(r.priceAvg)+'</b>'
     + '　区间价带 '+money(r.priceMin)+' ~ '+money(r.priceMax)
     + '　成交 '+cnt(r.qty)+' 件 / '+money(r.amt)
-    + '　访客 '+cnt(r.uv);
+    + '　访客 '+cnt(r.uv)
+    + (pp!==null
+        ? ('　'+badges(r.probeBadges, r.probeSeckill)+'　<span class="pwsub">'+probeReason(r)+'</span>')
+        : (r.probeError ? ('　商品页：<span class="down">'+esc(r.probeError)+'</span>') : ''));
   drawChart(r);
-  $('pwDetail').scrollIntoView({behavior:'smooth', block:'nearest'});
+  // 宽屏时右侧面板与价格表并排，别把页面滚到下方图表、把面板挤出视口
+  if(window.innerWidth <= 1280){
+    $('pwDetail').scrollIntoView({behavior:'smooth', block:'nearest'});
+  }
 }
 
 function drawChart(r){
   var box = $('pwChart');
   if(!box || !window.echarts) return;
   if(!CH) CH = echarts.init(box);
-  var xs = DAYS.map(function(d){ return String(d).slice(5); });
+  var xs = DAYS.map(function(d){
+    return String(d).slice(5) + (LAST && d === LAST.realtimeDay ? '*' : '');
+  });
   CH.setOption({
     animationDuration: 260,
     grid:{left:58, right:58, top:34, bottom:36},
@@ -2981,14 +4491,16 @@ function drawChart(r){
       ps.forEach(function(p){
         var v = (p.value===null || p.value===undefined) ? null : p.value;
         out += '<br>' + p.marker + p.seriesName + '：'
-          + (v===null ? '—' : (p.seriesName==='前台价' ? (v+' 元/件') : (v+' 件')));
+          + (v===null ? '—' : ((p.seriesName==='前台价')
+              ? (v+' 元/件') : (v+' 件')));
       });
       return out;
     }},
     legend:{top:0, right:56, itemWidth:12, itemHeight:8,
       textStyle:{fontSize:11, color:'#6c6a64'}},
     xAxis:{type:'category', data:xs,
-      axisLabel:{fontSize:10, color:'#8e8b82'}, axisLine:{lineStyle:{color:'#e6dfd8'}},
+      axisLabel:{fontSize:10, color:'#8e8b82', showMaxLabel:true},
+      axisLine:{lineStyle:{color:'#e6dfd8'}},
       axisTick:{show:false}},
     yAxis:[
       {type:'value', name:'元/件', scale:true,
@@ -3006,10 +4518,11 @@ function drawChart(r){
        markLine:{silent:true, symbol:'none',
          data:[{yAxis:r.priceAvg, lineStyle:{type:'dashed', color:'#8e8b82'},
            label:{formatter:'区间均价 '+r.priceAvg, position:'insideEndTop',
-                  fontSize:10, color:'#6c6a64'}}]}},
+                  fontSize:10, color:'#6c6a64'}}]}}
+    ].concat([
       {name:'成交件数', type:'bar', yAxisIndex:1, data:r.sparkQty,
        barMaxWidth:16, itemStyle:{color:'rgba(108,106,100,.16)'}}
-    ]
+    ])
   }, true);
   CH.resize();
 }
@@ -3038,7 +4551,8 @@ function load(acc, s, e){
   LAST = null; ROWS = []; DAYS = []; TOT = {}; clearDetail();
   $('pwKpis').style.display = 'none';
   fetch(API + '?account=' + encodeURIComponent(acc)
-        + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e))
+        + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e),
+        {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(j){
       if(!j.ok){ msg(j.error || '读取失败', true); loadSnap(acc); return; }
@@ -3049,56 +4563,344 @@ function load(acc, s, e){
         msg('已读取本地商智明细（未请求京东）。点任意商品看逐日价格曲线。');
       }
       render(); kpis(); cover();
+      loadRt(acc);
       loadSnap(acc);
       history.replaceState(null, '', location.pathname + '?account=' + encodeURIComponent(acc)
         + '&start=' + encodeURIComponent(s) + '&end=' + encodeURIComponent(e));
     })
-    .catch(function(err){ msg('读取失败：' + err, true); loadSnap(acc); });
+    .catch(function(err){ msg('读取失败：' + err, true); loadRt(acc); loadSnap(acc); });
+}
+
+/* 今日实时：商智 realtime 口径（今天 00:00 到此刻，对比昨天同一时刻）
+   降价的行会自动去前台商品页探寻原因；商品页展示价带回后当作「今日前台价」，
+   商智成交均价作为小字对照，活动标识（秒杀/百补/便宜包邮…）单独一列。 */
+function loadRt(acc){
+  var m = $('pwRtMsg'), box = $('pwRtBody');
+  if(!m || !box) return;
+  var qm = $('pwQtyMsg'), qb = $('pwQtyBody');
+  m.textContent = '读取今日实时…';
+  box.innerHTML = '';
+  if(qm) qm.textContent = '读取今日实时…';
+  if(qb) qb.innerHTML = '';
+  fetch('/api/price/realtime?account=' + encodeURIComponent(acc || $('pwAcc').value),
+        {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ m.textContent = j.error || '今天还没有实时数据'; qtyRank(j); return; }
+      RT = j;
+      var diff = '';
+      var a = num(j.avgPrice), b = num(j.cmpAvgPrice);
+      if(a !== null && b){
+        var p = (a - b) / b * 100;
+        var cls = p > 0.05 ? 'up' : (p < -0.05 ? 'down' : 'flat');
+        diff = '（昨日同刻 ' + money(b) + '，<span class="' + cls + '">'
+             + (p > 0 ? '↑' : (p < 0 ? '↓' : '·')) + ' ' + fx(Math.abs(p), 2) + '%</span>）';
+      }
+      m.innerHTML = (j.account === 'all' ? '<b>全部账号</b>　' : '')
+        + '截至 <b>' + esc(j.at || '—') + '</b>'
+        + '　成交 <b>' + cnt(j.qty) + '</b> 件 / ' + money(j.amt)
+        + '　全店均价 <b>' + money(j.avgPrice) + '</b>' + diff
+        + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>'
+        + (j.probe && j.probe.count
+            ? '　商品页已探寻 <b>' + cnt(j.probe.count) + '</b> 个' : '');
+      qtyRank(j);
+      var list = (j.rows || []).filter(function(r){
+        var p = num(r.price), c = num(r.cmpPrice);
+        return p !== null && c !== null && Math.abs(p - c) > 1;
+      });
+      function frontOf(r){
+        var pp = num(r.probePrice);
+        return pp !== null ? pp : num(r.price);
+      }
+      list.sort(function(a2, b2){
+        return Math.abs(frontOf(b2) - num(b2.cmpPrice))
+             - Math.abs(frontOf(a2) - num(a2.cmpPrice));
+      });
+      if(!list.length){
+        box.innerHTML = '<div class="pwsub">今天还没有「变动超过 ¥1」的 SKU。</div>';
+        return;
+      }
+      box.innerHTML = '<div class="pwrtlist"><table><thead><tr>'
+        + '<th class="l noSort">商品（变动超过 ¥1 的 ' + list.length + ' 个，按变动金额排序）</th>'
+        + '<th class="n noSort">今日前台价</th><th class="n noSort">昨日同刻</th>'
+        + '<th class="n noSort">变动</th><th class="l noSort">活动图标</th>'
+        + '<th class="n noSort">今日件数</th>'
+        + '</tr></thead><tbody>'
+        + list.map(function(r){
+            var pp = num(r.probePrice), sp = num(r.price);
+            var front = (pp !== null ? pp : sp);
+            var cmp = num(r.cmpPrice);
+            var d = (front !== null && cmp !== null) ? front - cmp : null;
+            var extra = d === null ? '' : ((d > 0 ? '+' : '') + fx(d, 2) + ' 元');
+            var pct = (d !== null && cmp) ? (d / cmp * 100) : r.changePct;
+            return '<tr class="pwrow" data-sku="' + esc(r.skuId)
+              + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
+              + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">'
+              + esc(r.itemName || r.skuId) + '</div>'
+              + '<div class="id">' + skuLink(r.skuId) + '</div></td>'
+              + '<td title="' + esc(r.probePriceText || '') + '">'
+              + '<span class="pwcur">' + money(front) + '</span>'
+              + '</td>'
+              + '<td>' + money(r.cmpPrice) + '</td>'
+              + '<td>' + pctCell(pct, extra) + '</td>'
+              + '<td class="l">' + badges(r.probeBadges, r.probeSeckill) + '</td>'
+              + '<td>' + cnt(r.qty) + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>';
+      // 降价的行自动探寻一次（每次会话只自动跑一次，结果当天复用）；
+      // 如果服务端已经有探寻任务在跑（刷新页面 / 另一个标签），接着显示进度
+      var drops = list.filter(function(r){
+        var p = num(r.price), c = num(r.cmpPrice);
+        return p !== null && c !== null && p < c - 0.01;
+      });
+      fetch('/api/price/probe/status', {cache:'no-store'})
+        .then(function(r){ return r.json(); })
+        .then(function(s){
+          if(s.active && !PROBE_BUSY){ PROBE_BUSY = true; pollProbe(); return; }
+          maybeAutoProbe(drops);
+        })
+        .catch(function(){ maybeAutoProbe(drops); });
+    })
+    .catch(function(){ m.textContent = '读取今日实时失败'; });
+}
+
+/* 销量变动榜：今日 00:00 到此刻 vs 昨天同一时刻，按件数变动排序 */
+function qtyRank(j){
+  var m = $('pwQtyMsg'), box = $('pwQtyBody');
+  if(!m || !box) return;
+  if(!j || !j.ok){
+    m.textContent = (j && j.error) || '今天还没有实时数据';
+    box.innerHTML = '';
+    return;
+  }
+  var all = [];
+  (j.rows || []).forEach(function(r){
+    var q = num(r.qty), c = num(r.cmpQty);
+    if(q === null) q = 0;
+    if(c === null) c = 0;
+    // 件数太少的榜噪声大：今日、昨日同刻都不到 3 件的不进榜
+    if(Math.max(q, c) < 3) return;
+    all.push({r: r, q: q, c: c, d: q - c, pct: c > 0 ? (q - c) / c * 100 : null});
+  });
+  var up = 0, down = 0;
+  all.forEach(function(x){ if(x.d > 0) up++; else if(x.d < 0) down++; });
+  m.innerHTML = (j.account === 'all' ? '<b>全部账号</b>　' : '')
+    + '截至 <b>' + esc(j.at || '—') + '</b>'
+    + '　件数增加 <span class="up">' + cnt(up) + '</span> / 减少 <span class="down">' + cnt(down) + '</span>'
+    + '　<span class="flat">只列今日/昨日同刻件数 ≥3 的 SKU，按变动件数排序</span>';
+  all.sort(function(a, b){
+    var x = Math.abs(b.d) - Math.abs(a.d);
+    if(x !== 0) return x;
+    return Math.abs(b.pct || 0) - Math.abs(a.pct || 0);
+  });
+  var list = all.slice(0, 10);
+  if(!list.length){
+    box.innerHTML = '<div class="pwsub">今天还没有可比的销量数据。</div>';
+    return;
+  }
+  box.innerHTML = '<div class="pwrtlist"><table><thead><tr>'
+    + '<th class="l noSort">商品（销量变动前 10）</th>'
+    + '<th class="n noSort">今日件数</th><th class="n noSort">昨日同刻</th>'
+    + '<th class="n noSort">变动件数</th><th class="n noSort">变动幅度</th>'
+    + '<th class="n noSort">今日前台价</th></tr></thead><tbody>'
+    + list.map(function(x){
+        var r = x.r;
+        var pp = num(r.probePrice), sp = num(r.price);
+        var front = pp !== null ? pp : sp;
+        var dcls = x.d > 0 ? 'up' : (x.d < 0 ? 'down' : 'flat');
+        var dtxt = (x.d > 0 ? '+' : '') + cnt(x.d);
+        var pct = x.pct !== null ? pctCell(x.pct, '') : '<span class="flat">新增</span>';
+        var hasBadge = (r.probeBadges && r.probeBadges.length)
+          || (r.probeSeckill && num(r.probeSeckill.price) !== null);
+        var priceCell = pp !== null
+          ? (money(pp) + (hasBadge ? ' ' + badges(r.probeBadges, r.probeSeckill) : ''))
+          : money(sp);
+        return '<tr class="pwrow" data-sku="' + esc(r.skuId) + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
+          + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">' + esc(r.itemName || r.skuId) + '</div>'
+          + '<div class="id">' + skuLink(r.skuId) + '</div></td>'
+          + '<td>' + cnt(x.q) + '</td><td>' + cnt(x.c) + '</td>'
+          + '<td><span class="' + dcls + '">' + dtxt + '</span></td>'
+          + '<td>' + pct + '</td><td>' + priceCell + '</td></tr>';
+      }).join('')
+    + '</tbody></table></div>';
+}
+
+/* 自动探寻：本会话只触发一次，跳过 15 分钟内已探过的 SKU（服务端也会再筛一遍） */
+function maybeAutoProbe(drops){
+  if(PROBE_BUSY || !drops.length) return;
+  var key = 'pwProbe:' + String(INIT.today || '');
+  try {
+    if(sessionStorage.getItem(key) === '1') return;
+    sessionStorage.setItem(key, '1');
+  } catch(e) {}
+  var todo = drops.filter(function(r){ return !r.probeAt; });
+  if(!todo.length) return;
+  // 自动只探前 15 个（按变动金额已排序），避免一开页面就占用浏览器好几分钟
+  startProbe(todo.slice(0, 15).map(function(r){ return r.skuId; }).join(','), false);
+}
+
+function startProbe(skus, force){
+  var m = $('pwRtMsg');
+  var ids = String(skus || '').split(',').filter(Boolean);
+  if(PROBE_BUSY){
+    // 已有任务：把 SKU 排队，等当前任务结束再跑，避免丢请求
+    ids.forEach(function(s){ if(PENDING.indexOf(s) < 0) PENDING.push(s); });
+    PENDING_FORCE = PENDING_FORCE || !!force;
+    if(m) m.textContent = '正在探寻商品页，已把 ' + ids.length + ' 个 SKU 排队…';
+    return;
+  }
+  if(!ids.length){ if(m) m.textContent = '没有需要探寻的 SKU'; return; }
+  PROBE_BUSY = true;
+  if(m) m.textContent = '正在前往商品页探寻 ' + ids.length + ' 个 SKU'
+    + '（需要浏览器登录态，每个约 4~6 秒）…';
+  fetch('/api/price/probe?skus=' + encodeURIComponent(ids.join(','))
+        + '&account=' + encodeURIComponent($('pwAcc').value)
+        + (force ? '&force=1' : ''), {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){
+        // 别的标签页/后台已经在跑：接管它的进度，不要当成失败
+        if(/已有探寻任务/.test(j.error || '')){ pollProbe(); return; }
+        PROBE_BUSY = false;
+        if(m) m.textContent = '探寻未启动：' + (j.error || '');
+        return;
+      }
+      if(!j.total){ afterProbe(); return; }
+      pollProbe();
+    })
+    .catch(function(err){ PROBE_BUSY = false; if(m) m.textContent = '探寻启动失败：' + err; });
+}
+
+/* 一轮探寻结束：有排队的先跑排队，否则刷新今日实时与夜间核算两张卡片 */
+function afterProbe(){
+  if(PENDING.length){
+    var next = PENDING.splice(0, 20);
+    var f = PENDING_FORCE;
+    PENDING_FORCE = false;
+    startProbe(next.join(','), f);
+    return;
+  }
+  loadRt($('pwAcc').value);
+  loadSnap($('pwAcc').value);
+}
+
+function pollProbe(){
+  var m = $('pwRtMsg');
+  fetch('/api/price/probe/status', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(s){
+      if(s.active){
+        if(m) m.textContent = '探寻中 ' + cnt(s.done) + '/' + cnt(s.total)
+          + '（成功 ' + cnt(s.okCount) + ' / 失败 ' + cnt(s.failCount) + '）'
+          + (s.current ? (' · ' + s.current) : '') + '…';
+        setTimeout(pollProbe, 2500);
+        return;
+      }
+      PROBE_BUSY = false;
+      if(s.error){
+        PENDING = []; PENDING_FORCE = false;
+        if(m) m.textContent = '探寻失败：' + String(s.error).slice(0, 200)
+          + '（可点「探寻今日价」重试）';
+        return;
+      }
+      afterProbe();
+    })
+    .catch(function(){ setTimeout(pollProbe, 3000); });
+}
+
+/* 夜间核算卡片固定看「核算日变动最大的 6 个」 */
+function snapList(j){
+  var list = (j.rows || []).filter(function(r){
+    var n = num(r.changeDodPct);
+    return n !== null && Math.abs(n) >= 2 && num(r.qty) >= 5;
+  });
+  list.sort(function(a, b){
+    return Math.abs(num(b.changeDodPct)) - Math.abs(num(a.changeDodPct));
+  });
+  return list.slice(0, 6);
 }
 
 /* 夜间自动核算：每天凌晨抓完数据后由服务端算好落盘，这里只读结果做摘要 */
 function loadSnap(acc){
   var m = $('pwAutoMsg'), box = $('pwAutoBody');
   if(!m || !box) return;
+  SNAP = null;
   m.textContent = '读取最近一次夜间核算…';
   box.innerHTML = '';
-  fetch('/api/price/snapshot?account=' + encodeURIComponent(acc || $('pwAcc').value))
+  fetch('/api/price/snapshot?account=' + encodeURIComponent(acc || $('pwAcc').value),
+        {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(j){
       if(!j.ok){
         m.textContent = j.error || '还没有核算记录';
         return;
       }
+      SNAP = j;
+      var allMode = !!(j.all && j.all.length);
       var at = String(j.generatedAt || '').replace('T', ' ').slice(0, 16);
-      m.innerHTML = '最近核算 <b>' + esc(j.day) + '</b>'
+      m.innerHTML = (allMode ? '<b>全部账号（按 SKU 合并）</b>　' : '') + '最近核算 <b>' + esc(j.day) + '</b>'
         + (at ? '（' + esc(at) + '）' : '')
-        + '　当日有成交 <b>' + cnt(j.skuCount) + '</b> 个 SKU'
+        + '　核算日有成交 <b>' + cnt(j.skuCount) + '</b> 个 SKU'
         + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>'
-        + '　当日均价 <b>' + money(j.avgPrice) + '</b>（成交 ' + cnt(j.qty) + ' 件）';
-      var list = (j.rows || []).filter(function(r){
-        var n = num(r.changeDodPct);
-        return n !== null && Math.abs(n) >= 2 && num(r.qty) >= 5;
-      });
-      list.sort(function(a, b){ return Math.abs(num(b.changeDodPct)) - Math.abs(num(a.changeDodPct)); });
-      list = list.slice(0, 6);
+        + '　核算日均价 <b>' + money(j.avgPrice) + '</b>（成交 ' + cnt(j.qty) + ' 件）'
+        + '　<span class="flat">今日前台价：商品页优先'
+        + (j.probe && j.probe.count ? ('，已探寻 ' + cnt(j.probe.count) + ' 个') : '')
+        + '</span>';
+      // 核算日落后于「昨天」时说明商智还没出数，避免以为核算没跑
+      var y = parseIso(INIT.today);
+      if(y){
+        y.setDate(y.getDate() - 1);
+        if(j.day < iso(y)){
+          m.innerHTML += '　<span class="flat">（' + iso(y)
+            + ' 的商智还没出数，白天会自动补抓后重算）</span>';
+        }
+      }
+      var list = snapList(j);
       if(!list.length){
-        box.innerHTML = '<div class="pwsub">当天没有「变动 ≥2% 且件数 ≥5」的 SKU。</div>';
+        box.innerHTML = '<div class="pwsub">核算日没有「变动 ≥2% 且件数 ≥5」的 SKU。</div>';
         return;
       }
       box.innerHTML = '<div class="tblwrap short" style="margin-top:10px"><table><thead><tr>'
-        + '<th class="l noSort">商品（变动最大的 6 个）</th>'
-        + '<th class="n noSort">当日前台价</th><th class="n noSort">上次价格</th>'
-        + '<th class="n noSort">变动</th><th class="n noSort">件数</th></tr></thead><tbody>'
+        + '<th class="l noSort">商品（核算日变动最大的 6 个）</th>'
+        + '<th class="n noSort">今日前台价</th><th class="n noSort">核算日前台价</th>'
+        + '<th class="n noSort">今日变动</th><th class="n noSort">核算日件数</th>'
+        + '</tr></thead><tbody>'
         + list.map(function(r){
+            var tp = num(r.todayPrice);
+            var fromProbe = num(r.probePrice) !== null;
+            var hasBadge = (r.probeBadges && r.probeBadges.length)
+              || (r.probeSeckill && num(r.probeSeckill.price) !== null);
+            var todayCell = tp !== null
+              ? ('<span class="pwcur">' + money(tp) + '</span> '
+                 + (fromProbe && hasBadge ? badges(r.probeBadges, r.probeSeckill) : '')
+                 + '<div class="pwsub">' + (fromProbe ? '商品页' : '商智实时') + '</div>')
+              : '<span class="flat">待探寻</span>';
+            var snapSub = num(r.changeDodPct) !== null
+              ? ('核算日较上次 ' + fx(r.changeDodPct, 1) + '%') : '';
+            var chg = num(r.todayChangePct);
+            var chgExtra = num(r.todayChange) !== null
+              ? ((r.todayChange > 0 ? '+' : '') + fx(r.todayChange, 2) + ' 元') : '';
             return '<tr class="pwrow" data-sku="' + esc(r.skuId) + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
               + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">' + esc(r.itemName || r.skuId) + '</div>'
-              + '<div class="id">' + esc(r.skuId) + '</div></td>'
-              + '<td>' + money(r.priceLatest) + '</td>'
-              + '<td>' + money(r.pricePrev) + '</td>'
-              + '<td>' + pctCell(r.changeDodPct, '') + '</td>'
+              + '<div class="id">' + skuLink(r.skuId) + '</div></td>'
+              + '<td>' + todayCell + '</td>'
+              + '<td>' + money(r.priceLatest)
+                + (snapSub ? '<div class="pwsub">' + snapSub + '</div>' : '') + '</td>'
+              + '<td>' + (chg !== null ? pctCell(chg, chgExtra) : '<span class="flat">—</span>') + '</td>'
               + '<td>' + cnt(r.qty) + '</td></tr>';
           }).join('')
         + '</tbody></table></div>';
+      // 卡片里这 6 个 SKU 自动补今日商品页价（缺失或超过 15 分钟才重探）
+      var need = list.filter(function(r){
+        if(!r.probeAt) return true;
+        if(r.probeError) return false;
+        var t = Date.parse(r.probeAt);
+        return !isNaN(t) && (Date.now() - t) > 15 * 60 * 1000;
+      }).slice(0, 6);
+      if(need.length){
+        m.innerHTML += '　<span class="flat">正在探寻今日价…</span>';
+        startProbe(need.map(function(r){ return r.skuId; }).join(','), false);
+      }
     })
     .catch(function(){ m.textContent = '读取夜间核算记录失败'; });
 }
@@ -3126,6 +4928,7 @@ window.PW = {
       all[i].className = 'pwrow' + (all[i].getAttribute('data-sku') === String(sid) ? ' on' : '');
     }
     detail(r);
+    if(window.CMP) CMP.show(r.skuId, r.itemName, r.priceLatest);
   },
   /* 夜间核算摘要里点某个 SKU：滚到主表并打开它的曲线 */
   pickSku: function(sid){
@@ -3138,6 +4941,64 @@ window.PW = {
     window.PW.pick(tr);
   },
   render: render,
+  /* 立刻抓一次今日实时（只抓商智这一个报表） */
+  rtFetch: function(){
+    var m = $('pwRtMsg');
+    if(m) m.textContent = '正在抓取今日实时（需要浏览器登录态，约 1 分钟）…';
+    fetch('/api/price/realtime/fetch', {method:'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){ if(m) m.textContent = '刷新失败：' + (j.error || ''); return; }
+        (function wait(n){
+          if(n <= 0){ if(m) m.textContent = '刷新超时，稍后再试一次'; return; }
+          setTimeout(function(){
+            fetch('/api/run/status', {cache:'no-store'})
+              .then(function(r){ return r.json(); })
+              .then(function(s){
+                if(s.active){
+                  if(m) m.textContent = '刷新中：' + (s.progress || '');
+                  wait(n - 1);
+                  return;
+                }
+                if(s.error){
+                  if(m) m.textContent = '刷新失败：' + String(s.error).slice(0, 160);
+                  return;
+                }
+                loadRt($('pwAcc').value);
+              })
+              .catch(function(){ wait(n - 1); });
+          }, 3000);
+        })(40);
+      })
+      .catch(function(err){ if(m) m.textContent = '刷新失败：' + err; });
+  },
+  /* 夜间核算卡片：手动刷新这 6 个 SKU 的今日商品页价 */
+  snapProbe: function(){
+    var list = SNAP ? snapList(SNAP) : [];
+    if(!list.length){ msg('夜间核算卡片里没有可探寻的 SKU'); return; }
+    startProbe(list.map(function(r){ return r.skuId; }).join(','), true);
+  },
+  /* 按本地现有数据立刻重算一次核算（补完商智后不用等夜里） */
+  snapRun: function(){
+    var m = $('pwAutoMsg');
+    if(m) m.textContent = '正在按本地数据重算…';
+    fetch('/api/price/snapshot/run', {method:'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){ if(m) m.textContent = '重算失败：' + (j.error || ''); return; }
+        loadSnap($('pwAcc').value);
+      })
+      .catch(function(err){ if(m) m.textContent = '重算失败：' + err; });
+  },
+  /* 手动探寻：把当前「今日实时」里所有降价的 SKU 重新去商品页看一遍 */
+  probeDrops: function(){
+    var drops = ((RT && RT.rows) || []).filter(function(r){
+      var p = num(r.price), c = num(r.cmpPrice);
+      return p !== null && c !== null && p < c - 0.5;
+    });
+    if(!drops.length){ msg('当前没有降价的 SKU 需要探寻'); return; }
+    startProbe(drops.map(function(r){ return r.skuId; }).join(','), true);
+  },
   sync: function(){
     if(!LAST) return;
     var days = (LAST.missingDays || []).concat(LAST.emptyDays || []).sort();
@@ -3167,14 +5028,13 @@ function iso(d){
 }
 window.PWQUICK = function(k){
   var t = parseIso(INIT.today) || new Date();
-  var end = new Date(t.getFullYear(), t.getMonth(), t.getDate()-1);   // 商智只到昨天
+  var end = new Date(t.getFullYear(), t.getMonth(), t.getDate());   // 含今天（有实时快照）
   var start;
   if(k === 'd7'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-6); }
   else if(k === 'd14'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-13); }
   else if(k === 'd30'){ start = new Date(end.getFullYear(), end.getMonth(), end.getDate()-29); }
   else if(k === 'month'){
-    if(t.getDate() === 1){ start = new Date(end.getTime()); }
-    else { start = new Date(t.getFullYear(), t.getMonth(), 1); }
+    start = new Date(t.getFullYear(), t.getMonth(), 1);
   }
   else if(k === 'lastmonth'){
     end = new Date(t.getFullYear(), t.getMonth(), 0);
@@ -3192,6 +5052,295 @@ window.PW.run();
 """
 
 
+# ---------------------------------------------------------------- 竞品与关键词面板
+COMPETE_CSS = """
+.pwSplit{display:grid;grid-template-columns:minmax(0,1fr) minmax(360px,430px);gap:18px;
+  align-items:start}
+.pwSplit.collapsed{grid-template-columns:minmax(0,1fr)}
+.pwSplit.collapsed #cmpPanel{display:none}
+.pwSplit #pwTableCard{min-width:0}
+#cmpPanel{margin-top:18px;position:sticky;top:75px;max-height:calc(100vh - 87px);overflow:auto}
+@media(max-width:1280px){
+  .pwSplit{grid-template-columns:1fr}
+  #cmpPanel{position:static;max-height:none}
+}
+.cmp h2{margin-bottom:6px}
+.cmp h3{margin:16px 0 8px;font-size:14px;font-weight:600;color:var(--ink);
+  display:flex;align-items:center;gap:8px}
+.cmp h3 .tagline{margin-left:auto;font-weight:400}
+.cmp table{font-size:12px}
+.cmp th,.cmp td{padding:6px 7px}
+.cmp .cmpname{font-size:13px;line-height:1.5;color:var(--ink);margin:0 0 8px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.cmp .cmptools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}
+.cmp .cmpsku{font-family:var(--mono);font-size:11.5px;color:var(--muted2)}
+.cmp .cmpchips{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 2px}
+.cmp .cmpchip{background:var(--soft);border:1px solid var(--hair);border-radius:999px;
+  padding:3px 9px;font-size:12px;color:var(--body);white-space:nowrap}
+.cmp .cmpchip b{font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+.cmp .cmpai{font-size:13px;line-height:1.8;color:var(--body);white-space:pre-wrap;
+  background:var(--soft);border:1px solid var(--hair);border-radius:var(--r-md);
+  padding:12px;max-height:46vh;overflow:auto}
+.cmp .cmpai .think{color:var(--muted2)}
+.cmp .cmpempty{font-size:12.5px;color:var(--muted);line-height:1.7;padding:6px 0}
+.cmp .pwsub{white-space:normal}
+"""
+
+COMPETE_JS = r"""
+(function(){
+var CUR = null, POLL = null, ES = null, RAW = '', TRIED = {};
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function num(v){ if(v===null||v===undefined||v==='') return null;
+  var n=Number(v); return isNaN(n)?null:n; }
+function fx(v,d){ var n=num(v); if(n===null) return '—';
+  return n.toLocaleString('zh-CN',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+function money(v){ var n=num(v); return n===null?'—':('¥'+fx(n,2)); }
+function cnt(v){ var n=num(v); return n===null?'—':n.toLocaleString('zh-CN'); }
+function acc(){ var e=$('pwAcc'); return e ? e.value : ''; }
+function msg(s,bad){ var e=$('cmpMsg'); if(!e) return; e.textContent=s||'';
+  e.style.color = bad ? 'var(--redink)' : 'var(--muted)'; }
+function skuLink(s){
+  return '<a class="skulink" href="https://item.jd.com/'+esc(s)+'.html" target="_blank"'
+    + ' rel="noopener noreferrer" title="在新标签打开京东商品页">'+esc(s)+'</a>';
+}
+function section(title, sub, body){
+  return '<h3>'+esc(title)+(sub?'<span class="tagline">'+sub+'</span>':'')+'</h3>'+body;
+}
+function table(head, rows){
+  return '<div class="tblwrap short"><table><thead><tr>'+head+'</tr></thead><tbody>'
+    + rows + '</tbody></table></div>';
+}
+
+function render(d){
+  var own = num(d.price);
+  var band = d.priceBand || {};
+  var cps = (d.competitorShown || []).slice(0, 8);
+  var html = '';
+
+  var adv = (band.adCount !== undefined && band.adCount !== null)
+    ? band.adCount : cps.filter(function(x){ return x.ad; }).length;
+  if(cps.length){
+    html += section('同款竞品', '共 '+cnt((d.competitors||[]).length)+' 个 · 广告 '+cnt(adv)+' 个',
+      table('<th class="l noSort">商品</th><th class="n noSort">价格</th>'
+            + '<th class="n noSort">较你</th>',
+        cps.map(function(x){
+          var p = num(x.price);
+          var diff = (p!==null && own!==null) ? (p-own) : null;
+          return '<tr><td class="l">'
+            + '<div class="pwsub" style="color:var(--ink)">'
+            + esc(String(x.title||'').slice(0,44))+'</div>'
+            + '<div class="pwsub">'+skuLink(x.sku)
+            + (x.ad ? ' · <span style="color:var(--primary)">广告</span>' : '')
+            + (x.shop ? ' · '+esc(x.shop) : '')+'</div></td>'
+            + '<td>'+money(p)+'</td>'
+            + '<td>'+(diff===null?'—':((diff>0?'+':'')+fx(diff,2)))+'</td></tr>';
+        }).join('')));
+  } else {
+    html += section('同款竞品', '', '<div class="cmpempty">没有抓到同款，换个核心词或稍后重试。</div>');
+  }
+  if(band.count){
+    html += '<div class="pwsub" style="margin-top:6px">竞品价带 '
+      + money(band.min)+' ~ '+money(band.max)+'，中位 '+money(band.median)
+      + (band.basis ? ('（'+esc(band.basis)+'）') : '')
+      + (band.ownRank ? ('；你在第 '+band.ownRank+' 低（共 '+(band.count+1)+' 个）') : '')
+      + '</div>';
+  }
+
+  var tr = d.trends || [];
+  if(tr.length){
+    html += section('行业关键词', '近7天 · 指数口径',
+      table('<th class="l noSort">词</th><th class="n noSort">展现</th>'
+            + '<th class="n noSort">点击</th><th class="n noSort">CTR</th>'
+            + '<th class="n noSort">CVR</th><th class="n noSort">出价</th>',
+        tr.map(function(x){
+          return '<tr><td class="l">'+esc(x.word)+'</td><td>'+cnt(x.imp)+'</td>'
+            + '<td>'+cnt(x.clicks)+'</td><td>'+fx(x.ctr,2)+'%</td>'
+            + '<td>'+fx(x.cvr,2)+'%</td><td>'+money(x.bid)+'</td></tr>';
+        }).join('')));
+  }
+
+  var recs = d.recs || {}, order = ['热搜词','潜力词','竞品词','竞品争夺词'], chips = '';
+  order.forEach(function(k){
+    var arr = (recs[k]||[]).slice(0, k==='竞品词' ? 8 : 6);
+    if(!arr.length) return;
+    chips += '<div class="pwsub" style="margin:7px 0 2px">'+esc(k)+'</div>'
+      + '<div class="cmpchips">' + arr.map(function(x){
+          return '<span class="cmpchip" title="搜索量 '+cnt(x.pv)+' · 建议出价 '
+            + money(x.bid)+'">'+esc(x.word)+' <b>'+cnt(x.pv)+'</b></span>';
+        }).join('') + '</div>';
+  });
+  if(chips) html += section('京东推词', '搜索量 + 建议出价', chips);
+
+  var own2 = d.ownTerms || [];
+  if(own2.length){
+    html += section('本店搜索词', '近30天 · 按花费',
+      table('<th class="l noSort">词</th><th class="n noSort">花费</th>'
+            + '<th class="n noSort">订单</th><th class="n noSort">ROI</th>',
+        own2.map(function(x){
+          return '<tr><td class="l">'+esc(x.word)+'</td><td>'+money(x.cost)+'</td>'
+            + '<td>'+cnt(x.orders)+'</td><td>'+fx(x.roi,2)+'</td></tr>';
+        }).join('')));
+  }
+
+  html += '<div class="pwsub" style="margin-top:12px">抓取于 '
+    + esc(String(d.fetchedAt||'').replace('T',' ').slice(0,16))
+    + ' · 账号 '+esc(d.accountLabel || d.account || '')
+    + ' · 核心词「'+esc(d.keyword||'')+'」</div>'
+    + '<div class="pwsub" style="margin-top:4px">'+esc(d.caliber||'')+'</div>';
+
+  $('cmpContent').innerHTML = html;
+}
+
+function paint(){
+  var b = $('cmpAi'); if(!b) return;
+  var txt = (RAW || 'AI 正在思考…')
+    .replace(/\*\*/g, '')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/^[-*_]{3,}\s*$/gm, '');
+  b.textContent = txt;
+  b.scrollTop = b.scrollHeight;
+  var p = $('cmpPanel');
+  if(p) p.scrollTop = p.scrollHeight;
+}
+
+function start(){
+  if(!CUR) return;
+  msg('开始抓取（约 30~60 秒，期间占用浏览器登录态）…');
+  var q = 'sku='+encodeURIComponent(CUR.sku)
+        + '&account='+encodeURIComponent(acc())
+        + '&name='+encodeURIComponent(CUR.name||'');
+  if(CUR.price !== null && CUR.price !== undefined && CUR.price !== ''){
+    q += '&price='+encodeURIComponent(CUR.price);
+  }
+  fetch('/api/compete/run?'+q, {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ msg(j.error||'启动失败', true); return; }
+      poll();
+    })
+    .catch(function(e){ msg('启动失败：'+e, true); });
+}
+
+function poll(){
+  clearTimeout(POLL);
+  if(!CUR) return;
+  fetch('/api/compete/status?sku='+encodeURIComponent(CUR.sku)
+        + '&account='+encodeURIComponent(acc()), {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j.running){ msg(j.progress||'抓取中…'); POLL = setTimeout(poll, 2000); return; }
+      if(j.error){ msg('抓取失败：'+j.error, true); return; }
+      load(true);
+    })
+    .catch(function(){ POLL = setTimeout(poll, 2500); });
+}
+
+function load(afterRun){
+  if(!CUR) return;
+  var sku = CUR.sku;
+  if(!afterRun) msg('读取缓存…');
+  fetch('/api/compete?sku='+encodeURIComponent(sku)
+        + '&account='+encodeURIComponent(acc()), {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j.ok && j.data){
+        if(!j.data.name && CUR.name) j.data.name = CUR.name;
+        // 价格以左侧表格当前值为准（缓存里的价格可能是上次抓取时的）
+        if(CUR.price !== null && CUR.price !== undefined && CUR.price !== ''){
+          j.data.price = CUR.price;
+        }
+        render(j.data);
+        msg(j.fresh ? '缓存 ' + String(j.data.fetchedAt||'').replace('T',' ').slice(0,16)
+              : '缓存已过期，可点「重新抓取」');
+        return;
+      }
+      if(afterRun){
+        msg('抓取完成但没有数据，请稍后重试', true);
+        return;
+      }
+      if(TRIED[sku]){ msg('没有可用数据，可点「重新抓取」', true); return; }
+      TRIED[sku] = 1;
+      start();
+    })
+    .catch(function(e){ msg('读取失败：'+e, true); });
+}
+
+function show(sku, name, price){
+  CUR = {sku:String(sku), name:name||'', price:price};
+  $('cmpEmpty').style.display = 'none';
+  $('cmpBody').style.display = '';
+  $('cmpTag').textContent = 'SKU '+sku;
+  $('cmpName').textContent = name || ('SKU '+sku);
+  $('cmpSku').innerHTML = skuLink(sku);
+  $('cmpContent').innerHTML = '';
+  $('cmpAiBox').style.display = 'none';
+  $('cmpAi').textContent = '';
+  if(ES){ try{ ES.close(); }catch(e){} ES = null; }
+  load(false);
+}
+
+function refresh(){
+  if(!CUR) return;
+  delete TRIED[CUR.sku];
+  start();
+}
+
+function togglePanel(){
+  var sp = document.querySelector('.pwSplit');
+  if(!sp) return;
+  sp.classList.toggle('collapsed');
+  try{ localStorage.setItem('cmpCollapsed', sp.classList.contains('collapsed') ? '1' : '0'); }catch(e){}
+}
+
+function ai(){
+  if(!CUR) return;
+  if(ES){ try{ ES.close(); }catch(e){} ES = null; }
+  RAW = '';
+  $('cmpAiBox').style.display = '';
+  $('cmpAi').textContent = 'AI 正在读取数据…';
+  var panel = $('cmpPanel');
+  if(panel) panel.scrollTop = panel.scrollHeight;
+  fetch('/api/compete/ai?sku='+encodeURIComponent(CUR.sku)
+        + '&account='+encodeURIComponent(acc()), {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(!j.ok){ $('cmpAi').textContent = j.error || 'AI 启动失败'; return; }
+      var es = new EventSource('/api/ai/stream?job='+encodeURIComponent(j.jobId));
+      ES = es;
+      es.addEventListener('content', function(e){
+        var d = JSON.parse(e.data); RAW += d.t; paint();
+      });
+      es.addEventListener('reasoning', function(){ if(!RAW) paint(); });
+      es.addEventListener('phase', function(e){
+        if(RAW) return;
+        var d = JSON.parse(e.data);
+        $('cmpAi').textContent = d.t || 'AI 正在思考…';
+      });
+      es.addEventListener('error', function(e){
+        try{ var d = JSON.parse(e.data); RAW += '\n[出错] '+(d.t||''); paint(); }catch(_){}
+      });
+      es.addEventListener('done', function(){
+        try{ es.close(); }catch(e){}
+        ES = null; paint();
+      });
+    })
+    .catch(function(e){ $('cmpAi').textContent = 'AI 启动失败：'+e; });
+}
+
+window.CMP = {show: show, refresh: refresh, ai: ai, togglePanel: togglePanel};
+try{
+  if(localStorage.getItem('cmpCollapsed') === '1'){
+    var sp = document.querySelector('.pwSplit');
+    if(sp) sp.classList.add('collapsed');
+  }
+}catch(e){}
+})();
+"""
+
+
 @app.get("/price", response_class=HTMLResponse)
 def price_page(request: Request):
     """SKU 前台价：逐日看每个 SKU 的「成交金额 ÷ 成交件数」怎么变。
@@ -3201,10 +5350,10 @@ def price_page(request: Request):
     """
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
-    acc = q.get("account") or settings.MAIN_ACCOUNT
-    if acc not in keys:
-        acc = settings.MAIN_ACCOUNT
-    end = _yesterday()
+    acc = q.get("account") or "all"
+    if acc != "all" and acc not in keys:
+        acc = "all"
+    end = _today()
     start = end - dt.timedelta(days=29)
     if q.get("start") and q.get("end"):
         try:
@@ -3214,7 +5363,8 @@ def price_page(request: Request):
                 start, end = s0, e0
         except ValueError:
             pass
-    opts = "".join(
+    opts = ('<option value="all"%s>全部账号（总览）</option>'
+            % (" selected" if acc == "all" else "")) + "".join(
         f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
         f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
     init = {"api": "/api/price", "account": acc, "today": _today().isoformat(),
@@ -3222,7 +5372,7 @@ def price_page(request: Request):
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SKU 前台价 · 京东广告运营</title>
-<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PRICE_CSS}</style>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PRICE_CSS}</style><style>{COMPETE_CSS}</style>
 </head><body>
 {report2.navtop("/price")}
 <header class="top"><div class="wrap pagehead">
@@ -3231,7 +5381,7 @@ def price_page(request: Request):
   <div class="metaline">
     <span>前台件单价 = 商智成交金额 ÷ 成交件数</span><span class="dot"></span>
     <span>消费者实付（含优惠券 / 满减）</span><span class="dot"></span>
-    <span>只读本地按天入库，不发请求</span>
+    <span>价格表只读本地；右侧竞品分析按需抓取</span>
   </div>
   <div class="actions">
     <a class="btn ghost mini" href="/profit">月度利润 →</a>
@@ -3254,19 +5404,42 @@ def price_page(request: Request):
       <button type="button" class="chip" onclick="PWQUICK('month')">本月</button>
       <button type="button" class="chip" onclick="PWQUICK('lastmonth')">上月</button>
     </span>
+    <button type="button" class="btn sec mini" style="margin-left:auto"
+            onclick="CMP.togglePanel()">竞品面板</button>
   </div>
   <div class="hint" id="pwMsg" style="min-height:20px">读取本地商智商品明细…</div>
   <div class="pwcover" id="pwCover"></div>
 </div>
 
+<div class="card" id="pwRtCard" style="margin-top:18px">
+  <h2>今日实时 <span class="tagline">商智实时口径 · 对比昨天同一时刻 · 降价自动探寻前台原因</span>
+    <button class="btn sec mini" style="margin-left:auto" onclick="PW.probeDrops()"
+            title="把今天降价的 SKU 逐个打开京东商品页，带回页面展示价和活动标识（秒杀/百补/便宜包邮…）">探寻降价原因</button>
+    <button class="btn sec mini" style="margin-left:6px" onclick="PW.rtFetch()"
+            title="立刻抓一次今天的商智实时商品明细（只抓这一个报表）">刷新今日实时</button></h2>
+  <div class="hint" id="pwRtMsg" style="margin-bottom:0">读取今日实时…</div>
+  <div id="pwRtBody"></div>
+</div>
+
+<div class="card" id="pwQtyCard" style="margin-top:18px">
+  <h2>销量变动榜 <span class="tagline">今日 00:00 到此刻 vs 昨天同一时刻 · 按件数变动排序</span></h2>
+  <div class="hint" id="pwQtyMsg" style="margin-bottom:0">读取今日实时…</div>
+  <div id="pwQtyBody"></div>
+</div>
+
 <div class="card" id="pwAutoCard" style="margin-top:18px">
-  <h2>夜间自动核算 <span class="tagline">每天凌晨抓完昨天数据后自动生成</span></h2>
+  <h2>夜间自动核算 <span class="tagline">凌晨核算昨天 · 今日前台价优先取商品页</span>
+    <button class="btn sec mini" style="margin-left:auto" onclick="PW.snapProbe()"
+            title="把这 6 个 SKU 逐个打开京东商品页，取今天的展示价">探寻今日价</button>
+    <button class="btn sec mini" style="margin-left:6px" onclick="PW.snapRun()"
+            title="按本地现有数据立刻重算一次（补完商智后不用等夜里）">立即重算</button></h2>
   <div class="hint" id="pwAutoMsg" style="margin-bottom:0">读取最近一次夜间核算…</div>
   <div id="pwAutoBody"></div>
 </div>
 
 <div class="grid g4" id="pwKpis" style="display:none;margin-top:18px"></div>
 
+<div class="pwSplit">
 <div class="card" id="pwTableCard" style="margin-top:18px">
   <h2>价格变化 <span class="tagline">点任意一行看逐日曲线</span></h2>
   <div class="toolbar">
@@ -3279,6 +5452,28 @@ def price_page(request: Request):
   </div>
 </div>
 
+<aside class="card cmp" id="cmpPanel">
+  <h2>竞品与关键词 <span class="tagline" id="cmpTag">点左侧 SKU 行开始</span></h2>
+  <div class="cmpempty" id="cmpEmpty">选一个 SKU，自动分析同款竞品、价格带、行业关键词和京东推词；
+    也可以让 AI 基于这些数据给出投放动作。</div>
+  <div id="cmpBody" style="display:none">
+    <div class="cmpname" id="cmpName"></div>
+    <div class="cmptools">
+      <span class="cmpsku" id="cmpSku"></span>
+      <button class="btn ghost mini" onclick="CMP.togglePanel()">收起</button>
+      <button class="btn sec mini" onclick="CMP.refresh()">重新抓取</button>
+      <button class="btn mini" onclick="CMP.ai()">AI 解读</button>
+    </div>
+    <div class="hint" id="cmpMsg" style="min-height:18px;margin:0 0 4px"></div>
+    <div id="cmpContent"></div>
+    <div id="cmpAiBox" style="display:none">
+      <h3>AI 解读<span class="tagline">基于本面板数据</span></h3>
+      <div class="cmpai" id="cmpAi"></div>
+    </div>
+  </div>
+</aside>
+</div>
+
 <div class="card" id="pwDetail" style="display:none">
   <h2><span id="pwDTitle">—</span>
     <span class="tagline">逐日前台件单价（成交金额 ÷ 成交件数）</span></h2>
@@ -3287,6 +5482,10 @@ def price_page(request: Request):
 </div>
 
 <div class="note" style="margin-top:18px">
+  <p><b>右侧「竞品与关键词」</b>：点任意 SKU 行后按需抓取京东搜索前台的同款在售商品、
+     行业关键词效率（京准通流量解析）、京东推词（热搜/潜力/竞品/争夺）和本店近 30 天搜索词，
+     结果按 SKU + 账号缓存 12 小时，可点「重新抓取」刷新；「AI 解读」用现有模型配置生成投放建议。
+     京东看不到竞品后台的计划/预算/出价，面板给的是公开前台数据 + 平台侧指标。</p>
   <p><b>前台件单价</b> = 商智「商品明细」成交金额 ÷ 成交件数（消费者实付，已含优惠券/满减），
      与「月度利润」页的前台件单价是同一口径；不是商品页标价（商智没有标价字段）。</p>
   <p><b>有成交才有价</b>：某天 0 件，这天就没有价，曲线断开、不做插值——
@@ -3301,13 +5500,42 @@ def price_page(request: Request):
      （以及相对各自上一个有价日的变动）算好存一份，就是顶部「夜间自动核算」卡片；
      因为商智 T+1 只出一半、T+2~T+3 才定稿，每次会把最近 3 个有数据的日子一起重算覆盖。
      凌晨抓「昨天」时商智常常还没出数（0 行），白天 08:00~23:00 会每小时自动只补商智，
-     补到就立刻重算，任务日志里能看到「商智补抓」「前台价已核算 &lt;日期&gt;」。</p>
+     补到就立刻重算，任务日志里能看到「商智补抓」「前台价已核算 &lt;日期&gt;」。
+     卡片里的「核算日前台价」才是商智结算价；「今日前台价」会优先用今天的商品页价
+     （打开卡片时自动探寻这 6 个 SKU，超过 15 分钟会重探），取不到才退回商智实时价，
+     所以刷新页面能看到今天的前台价，而不是一直停在核算日。</p>
+  <p><b>全部账号</b>：按 SKU 合并各店 —— 成交金额 / 成交件数相加，价格仍是 Σ金额 ÷ Σ件数；
+     同一个 SKU 在多个店都有成交时合并成一行。「夜间自动核算」那张卡片按账号各列一行
+     （核算是按账号分别做的，不强行合并价格）。</p>
+  <p><b>今天的价格</b>：表格里最新一行如果是今天，会标橙色「实时」、曲线横轴那天带 * ——
+     那是商智实时快照（今天 00:00 到此刻，<b>未结算</b>），件数/金额白天还会继续涨；
+     想排除今天只看到结算日，把「止」改成昨天即可。</p>
+  <p><b>今日实时</b>：商智「商品明细 → 实时」能给当天 00:00 到此刻的按 SKU 成交，
+     页面白天每 30 分钟自动刷新一次（也可点「刷新今日实时」）。因为今天还没结束，
+     对比用的是<b>昨天同一时刻</b>而不是昨天全天，避免「今天只过了一半」的误判；
+     数字会随白天继续成交变化，只看趋势，不要当成最终价。</p>
+  <p><b>销量变动榜</b>：同口径对比「今日 00:00 到此刻」与「昨天同一时刻」的成交件数，
+     只列今日 / 昨日同刻件数 ≥3 的 SKU，按<b>变动件数</b>排序，同时给出变动幅度和今日前台价。
+     价格没怎么动但销量突然放大或掉零，通常不是价格问题，更像流量、竞价或活动节奏变化；
+     配合上面的价格变动和秒杀标识，可以更快定位是「降价带量」还是「流量变了」。</p>
+  <p><b>降价探寻（本页新增）</b>：商智成交均价只能看出「降了」，看不出「为什么降」。
+     页面对今天降价的 SKU 自动打开对应京东商品页（<code>item.jd.com/&lt;SKU&gt;.html</code>），
+     把<b>页面展示价</b>和<b>秒杀标识</b>带回来。一旦取到商品页价，就用它显示「今日前台价」，
+     <b>不再显示商智成交均价</b>；「今日实时」去掉了价格下的小字与「探寻原因」列，
+     「活动图标」列保留秒杀标识，点开详情也能看到秒杀价。
+     秒杀判定以商品页接口 <code>pc_detailpage_wareBusiness</code> 的 <code>miaoshaInfo</code> 为准，
+     并带回秒杀价 / 到手价 / 剩余时间——2026 版商品页的「京东秒杀」是图片 logo，
+     页面文案里没有「秒杀」二字，只靠文字会漏判（例如 SKU 100087667252 天麻）。
+     结果按天保存在本地（<code>data/price/probe_&lt;日期&gt;.json</code>），15 分钟内不重复抓，
+     也可点「探寻降价原因」强制重探；抓取需要浏览器登录态，和夜间抓取共用同一把锁，
+     遇到抓取任务在跑会提示稍后再试。</p>
 </div>
 
 </div>
 {report2._echarts_src()}
 <script>window.PW_INIT = {json.dumps(init, ensure_ascii=False)};</script>
 <script>{PRICE_JS}</script>
+<script>{COMPETE_JS}</script>
 </body></html>""")
 
 
@@ -3316,10 +5544,10 @@ def api_price(account: str | None = None, start: str = "", end: str = ""):
     """某个账号某个区间内，每个 SKU 的逐日前台价与区间汇总（纯本地读）。"""
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = account or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
     if not (start and end):
-        e = _yesterday()
+        e = _today()
         start, end = (e - dt.timedelta(days=29)).isoformat(), e.isoformat()
     try:
         span = ds.day_span(start, end)
@@ -3327,22 +5555,329 @@ def api_price(account: str | None = None, start: str = "", end: str = ""):
         return {"ok": False, "error": "日期格式应为 YYYY-MM-DD"}
     if len(span) > 400:
         return {"ok": False, "error": "区间最长 400 天，请缩小范围"}
-    return pricewatch.build(acc, span[0], span[-1])
+    # 价格会随着商智回补/补抓变化，别让浏览器缓存住上一次的结果
+    data = pricewatch.build(acc, span[0], span[-1])
+    # 商品页探寻结果：只补齐「最新价就是今天」的行，避免把今天的商品页价贴到历史日
+    try:
+        data["probe"] = itemprobe.attach(data.get("rows") or [],
+                                         ds.today().isoformat(),
+                                         only_day_field="latestDay")
+    except Exception as exc:  # noqa: BLE001
+        data["probe"] = {"available": False,
+                         "error": f"{type(exc).__name__}: {exc}"[:200]}
+    return JSONResponse(data, headers={"Cache-Control": "no-store"})
+
+
+def _snapshot_attach_today(rows: list, acc: str, today: str) -> dict:
+    """给夜间核算行补「今日前台价」：商品页价优先，商智实时价兜底。"""
+    try:
+        probe = itemprobe.attach(rows, today)
+    except Exception as exc:  # noqa: BLE001
+        probe = {"available": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+    try:
+        rt = pricewatch.realtime_snapshot(acc, today)
+    except Exception:  # noqa: BLE001
+        rt = None
+    rtmap = {str(x.get("skuId") or ""): x for x in ((rt or {}).get("rows") or [])}
+    for r in rows or []:
+        t = rtmap.get(str(r.get("skuId") or ""))
+        if t:
+            r["todaySzPrice"] = t.get("price")
+            r["todayQty"] = t.get("qty")
+        price = r.get("probePrice")
+        if price is None:
+            price = r.get("todaySzPrice")
+        r["todayPrice"] = price
+        base = r.get("priceLatest")
+        if price is not None and base:
+            r["todayChange"] = round(price - base, 2)
+            r["todayChangePct"] = round((price - base) / base * 100, 2)
+    return probe
+
+
+def _merged_snapshot() -> dict | None:
+    """全部账号：把各账号最新核算按 SKU 合并（金额/件数相加，价格 Σ金额÷Σ件数）。"""
+    snaps = []
+    for a in settings.ACCOUNTS:
+        s = pricewatch.latest_snapshot(a["key"])
+        if s:
+            snaps.append(s)
+    if not snaps:
+        return None
+    day = max((s.get("day") or "") for s in snaps)
+    merged: dict = {}
+    for s in snaps:
+        if (s.get("day") or "") != day:
+            continue
+        for r in s.get("rows") or []:
+            sid = str(r.get("skuId") or "")
+            if not sid:
+                continue
+            e = merged.setdefault(sid, {"skuId": sid, "itemName": "", "amt": 0.0,
+                                        "qty": 0.0, "_wp": 0.0, "_wq": 0.0})
+            if not e["itemName"] and r.get("itemName"):
+                e["itemName"] = r["itemName"]
+            q = float(r.get("qty") or 0)
+            e["amt"] += float(r.get("amt") or 0)
+            e["qty"] += q
+            pct = r.get("changeDodPct")
+            if pct is not None and q > 0:
+                e["_wp"] += float(pct) * q
+                e["_wq"] += q
+    rows = []
+    for e in merged.values():
+        qty, amt, wp, wq = e["qty"], e["amt"], e["_wp"], e["_wq"]
+        if qty <= 0 or amt <= 0:
+            continue
+        rows.append({
+            "skuId": e["skuId"], "itemName": e["itemName"],
+            "priceLatest": round(amt / qty, 2),
+            "pricePrev": None, "changeDod": None,
+            "changeDodPct": round(wp / wq, 2) if wq else None,
+            "amt": round(amt, 2), "qty": int(qty),
+        })
+    rows.sort(key=lambda r: r["amt"], reverse=True)
+    total_amt = sum(r["amt"] for r in rows)
+    total_qty = sum(r["qty"] for r in rows)
+    up = sum(1 for r in rows if (r["changeDodPct"] or 0) > 0.5)
+    down = sum(1 for r in rows if (r["changeDodPct"] or 0) < -0.5)
+    return {
+        "account": "all", "label": "全部账号（总览）",
+        "accounts": [s.get("account") for s in snaps],
+        "day": day,
+        "generatedAt": max((s.get("generatedAt") or "") for s in snaps),
+        "skuCount": len(rows), "up": up, "down": down,
+        "amt": round(total_amt, 2), "qty": int(total_qty),
+        "avgPrice": round(total_amt / total_qty, 2) if total_qty else None,
+        "rows": rows,
+        "accountSummaries": [
+            {k: s.get(k) for k in ("account", "label", "day", "skuCount", "up", "down",
+                                   "avgPrice", "generatedAt")}
+            for s in snaps
+        ],
+    }
 
 
 @app.get("/api/price/snapshot")
 def api_price_snapshot(account: str | None = None):
-    """最近一次「夜间自动核算」结果（凌晨抓完数据后由 pricewatch.run_nightly 落盘）。"""
+    """最近一次「夜间自动核算」结果（凌晨抓完数据后由 pricewatch.run_nightly 落盘）。
+
+    account='all' 时按 SKU 合并各账号，卡片仍能看到逐商品明细。
+    """
     keys = [a["key"] for a in settings.ACCOUNTS]
     acc = account or settings.MAIN_ACCOUNT
-    if acc not in keys:
+    if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
+    today = ds.today().isoformat()
+    if str(acc).lower() == "all":
+        snap = _merged_snapshot()
+        if not snap:
+            return JSONResponse({"ok": False, "empty": True,
+                                 "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）"},
+                                headers={"Cache-Control": "no-store"})
+        snap["probe"] = _snapshot_attach_today(snap["rows"], "all", today)
+        snap["today"] = today
+        summaries = snap.pop("accountSummaries", [])
+        return JSONResponse({"ok": True, "all": summaries, **snap},
+                            headers={"Cache-Control": "no-store"})
     snap = pricewatch.latest_snapshot(acc)
     if not snap:
-        return {"ok": False, "empty": True,
-                "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）；"
-                         "下面价格表本身是现算的，可以先直接看"}
-    return {"ok": True, **snap}
+        return JSONResponse({"ok": False, "empty": True,
+                             "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）；"
+                                      "下面价格表本身是现算的，可以先直接看"},
+                            headers={"Cache-Control": "no-store"})
+    snap["probe"] = _snapshot_attach_today(snap.get("rows") or [], acc, today)
+    snap["today"] = today
+    return JSONResponse({"ok": True, **snap}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/price/snapshot/run")
+def api_price_snapshot_run(account: str | None = None):
+    """立刻重算一次前台价核算（与夜间任务同一个函数），补完数据后不用等夜里。"""
+    accounts = [settings.get_account(account)] if account else settings.ACCOUNTS
+    try:
+        done = pricewatch.run_nightly(accounts, log=_log_progress)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "done": done,
+            "errors": [x for x in done if x.get("error")]}
+
+
+@app.get("/api/price/realtime")
+def api_price_realtime(account: str | None = None):
+    """今日实时前台价（商智 realtime 口径，对比昨天同一时刻），读本地快照。"""
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = account or settings.MAIN_ACCOUNT
+    if acc != "all" and acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    snap = pricewatch.realtime_snapshot(acc)
+    if not snap:
+        return JSONResponse(
+            {"ok": False, "empty": True,
+             "error": "今天还没有实时数据：白天每 "
+                      f"{max(settings.SZ_RT_INTERVAL // 60, 1)} 分钟自动刷新一次，"
+                      "也可点右上角「刷新今日实时」"},
+            headers={"Cache-Control": "no-store"})
+    # 商品页探寻：把商品页展示价 / 活动标识补进每一行，并用它更新「今日前台价」
+    try:
+        snap["probe"] = itemprobe.attach(snap.get("rows") or [], snap.get("day"))
+        for r in snap.get("rows") or []:
+            r["priceFront"] = (r.get("probePrice")
+                               if r.get("probePrice") is not None else r.get("price"))
+    except Exception as exc:  # noqa: BLE001
+        snap["probe"] = {"available": False,
+                         "error": f"{type(exc).__name__}: {exc}"[:200]}
+    return JSONResponse({"ok": True, **snap}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/price/probe")
+def api_price_probe(skus: str = "", account: str = "", force: int = 0):
+    """探寻降价商品的前台原因：逐个打开商品页取展示价 + 活动标识（后台线程）。"""
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = account if account in keys else settings.MAIN_ACCOUNT
+    ids = [s for s in re.split(r"[,\s]+", skus or "") if s.strip()]
+    res = itemprobe.start(ids, day=ds.today().isoformat(), account=acc,
+                          force=bool(force))
+    return JSONResponse(res, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/price/probe/status")
+def api_price_probe_status():
+    """商品页探寻进度（页面轮询用）。"""
+    st = itemprobe.status()
+    # 内部 _RUN 里的 ok / fail 是成功/失败计数，避免盖掉接口的 ok=true
+    st["okCount"] = st.pop("ok", 0)
+    st["failCount"] = st.pop("fail", 0)
+    return JSONResponse({"ok": True, **st},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/price/realtime/fetch")
+def api_price_realtime_fetch(account: str | None = None):
+    """立刻抓一次今日实时商品明细（只抓 sz_product_rt，需要浏览器登录态）。"""
+    accs = (settings.ACCOUNTS if not account or str(account).lower() == "all"
+            else [settings.get_account(account)])
+    info = scrape_day.lock_info()
+    if info.get("locked") and info.get("alive"):
+        return {"ok": False, "error": "正在执行其它抓取任务，等它结束再刷新"}
+    today = ds.today().isoformat()
+    try:
+        return scrape_day.run_background(accs, today, today, force=True,
+                                         kinds=["sz_product_rt"],
+                                         name="sz-realtime", trigger="manual")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------- 竞品与关键词分析
+_COMPETE_JOBS: dict[str, dict] = {}
+_COMPETE_LOCK = threading.Lock()
+
+
+def _compete_state(sku: str) -> dict:
+    with _COMPETE_LOCK:
+        return dict(_COMPETE_JOBS.get(str(sku)) or {})
+
+
+def _sku_arg(sku: str) -> str:
+    sku = str(sku or "").strip()
+    return sku if re.fullmatch(r"\d{5,20}", sku) else ""
+
+
+@app.get("/api/compete")
+def api_compete(sku: str, account: str | None = None):
+    """读某个 SKU 的竞品/关键词分析缓存（12 小时内返回 fresh=True）。"""
+    sku = _sku_arg(sku)
+    if not sku:
+        return JSONResponse({"ok": False, "error": "SKU 不合法"},
+                            headers={"Cache-Control": "no-store"})
+    acc = compete._account_for(account) if account else None
+    fresh = compete.load_cache(sku, acc)
+    if fresh:
+        return JSONResponse({"ok": True, "data": fresh, "fresh": True},
+                            headers={"Cache-Control": "no-store"})
+    old = compete.load_cache(sku, acc, max_age=None)
+    if old:
+        return JSONResponse({"ok": True, "data": old, "fresh": False},
+                            headers={"Cache-Control": "no-store"})
+    return JSONResponse({"ok": False, "empty": True},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/compete/run")
+def api_compete_run(sku: str, account: str | None = None,
+                    keyword: str | None = None, name: str | None = None,
+                    price: float | None = None):
+    """后台抓一次：前台同款 + 行业词 + 京东推词 + 本店搜索词。"""
+    sku = str(sku or "").strip()
+    if not re.fullmatch(r"\d{5,20}", sku):
+        return {"ok": False, "error": "SKU 不合法"}
+    key = f"{sku}:{compete._account_for(account)}"
+    if _compete_state(key).get("running"):
+        return {"ok": True, "running": True}
+    with _COMPETE_LOCK:
+        _COMPETE_JOBS[key] = {"running": True, "progress": "排队中…", "error": None,
+                              "startedAt": settings.now_iso(), "finishedAt": None}
+
+    def _log(text: str) -> None:
+        with _COMPETE_LOCK:
+            job = _COMPETE_JOBS.get(key)
+            if job is not None:
+                job["progress"] = str(text)[:140]
+
+    def _work() -> None:
+        try:
+            compete.collect(sku, account=account, keyword=keyword,
+                            name=name, price=price, log=_log)
+            with _COMPETE_LOCK:
+                job = _COMPETE_JOBS.get(key) or {}
+                job.update({"running": False, "progress": "完成", "error": None,
+                            "finishedAt": settings.now_iso()})
+        except Exception as exc:  # noqa: BLE001
+            with _COMPETE_LOCK:
+                job = _COMPETE_JOBS.get(key) or {}
+                job.update({"running": False, "error": f"{type(exc).__name__}: {exc}"[:300],
+                            "finishedAt": settings.now_iso()})
+
+    threading.Thread(target=_work, daemon=True, name=f"compete-{sku}").start()
+    return {"ok": True, "running": True}
+
+
+@app.get("/api/compete/status")
+def api_compete_status(sku: str, account: str | None = None):
+    sku = _sku_arg(sku)
+    if not sku:
+        return {"ok": False, "error": "SKU 不合法"}
+    st = _compete_state(f"{sku}:{compete._account_for(account)}")
+    if not st:
+        return {"ok": True, "running": False}
+    return {"ok": True, **{k: st.get(k) for k in
+                           ("running", "progress", "error", "startedAt", "finishedAt")}}
+
+
+@app.post("/api/compete/ai")
+def api_compete_ai(sku: str, account: str | None = None):
+    """用现有 LLM 配置对某个 SKU 的竞品/关键词数据做解读（SSE 走 /api/ai/stream）。"""
+    if not settings.AI_ENABLED:
+        return {"ok": False, "error": "AI 解读已禁用（JD_AI_ENABLED=0）"}
+    sku = _sku_arg(sku)
+    if not sku:
+        return {"ok": False, "error": "SKU 不合法"}
+    data = compete.load_cache(sku, compete._account_for(account), max_age=None)
+    if not data:
+        return {"ok": False, "error": "先抓取分析数据，再让 AI 解读"}
+    job = aijobs.JOBS.new("compete", {"sku": str(sku)})
+
+    def _work() -> None:
+        try:
+            job.emit("phase", "读取竞品与关键词数据…")
+            compete.ai_run(data, on_event=lambda kind, text="": job.emit(kind, text))
+            job.finish(result={"sku": str(sku)})
+        except Exception as exc:  # noqa: BLE001
+            job.finish(error=f"{type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_work, daemon=True, name=f"compete-ai-{sku}").start()
+    return {"ok": True, "jobId": job.id}
 
 
 @app.post("/api/price/backfill")
@@ -4281,6 +6816,12 @@ class LoginSession:
         from . import config
         from .browser import has_login, launch_persistent, session_ok
         pw = ctx = None
+        # 与保活/检查/抓取共用同一个 Profile：不拿锁就起浏览器，会在「别的任务正开着
+        # 同一个 user_data_dir」时直接失败（页面表现为一直出不来二维码/窗口）。
+        if not self._profile_lock.acquire(timeout=60):
+            self._set(state="error",
+                      message="浏览器登录态正被其他任务占用（抓取/保活/检查），请等它结束再登录")
+            return
         try:
             # 容器里没有 X 显示：有头 Chromium 起不来（Playwright 只会抛一句难懂的
             # "headed browser without having a XServer"），这里先给出可操作的提示。
@@ -4345,11 +6886,19 @@ class LoginSession:
                 pw and pw.stop()
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                self._profile_lock.release()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _loop(self, account: str) -> None:
         from . import config
         from .browser import has_login, launch_persistent, session_ok
         pw = ctx = None
+        if not self._profile_lock.acquire(timeout=60):
+            self._set(state="error",
+                      message="浏览器登录态正被其他任务占用（抓取/保活/检查），请等它结束再扫码")
+            return
         try:
             pw, ctx = launch_persistent(headless=True, account=account)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -4390,6 +6939,10 @@ class LoginSession:
                 pass
             try:
                 pw and pw.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._profile_lock.release()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -4512,16 +7065,29 @@ def _ai_after_scrape(summary: dict) -> None:
 
 
 def _price_snapshot() -> None:
-    """核算前台价并落盘。单独 try 住：算价格失败不能连累 AI 解读 / 抓取结果。"""
+    """核算前台价并落盘。单独 try 住：算价格失败不能连累 AI 解读 / 抓取结果。
+
+    注意：这个回调跑在 `finish_task` 之后，任务日志（append_log）已经写不进去了，
+    所以同时 print 到容器日志 —— 否则夜里核算失败会完全看不到原因。
+    """
     try:
         done = pricewatch.run_nightly(settings.ACCOUNTS, log=_log_progress)
-        if done:
-            _log_progress("前台价核算完成：" + "；".join(
-                f"{x['label']} {x['day']} {x['skuCount']} 个 SKU" for x in done))
-        else:
-            _log_progress("前台价核算：没有可用的商智商品明细，跳过")
     except Exception as exc:  # noqa: BLE001
-        _log_progress(f"前台价核算失败：{type(exc).__name__}: {exc}")
+        text = f"前台价核算失败：{type(exc).__name__}: {exc}"
+        _log_progress(text)
+        print(f"[price] {text}", flush=True)
+        return
+    errs = [x for x in done if x.get("error")]
+    if done:
+        text = "前台价核算完成：" + "；".join(
+            f"{x.get('label') or x.get('account')} {x.get('day')} "
+            f"{x.get('skuCount', '—')} 个 SKU" for x in done if not x.get("error"))
+    else:
+        text = "前台价核算：没有可用的商智商品明细，跳过"
+    _log_progress(text)
+    print(f"[price] {text}", flush=True)
+    for x in errs:
+        print(f"[price] 失败 {x.get('account')} {x.get('day')}：{x.get('error')}", flush=True)
 
 
 def _after_scrape(summary: dict) -> None:
@@ -5017,6 +7583,65 @@ def api_login_qr():
 
 
 # ================================================================ 调度
+def _activity_nightly():
+    """凌晨团长活动抓取：报名日志（近 30 天）+ 效果（近 REFRESH_DAYS 天）。
+
+    与按天抓取共用同一把抓取锁 / 同一个浏览器 Profile，所以必须在主抓取
+    释放之后再跑（activity.run 会阻塞等锁，最长 1 小时）。
+    """
+    try:
+        today = _today()
+        start = (today - dt.timedelta(days=30)).isoformat()
+        _log_progress("团长活动：开始抓取报名日志（近 30 天）与效果数据")
+        res = activity.run(accounts=settings.ACCOUNTS, start=start,
+                           end=today.isoformat(), perf_days=settings.REFRESH_DAYS,
+                           log=_log_progress)
+        total = sum(v.get("signups", 0) for v in (res.get("accounts") or {}).values())
+        _log_progress(f"团长活动：完成，本次解析报名 {total} 条")
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"团长活动抓取失败：{type(exc).__name__}: {exc}")
+
+
+def _activity_fresh(hours: int = 6) -> bool:
+    """全部账号都在最近 N 小时内抓过，就不再重复跑（容器频繁重启时省时间）。"""
+    now = settings.now().replace(tzinfo=None)
+    for a in settings.ACCOUNTS:
+        st = activity._read(activity.acct_dir(a["key"]) / "state.json", {})
+        last = st.get("lastRun")
+        if not last:
+            return False
+        try:
+            if (now - dt.datetime.fromisoformat(last)).total_seconds() > hours * 3600:
+                return False
+        except ValueError:
+            return False
+    # 还要确认「昨天」的订单明细在：夜间任务偶尔会被抓取锁/重启打断，
+    # 只按 lastRun 判断会漏掉整天的数据。
+    yday = (settings.today() - dt.timedelta(days=1)).isoformat()
+    for a in settings.ACCOUNTS:
+        od = activity.acct_dir(a["key"]) / "orders"
+        if od.is_dir() and not (od / f"{yday}.json").exists():
+            return False
+    return True
+
+
+_ACT_SPAWN_AT = {"t": 0.0}
+
+
+def _spawn_activity_nightly() -> None:
+    if activity.runtime_status().get("active"):
+        return
+    if _activity_fresh():
+        # 不用 _log_progress：它会覆盖「当前抓取进度」，主抓取还在跑时容易误导
+        print("[activity] 最近已抓过，跳过", flush=True)
+        return
+    # 启动补跑与定时调度可能在同一分钟内各调一次，只允许安排一个线程去等锁
+    if time.time() - _ACT_SPAWN_AT["t"] < 7200:
+        return
+    _ACT_SPAWN_AT["t"] = time.time()
+    threading.Thread(target=_activity_nightly, name="activity-nightly", daemon=True).start()
+
+
 def _nightly_job():
     """回刷最近 REFRESH_DAYS 天，并补齐停机期间的空洞。"""
     # 行业大盘按「本地实际有数据的区间」单独补一份缓存：
@@ -5032,6 +7657,7 @@ def _nightly_job():
         _log_progress("数据已是最新，无需抓取")
         # 没有抓取也要核算：可能是白天手动补过数，页面摘要不该停在更早的一天
         _price_snapshot()
+        _spawn_activity_nightly()
         return
     start, end = rng
     newest = scrape_day.newest_day()
@@ -5042,6 +7668,8 @@ def _nightly_job():
                                      after=_after_scrape)
     if not res.get("ok"):
         _log_progress(f"定时任务未启动：{res.get('error')}")
+    # 主抓取已占锁，团长活动线程会等它结束后再跑（同一个 Profile 不能并发）
+    _spawn_activity_nightly()
 
 
 def _schedule_target(dt=None):
@@ -5115,18 +7743,35 @@ def _after_sz_retry(summary: dict) -> None:
 
 
 def _sz_retry_loop() -> None:
-    """白天补商智：只在 08:00~23:00、两次尝试至少间隔 1 小时、且确实还有 0 行天才发请求。
+    """白天维护商智数据（只在 08:00~23:00，且没有别的任务在跑时）：
 
-    请求量很小（每个账号 sz_product + sz_flow 各一次），不走整轮夜间抓取，
-    避免为了一个空天把京准通那堆报表重抓一遍。
+    ① 今日实时：按 SZ_RT_INTERVAL 刷新 sz_product_rt，前台价页「今日实时」卡片用；
+    ② 0 行天补抓：凌晨抓「昨天」时商智常还没出数，补上后重算前台价。
     """
     while True:
         time.sleep(300)
         try:
-            if not settings.SZ_RETRY_ENABLED:
+            if not (settings.SZ_RETRY_ENABLED or settings.SZ_RT_ENABLED):
                 continue
             now = dt_now()
             if not (settings.SZ_RETRY_START_HOUR <= now.hour <= settings.SZ_RETRY_END_HOUR):
+                continue
+            if scrape_day.is_running():
+                continue
+            # ① 今日实时（每账号 1 个请求）
+            if (settings.SZ_RT_ENABLED
+                    and time.time() - _sz_retry_state.get("rt_at", 0.0)
+                    >= settings.SZ_RT_INTERVAL):
+                _sz_retry_state["rt_at"] = time.time()
+                today = ds.today().isoformat()
+                res = scrape_day.run_background(
+                    settings.ACCOUNTS, today, today, force=True, kinds=["sz_product_rt"],
+                    log=_log_progress, name="sz-realtime", trigger="schedule")
+                if not res.get("ok"):
+                    _log_progress(f"今日实时刷新未启动：{res.get('error')}")
+                continue          # 与下面的补抓分开跑，别抢同一把锁
+            # ② 0 行天补抓
+            if not settings.SZ_RETRY_ENABLED:
                 continue
             if time.time() - _sz_retry_state["last"] < settings.SZ_RETRY_INTERVAL:
                 continue

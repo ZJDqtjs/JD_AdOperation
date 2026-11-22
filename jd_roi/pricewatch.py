@@ -44,26 +44,39 @@ def _pct(cur, base):
     return round((cur - base) / base * 100, 2)
 
 
+def _keys(account: str) -> list:
+    """account='all' 表示全部账号（按 SKU 相加）；否则就是单个账号 key。"""
+    if str(account).lower() == "all":
+        return [a["key"] for a in settings.ACCOUNTS]
+    return [str(account)]
+
+
+def _label(account: str) -> str:
+    if str(account).lower() == "all":
+        return "全部账号（总览）"
+    return settings.get_account(account).get("label") or account
+
+
 def build(account: str, start: str, end: str) -> dict:
-    """区间内每个 SKU 的逐日前台价 + 区间汇总。"""
+    """区间内每个 SKU 的逐日前台价 + 区间汇总。
+
+    account 传 "all" 时按 SKU 合并全部账号：成交金额/件数相加，价格仍是 Σ金额÷Σ件数。
+    """
     start, end = ds.norm_day(start), ds.norm_day(end)
     days = ds.day_span(start, end)
+    keys = _keys(account)
 
     missing: list = []       # 这天没文件（从未抓过）
     empty: list = []         # 文件在但 0 行（抓早了 / 接口成功但空）
     data_days: list = []     # 真正有商品明细的天
     per: dict = {}
+    # 今天还没结算：区间包含今天时，用「实时」快照（sz_product_rt）顶上，
+    # 这样表格里能直接看到今天到现在为止的前台价；拿不到就当「今天还没数据」，
+    # 不算「缺天」（那会让人以为漏抓）。
+    today = ds.today().isoformat()
+    realtime_day = ""
 
-    for day in days:
-        payload = ds.load_day(account, day, "sz_product")
-        if payload is None:
-            missing.append(day)
-            continue
-        rows = payload.get("rows") or []
-        if not rows:
-            empty.append(day)
-            continue
-        data_days.append(day)
+    def _merge(rows, day, is_rt=False):
         for r in rows:
             if r.get("$summary"):
                 continue
@@ -80,8 +93,42 @@ def build(account: str, start: str, end: str) -> dict:
                 e["img"] = r.get("img_src")
             if not e["url"] and r.get("pro_url"):
                 e["url"] = r.get("pro_url")
-            e["byDay"][day] = {"amt": _f(r.get(SZ_AMT)), "qty": _f(r.get(SZ_QTY)),
-                               "uv": _f(r.get(SZ_UV)), "ord": _f(r.get(SZ_ORDN))}
+            cur = e["byDay"].get(day) or {"amt": 0.0, "qty": 0.0, "uv": 0.0, "ord": 0.0}
+            cur["amt"] += _f(r.get(SZ_AMT))
+            cur["qty"] += _f(r.get(SZ_QTY))
+            cur["uv"] += _f(r.get(SZ_UV))
+            cur["ord"] += _f(r.get(SZ_ORDN))
+            e["byDay"][day] = cur
+            if is_rt:
+                # 昨天的同一时刻（商智 realtime 每行带回的 ##compareValue），
+                # 今天只过了一半，拿它跟昨天全天比会失真
+                cmp_ = e.get("rtCmp") or {"amt": 0.0, "qty": 0.0}
+                cmp_["amt"] += _f(r.get(SZ_AMT + "##compareValue"))
+                cmp_["qty"] += _f(r.get(SZ_QTY + "##compareValue"))
+                e["rtCmp"] = cmp_
+
+    for day in days:
+        kind = "sz_product_rt" if day == today else "sz_product"
+        any_file = any_rows = False
+        for key in keys:
+            payload = ds.load_day(key, day, kind)
+            if payload is None:
+                continue
+            any_file = True
+            rows = payload.get("rows") or []
+            if not rows:
+                continue
+            any_rows = True
+            _merge(rows, day, day == today)
+        if any_rows:
+            data_days.append(day)
+            if day == today:
+                realtime_day = day
+        elif any_file:
+            if day != today:      # 今天文件在但 0 行：只是还没出数，不算空天
+                empty.append(day)
+        elif day != today:
+            missing.append(day)
 
     rows_out: list = []
     tot_amt = tot_qty = tot_uv = 0.0
@@ -106,12 +153,28 @@ def build(account: str, start: str, end: str) -> dict:
         prices = [p for _d, p in valid]
         last_day, last_price = valid[-1]
         first_day, first_price = valid[0]
-        prev_price = valid[-2][1] if len(valid) > 1 else None
+        # 「较上日」必须真的是上一天：
+        #  · 最新是今天（实时）→ 用商智给的同刻价（昨天 00:00~此刻），
+        #    今天只过了一半，跟昨天全天比会失真
+        #  · 否则 → 只有紧邻的上一天也有价才算；中间断档（那天 0 件）就不给涨跌幅，
+        #    只标注「上次有价 X」，避免把几天前的价格说成「上日」
+        prev_price, prev_day, prev_same_time = None, "", False
+        yday = (_date.fromisoformat(last_day) - _timedelta(days=1)).isoformat()
+        if last_day == realtime_day and e.get("rtCmp"):
+            cmp_price = _price(e["rtCmp"]["amt"], e["rtCmp"]["qty"])
+            if cmp_price is not None:
+                prev_price, prev_day, prev_same_time = cmp_price, yday, True
+        if prev_price is None and len(valid) > 1:
+            back_day, back_price = valid[-2]
+            prev_day = back_day
+            if back_day == yday:
+                prev_price = back_price
         row = {
             "skuId": e["skuId"], "itemName": e["itemName"],
             "img": e["img"], "url": e["url"],
             "priceLatest": last_price, "latestDay": last_day,
-            "pricePrev": prev_price,
+            "pricePrev": prev_price, "prevDay": prev_day,
+            "prevSameTime": prev_same_time,
             "changeDod": (round(last_price - prev_price, 2)
                           if prev_price is not None else None),
             "changeDodPct": _pct(last_price, prev_price),
@@ -124,6 +187,8 @@ def build(account: str, start: str, end: str) -> dict:
             "amt": round(amt, 2), "qty": int(qty), "orders": int(orders),
             "uv": int(uv), "priceDays": len(prices),
             "spark": spark, "sparkQty": spark_qty,
+            # 这个 SKU 的「最新价」是不是今天还没结算的实时值
+            "realtime": bool(realtime_day) and last_day == realtime_day,
         }
         rows_out.append(row)
         tot_amt += amt
@@ -134,11 +199,14 @@ def build(account: str, start: str, end: str) -> dict:
     return {
         "ok": True,
         "account": account,
+        "label": _label(account),
+        "accounts": keys,
         "start": start, "end": end,
         "days": days,
         "daysWithData": data_days,
         "missingDays": missing,
         "emptyDays": empty,
+        "realtimeDay": realtime_day,
         "rows": rows_out,
         "totals": {
             "skuCount": len(rows_out),
@@ -242,11 +310,93 @@ def latest_snapshot(account: str):
         return None
 
 
+# ---------------------------------------------------------------- 今日实时
+# 商智「商品明细 → 实时」能拿当天 00:00 到此刻、且每行带 `##compareValue`
+# （昨天同一时刻的值）。用这两个数算前台价再对比，就是同刻口径 —— 不受
+# 「今天才过了一半」影响，比拿今天的均价去比昨天全天要靠谱。
+def realtime_snapshot(account: str, day: str | None = None):
+    """读今天（或指定日）的 sz_product_rt 快照，算逐 SKU 前台价与昨日同刻对比。
+
+    account="all" 时合并各账号：金额/件数相加，价格仍是 Σ金额÷Σ件数；
+    `at` 取各账号里最新的那个抓取时刻。
+    """
+    day = ds.norm_day(day or ds.today())
+    merged: dict = {}
+    at = ""
+    used = []
+    for key in _keys(account):
+        payload = ds.load_day(key, day, "sz_product_rt")
+        if not payload:
+            continue
+        rows = payload.get("rows") or []
+        if not rows:
+            continue
+        used.append(key)
+        if (payload.get("at") or "") > at:
+            at = payload.get("at") or at
+        for r in rows:
+            if r.get("$summary"):
+                continue
+            sid = str(r.get("sku_id") or "").strip()
+            if not sid or sid == "合计":
+                continue
+            e = merged.get(sid)
+            if e is None:
+                e = {"skuId": sid, "itemName": r.get("name") or "",
+                     "amt": 0.0, "qty": 0.0, "cmpAmt": 0.0, "cmpQty": 0.0}
+                merged[sid] = e
+            if r.get("name"):
+                e["itemName"] = r.get("name")
+            e["amt"] += _f(r.get(SZ_AMT))
+            e["qty"] += _f(r.get(SZ_QTY))
+            e["cmpAmt"] += _f(r.get(SZ_AMT + "##compareValue"))
+            e["cmpQty"] += _f(r.get(SZ_QTY + "##compareValue"))
+    if not merged:
+        return None
+    rows = []
+    for e in merged.values():
+        price = _price(e["amt"], e["qty"])
+        if price is None:
+            continue
+        cmp_price = _price(e["cmpAmt"], e["cmpQty"])
+        rows.append({
+            "skuId": e["skuId"], "itemName": e["itemName"],
+            "price": price, "cmpPrice": cmp_price,
+            "changePct": _pct(price, cmp_price),
+            "amt": round(e["amt"], 2), "qty": int(e["qty"]),
+            "cmpAmt": round(e["cmpAmt"], 2), "cmpQty": int(e["cmpQty"]),
+        })
+    if not rows:
+        return None
+    amt = sum(x["amt"] for x in rows)
+    qty = sum(x["qty"] for x in rows)
+    camt = sum(x["cmpAmt"] for x in rows)
+    cqty = sum(x["cmpQty"] for x in rows)
+    up = sum(1 for x in rows if (x["changePct"] or 0) > 0.5)
+    down = sum(1 for x in rows if (x["changePct"] or 0) < -0.5)
+    return {
+        "account": account,
+        "label": _label(account),
+        "accounts": used,
+        "day": day,
+        "at": at,
+        "generatedAt": settings.now_iso(),
+        "skuCount": len(rows),
+        "up": up, "down": down,
+        "amt": round(amt, 2), "qty": int(qty),
+        "cmpAmt": round(camt, 2), "cmpQty": int(cqty),
+        "avgPrice": _price(amt, qty),
+        "cmpAvgPrice": _price(camt, cqty),
+        "rows": rows,
+    }
+
+
 def run_nightly(accounts=None, days_back: int = 3, log=None) -> list:
     """夜间抓取成功后调用：核算最近几个「有商智数据」的日前台价并落盘。
 
     算的不只是最新一天：商智 T+1 只有一半、T+2~T+3 才定稿，夜里会回刷最近 15 天，
     所以把最近 3 个有数据的天一起重算覆盖，历史那两天会逐步修正成定稿值。
+    单天失败只跳过那一天，不影响其它账号/其它天（返回值里带 error）。
     """
     out = []
     for acc in (accounts or settings.ACCOUNTS):
@@ -256,8 +406,15 @@ def run_nightly(accounts=None, days_back: int = 3, log=None) -> list:
         days = [d for d in recent
                 if ds.payload_rows(ds.load_day(key, d, "sz_product")) > 0][-max(days_back, 1):]
         for day in days:
-            snap = snapshot(key, day)
-            save_snapshot(snap)
+            try:
+                snap = snapshot(key, day)
+                save_snapshot(snap)
+            except Exception as exc:  # noqa: BLE001  单天失败别拖垮整轮
+                if log:
+                    log(f"[{key}] 前台价核算失败 {day}：{type(exc).__name__}: {exc}")
+                out.append({"account": key, "label": key, "day": day,
+                            "error": f"{type(exc).__name__}: {exc}"})
+                continue
             if log:
                 log(f"[{snap['label']}] 前台价已核算 {day}：{snap['skuCount']} 个 SKU"
                     f"（涨 {snap['up']} / 跌 {snap['down']}）")

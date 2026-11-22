@@ -185,26 +185,35 @@ def has_login(context: BrowserContext) -> bool:
     return False
 
 
+# 页面里的 fetch 没有超时：网络卡在「已建连、无响应」时会一直挂着，
+# 把调用方（利润/登录/保活）整条线程连同 Profile 锁一起卡死。统一 12 秒 abort。
+_FETCH_TIMEOUT_MS = 12000
+
 _JS_LOGININFO = """
 async () => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), %d);
   try {
     const r = await fetch('https://jzt-api.jd.com/common/logininfo', {
-      method: 'POST', credentials: 'include',
+      method: 'POST', credentials: 'include', signal: ctl.signal,
       headers: {'Content-Type':'application/json','accept':'application/json, text/plain, */*',
         'referer':'https://jzt.jd.com/','language':'zh_CN','siteid':'0','loginmode':'0'},
       body: JSON.stringify({requestFrom: 0})});
     const j = await r.json();
     return j && j.code === 1;
   } catch (e) { return false; }
+  finally { clearTimeout(timer); }
 }
-"""
+""" % _FETCH_TIMEOUT_MS
 
 
 _JS_LOGININFO_DATA = """
 async () => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), %d);
   try {
     const r = await fetch('https://jzt-api.jd.com/common/logininfo', {
-      method: 'POST', credentials: 'include',
+      method: 'POST', credentials: 'include', signal: ctl.signal,
       headers: {'Content-Type':'application/json','accept':'application/json, text/plain, */*',
         'referer':'https://jzt.jd.com/','language':'zh_CN','siteid':'0','loginmode':'0'},
       body: JSON.stringify({requestFrom: 0})});
@@ -214,8 +223,9 @@ async () => {
     return {userId: d.userId || 0, pin: d.pin || '',
             name: d.userDisplayName || d.pin || ''};
   } catch (e) { return null; }
+  finally { clearTimeout(timer); }
 }
-"""
+""" % _FETCH_TIMEOUT_MS
 
 
 def login_info(page: Page) -> dict | None:

@@ -158,6 +158,8 @@ SWA_TYPES = {101: "单品推广", 118: "全店推广", 117: "新品推广"}
 # 全站营销推广管理：计划列表 + 计划下的「实际投放 SKU」（deliverySkuIds）
 SWA_AD_API = "https://jzt-api.jd.com/swa/ad/list"
 SWA_FORBID_API = "https://jzt-api.jd.com/swa/forbidden/list"
+# 全站营销「计划二级页」：生效投放商品（deliverySkuDetailList）与 SPU 全量 SKU
+SWA_DELIVERY_API = "https://jzt-api.jd.com/swa/delivery/ad/list"
 # 快车推广管理：创意列表直接带 skuId（关键词计划推的是哪个商品）
 MSA_AD_API = "https://atoms-api.jd.com/dspad/msa/promolist/item/keyword/ad"
 MSA_PAGE = "https://jzt.jd.com/msa/index.html#/list/tab/plan?objective=overview"
@@ -454,11 +456,13 @@ def fetch_swa_plans(page, start: str, end: str, page_size: int = 200) -> list[di
 
 
 def fetch_swa_delivery(page, start: str, end: str) -> dict:
-    """全站营销单品推广：SPU → 实际投放的 SKU 列表。
+    """全站营销单品推广：SPU → 实际生效投放的 SKU 列表。
 
-    单品推广是「按 SPU 投」，计划里可以把 SPU 下部分 SKU 拉黑，报表只给 SPU 汇总，
-    必须再查 swa/forbidden/list 的 deliverySkuIds 才知道真正在投哪几个 SKU。
-    返回 {spuId: {"skus": [skuId...], "names": {skuId: 商品名}}}。
+    单品推广是「按 SPU 投」，计划里可以把 SPU 下部分 SKU 拉黑/因供应商简码不一致而不生效，
+    报表只给 SPU 汇总，**计划不等于一个商品**。必须查计划二级页
+    `/swa/delivery/ad/list` 的 `deliverySkuDetailList`（生效投放商品），
+    拿不到时退回 `/swa/forbidden/list` 的 deliverySkuIds。
+    返回 {spuId: {"skus": [skuId...], "names": {skuId: 商品名}, "inactive": [skuId...]}}。
     """
     out: dict[int, dict] = {}
     try:
@@ -480,35 +484,72 @@ def fetch_swa_delivery(page, start: str, end: str) -> dict:
             continue
         if not spu:
             continue
-        payload = {"spuIds": [spu], "businessType": 600000004, "campaignType": 101,
-                   "searchType": 2,
-                   "campaignInfoList": [{"campaignId": cid, "adGroupId": gid, "spuId": spu,
-                                         "jointActivityId": 0, "activityType": 0}],
-                   "requestFrom": 0}
-        try:
-            data = _post_swa(page, SWA_FORBID_API, payload).get("data") or {}
-        except Exception:  # noqa: BLE001
-            continue
         skus: list[int] = []
-        for x in data.get("deliverySkuIds") or []:
-            try:
-                skus.append(int(x))
-            except (TypeError, ValueError):
-                pass
         names: dict[int, str] = {}
-        for sid, v in (data.get("skuDetailMap") or {}).items():
+        inactive: list[int] = []
+        # ① 计划二级页：生效投放商品（这才是「这个计划到底在投哪几个商品」）
+        try:
+            dd = _post_swa(page, SWA_DELIVERY_API, {
+                "campaignId": cid, "campaignType": 101, "startDay": start,
+                "endDay": end, "page": 1, "pageSize": 200, "requestFrom": 0,
+            }).get("data") or {}
+            for s in dd.get("deliverySkuDetailList") or []:
+                try:
+                    sid = int(s.get("skuId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not sid:
+                    continue
+                if sid not in skus:
+                    skus.append(sid)
+                nm = str(s.get("skuName") or s.get("name") or "")
+                if nm:
+                    names.setdefault(sid, nm)
+            for s in dd.get("skuDetailList") or []:
+                try:
+                    sid = int(s.get("skuId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                nm = str(s.get("skuName") or s.get("name") or "")
+                if nm:
+                    names.setdefault(sid, nm)
+                if sid and sid not in skus and sid not in inactive:
+                    inactive.append(sid)
+        except Exception:  # noqa: BLE001
+            pass
+        # ② 兜底：forbidden/list 的 deliverySkuIds（老接口，仍会排除黑名单）
+        if not skus:
+            payload = {"spuIds": [spu], "businessType": 600000004, "campaignType": 101,
+                       "searchType": 2,
+                       "campaignInfoList": [{"campaignId": cid, "adGroupId": gid, "spuId": spu,
+                                             "jointActivityId": 0, "activityType": 0}],
+                       "requestFrom": 0}
             try:
-                names[int(sid)] = str((v or {}).get("skuName") or (v or {}).get("name") or "")
-            except (TypeError, ValueError):
+                data = _post_swa(page, SWA_FORBID_API, payload).get("data") or {}
+                for x in data.get("deliverySkuIds") or []:
+                    try:
+                        skus.append(int(x))
+                    except (TypeError, ValueError):
+                        pass
+                for sid, v in (data.get("skuDetailMap") or {}).items():
+                    try:
+                        names.setdefault(int(sid), str((v or {}).get("skuName")
+                                                       or (v or {}).get("name") or ""))
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:  # noqa: BLE001
                 pass
         if skus:
-            slot = out.setdefault(spu, {"skus": [], "names": {}})
+            slot = out.setdefault(spu, {"skus": [], "names": {}, "inactive": []})
             for sku in skus:
                 if sku not in slot["skus"]:
                     slot["skus"].append(sku)
             for sid, nm in names.items():
                 if nm:
                     slot["names"].setdefault(sid, nm)
+            for sid in inactive:
+                if sid not in slot["inactive"]:
+                    slot["inactive"].append(sid)
         _sleep(DELAY_PAGE)
     return out
 

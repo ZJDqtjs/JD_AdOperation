@@ -1158,7 +1158,7 @@ def compact_for_ai(ind: dict | None) -> dict:
         })
     note = ""
     if len(all_accounts) > 3:
-        note = f"共 {len(all_accounts)} 个账号，AI 摘要只列前 3 个；完整明细见报表⑧行业大盘页签"
+        note = f"共 {len(all_accounts)} 个账号，AI 摘要只列前 3 个；完整明细见报表⑨行业大盘页签"
     return {"available": True, "caliber": ind.get("caliber"),
             "accounts": accounts, "gaps": (ind.get("gaps") or [])[:8], "note": note}
 
