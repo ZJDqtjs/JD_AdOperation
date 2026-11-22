@@ -24,11 +24,12 @@ SPIKE_SVG = (
     '</g></svg>'
 )
 
-_NAV_ITEMS = [("/", "控制台"), ("/report", "分析报表"),
+_NAV_ITEMS = [("/", "控制台"),
+              ("分析报表", [("/report", "区间报表"), ("/vs", "史上最强vs现代最强")]),
               ("/ai", "AI 分析台"),
               ("广告情况", [("/paycomm", "CPS花费"), ("/paycomm/spend", "京准通花费"),
                            ("/cashflow", "广告费流水"),
-                           ("/profit", "月度利润"), ("/maobao", "毛利诊断")]),
+                           ("/profit", "月度利润"), ("/maobao", "毛保诊断")]),
               ("/price", "SKU前台价"), ("/activity", "团长活动")]
 
 

@@ -62,8 +62,8 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse, Response, StreamingResponse)
 
 from . import (activity, aijobs, ai_page, analyze2, analyze_ai, cashflow, compete, config,
-               dailystore as ds, industry, itemprobe, maobao, paycomm, pricewatch,
-               profit, report2, scrape_day, settings)
+               dailystore as ds, industry, itemprobe, llm, maobao, paycomm, pricewatch,
+               profit, report2, scrape_day, settings, vs)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -80,7 +80,7 @@ URL_PREFIX = (os.getenv("JD_URL_PREFIX", "") or "").rstrip("/")
 _ATTR_RE = re.compile(r'\b(href|src|action)=(["\'])/(?!/)')
 # 只给已知的首段路径补前缀，避免误伤 JS 里的 split('/') 之类的普通字符串
 _URL_STR_RE = re.compile(
-    r'(["\'])/(?=(?:api|login|report|ai|assets|healthz|favicon\.ico'
+    r'(["\'])/(?=(?:api|login|report|vs|ai|assets|healthz|favicon\.ico'
     r'|cashflow|paycomm|profit|price|cache)\b)')
 
 
@@ -814,6 +814,7 @@ def report(request: Request):
             status_code=200)
     ui = _range_bar(start, end, keys, "/report",
                     extra='<a href="/">← 控制台</a>'
+                          '<a href="/vs?preset=switch">史上最强vs现代最强 →</a>'
                           '<a href="/ai?start=%s&end=%s&accounts=%s">AI 分析台（可追问）→</a>'
                           '<a href="/api/analysis?start=%s&end=%s&accounts=%s" target="_blank">看 JSON</a>'
                           % (_e(start), _e(end), _e(",".join(keys)),
@@ -827,6 +828,76 @@ def report(request: Request):
           f"render {time.time() - t1:.2f}s 成本={(settings.COSTS_SOURCE or {}).get('kind')}",
           flush=True)
     return HTMLResponse(html_out)
+
+
+# ================================================================ 史上最强 vs 现代最强
+@app.get("/vs", response_class=HTMLResponse)
+def vs_page(request: Request):
+    """任意两区间对比：A=史上最强、B=现代最强，统一用商智成交额看费比。"""
+    q = request.query_params
+    preset = (q.get("preset") or "").strip()
+    yday = _today() - dt.timedelta(days=1)
+    if preset == "switch":
+        a_start, a_end = "2026-11-06", "2026-11-17"
+        b_start, b_end = "2026-11-19", "2026-11-20"
+    elif preset == "week":
+        b_end_d = yday
+        b_start_d = b_end_d - dt.timedelta(days=6)
+        a_end_d = b_start_d - dt.timedelta(days=1)
+        a_start_d = a_end_d - dt.timedelta(days=6)
+        a_start, a_end = a_start_d.isoformat(), a_end_d.isoformat()
+        b_start, b_end = b_start_d.isoformat(), b_end_d.isoformat()
+    else:
+        a_start = q.get("a_start") or vs.DEFAULT_A[0]
+        a_end = q.get("a_end") or vs.DEFAULT_A[1]
+        b_start = q.get("b_start") or vs.DEFAULT_B[0]
+        b_end = q.get("b_end") or vs.DEFAULT_B[1]
+    a_start, a_end = ds.norm_day(a_start), ds.norm_day(a_end)
+    b_start, b_end = ds.norm_day(b_start), ds.norm_day(b_end)
+    if a_start > a_end:
+        a_start, a_end = a_end, a_start
+    if b_start > b_end:
+        b_start, b_end = b_end, b_start
+    keys = q.getlist("accounts")
+    if keys:
+        accounts = account_list(keys)
+    else:
+        # 默认只看做过切换的两个账号；其他账号可在页面上勾选
+        accounts = [a for a in settings.ACCOUNTS if a.get("key") in ("main", "b")] or settings.ACCOUNTS
+    try:
+        data = vs.build(a_start, a_end, b_start, b_end, accounts)
+    except FileNotFoundError as exc:
+        return HTMLResponse(vs.error_page(str(exc)), status_code=200)
+    return HTMLResponse(vs.render(data, accounts_all=settings.ACCOUNTS, preset=preset))
+
+
+@app.post("/api/vs/insight")
+def vs_insight(payload: dict | None = None):
+    """用现有 LLM 接口解读当前 A/B 对比（同步调用，页面按钮触发）。"""
+    p = payload or {}
+    a_start = ds.norm_day(p.get("a_start") or vs.DEFAULT_A[0])
+    a_end = ds.norm_day(p.get("a_end") or vs.DEFAULT_A[1])
+    b_start = ds.norm_day(p.get("b_start") or vs.DEFAULT_B[0])
+    b_end = ds.norm_day(p.get("b_end") or vs.DEFAULT_B[1])
+    if a_start > a_end:
+        a_start, a_end = a_end, a_start
+    if b_start > b_end:
+        b_start, b_end = b_end, b_start
+    keys = p.get("accounts") or ["main", "b"]
+    accounts = [settings.get_account(k) for k in keys if settings.get_account(k)]
+    if not accounts:
+        return JSONResponse({"ok": False, "error": "没有可用账号"}, status_code=400)
+    try:
+        data = vs.build(a_start, a_end, b_start, b_end, accounts)
+        text = llm.chat([
+            {"role": "system",
+             "content": "你是京东广告投放分析师。只输出中文结论，条目化，不要客套，不要编造数据。"},
+            {"role": "user", "content": vs.insight_prompt(data)},
+        ], max_tokens=900, timeout=90)
+        return {"ok": True, "text": text}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                            status_code=500)
 
 
 # ================================================================ AI 分析台
@@ -2573,7 +2644,7 @@ function sort(k){
   render();
 }
 
-/* ---------------- 毛利诊断（京东毛保） ---------------- */
+/* ---------------- 毛保诊断（京东毛保） ---------------- */
 function mbConf(){ return (INIT.maobao || {}); }
 function mbRules(){
   var key = $('pfAcc').value;
@@ -2638,9 +2709,9 @@ function mbTable(groups){
   return h+'</tbody></table></div>';
 }
 function maobao(){
-  if(!ROWS.length){ msg('先查询出利润明细，再做毛利诊断','bad'); return; }
+  if(!ROWS.length){ msg('先查询出利润明细，再做毛保诊断','bad'); return; }
   var acc = $('pfAcc').value;
-  if(acc === 'all'){ msg('毛利诊断按账号结算，请先选择具体账号（例如雨润禾）','bad'); return; }
+  if(acc === 'all'){ msg('毛保诊断按账号结算，请先选择具体账号（例如雨润禾）','bad'); return; }
   var rules = mbRules();
   var groups = {
     frozen:{temp:'frozen',label:'冷冻品',qty:0,sale:0,settle:0,profit:0,items:[]},
@@ -2704,7 +2775,7 @@ function maobao(){
       + '<p><b>温层判定</b>：已登记 SKU 按登记表；未登记的按商品名关键词（冷冻/速冻/解冻/薯条/什锦/杂菜/毛豆/青豆/纳豆 → 冷冻，'
       + '冻干 → 常温），都没有按常温。</p></div>';
   $('mbModal').classList.add('open');
-  msg('毛利诊断：' + accLabel + '，触发补差 ¥' + fmt(shortfall,'money'));
+  msg('毛保诊断：' + accLabel + '，触发补差 ¥' + fmt(shortfall,'money'));
 }
 function closeMaobao(){ var m = $('mbModal'); if(m) m.classList.remove('open'); }
 window.PF = {run:run, refetch:refetch, exp:exp, expView:expView, dim:dim, sort:sort,
@@ -2802,7 +2873,7 @@ def profit_page(request: Request):
   <h2><span id="pfTableTitle">SKU 明细</span> <span class="tagline">点表头可换排序</span>
     <button class="btn sec mini" id="pfMaobao" onclick="PF.maobao()"
             style="margin-left:12px"
-            title="按「平均前台价 − 扣点后采购价」测算京东毛利，判断是否触发毛保">毛利诊断</button>
+            title="按「平均前台价 − 扣点后采购价」测算京东毛利，判断是否触发毛保">毛保诊断</button>
   </h2>
   <div class="toolbar">
     <span class="tabs" style="margin:0 12px 8px 0">
@@ -2823,7 +2894,7 @@ def profit_page(request: Request):
 <div class="modal" id="mbModal" onclick="if(event.target===this)PF.closeMaobao()">
   <div class="modal-card" style="max-width:1120px">
     <div class="modal-head">
-      <h2>毛利诊断 · 京东毛保测算</h2>
+      <h2>毛保诊断 · 京东毛保测算</h2>
       <span class="hint" id="mbMeta" style="margin:0"></span>
       <button class="btn sec mini" onclick="PF.closeMaobao()">关闭</button>
     </div>
@@ -2844,7 +2915,7 @@ def profit_page(request: Request):
      这里也能看到件数与毛利（悬停可看「成交账号」）。两个账号的商智都没有它时，才是 0 件数、毛利 0 的纯花费行。</p>
   <p>注意：同一个 SKU 若两个账号都在投，会同时出现在两张表里且各自带全额成交，跨账号相加会重复计成交与毛利，
      按账号单独看才准。</p>
-  <p><b>毛利诊断</b>（「SKU 明细」右侧按钮）：京东毛利 = 平均前台价 − 扣点后采购价，
+  <p><b>毛保诊断</b>（「SKU 明细」右侧按钮）：京东毛利 = 平均前台价 − 扣点后采购价，
      毛利率 = 京东毛利合计 ÷ 结算给我们的扣点后采购价合计。雨润禾账号常温品低于 10%、冷冻品低于 18% 触发毛保，
      诊断里给出触发温层与需补利润（= 毛保线 × 结算采购额 − 实际毛利额）。</p>
 </div>
@@ -2956,7 +3027,7 @@ def _mb_html(diag: dict, acc_label: str, start: str, end: str, saved_at: str = "
 
 @app.get("/maobao", response_class=HTMLResponse)
 def maobao_page(request: Request):
-    """毛利诊断（京东毛保）独立页：读本地利润缓存，按温层判定是否触发毛保。"""
+    """毛保诊断（京东毛保）独立页：读本地利润缓存，按温层判定是否触发毛保。"""
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
     labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS}
@@ -2988,13 +3059,13 @@ def maobao_page(request: Request):
 
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>毛利诊断 · 京东广告运营</title>
+<title>毛保诊断 · 京东广告运营</title>
 <style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{PAYCOMM_CSS}</style>
 </head><body>
 {report2.navtop("/maobao")}
 <header class="top"><div class="wrap pagehead">
   <div class="eyebrow">{report2.SPIKE_SVG}毛保</div>
-  <h1>毛利诊断 · 京东毛保测算</h1>
+  <h1>毛保诊断 · 京东毛保测算</h1>
   <div class="metaline">
     <span>京东毛利 = 平均前台价 − 扣点后采购价</span><span class="dot"></span>
     <span>数据与「月度利润」同一份本地缓存</span>
@@ -4506,13 +4577,16 @@ function load(acc, s, e){
 function loadRt(acc){
   var m = $('pwRtMsg'), box = $('pwRtBody');
   if(!m || !box) return;
+  var qm = $('pwQtyMsg'), qb = $('pwQtyBody');
   m.textContent = '读取今日实时…';
   box.innerHTML = '';
+  if(qm) qm.textContent = '读取今日实时…';
+  if(qb) qb.innerHTML = '';
   fetch('/api/price/realtime?account=' + encodeURIComponent(acc || $('pwAcc').value),
         {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(j){
-      if(!j.ok){ m.textContent = j.error || '今天还没有实时数据'; return; }
+      if(!j.ok){ m.textContent = j.error || '今天还没有实时数据'; qtyRank(j); return; }
       RT = j;
       var diff = '';
       var a = num(j.avgPrice), b = num(j.cmpAvgPrice);
@@ -4529,6 +4603,7 @@ function loadRt(acc){
         + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>'
         + (j.probe && j.probe.count
             ? '　商品页已探寻 <b>' + cnt(j.probe.count) + '</b> 个' : '');
+      qtyRank(j);
       var list = (j.rows || []).filter(function(r){
         var p = num(r.price), c = num(r.cmpPrice);
         return p !== null && c !== null && Math.abs(p - c) > 1;
@@ -4587,6 +4662,67 @@ function loadRt(acc){
         .catch(function(){ maybeAutoProbe(drops); });
     })
     .catch(function(){ m.textContent = '读取今日实时失败'; });
+}
+
+/* 销量变动榜：今日 00:00 到此刻 vs 昨天同一时刻，按件数变动排序 */
+function qtyRank(j){
+  var m = $('pwQtyMsg'), box = $('pwQtyBody');
+  if(!m || !box) return;
+  if(!j || !j.ok){
+    m.textContent = (j && j.error) || '今天还没有实时数据';
+    box.innerHTML = '';
+    return;
+  }
+  var all = [];
+  (j.rows || []).forEach(function(r){
+    var q = num(r.qty), c = num(r.cmpQty);
+    if(q === null) q = 0;
+    if(c === null) c = 0;
+    // 件数太少的榜噪声大：今日、昨日同刻都不到 3 件的不进榜
+    if(Math.max(q, c) < 3) return;
+    all.push({r: r, q: q, c: c, d: q - c, pct: c > 0 ? (q - c) / c * 100 : null});
+  });
+  var up = 0, down = 0;
+  all.forEach(function(x){ if(x.d > 0) up++; else if(x.d < 0) down++; });
+  m.innerHTML = (j.account === 'all' ? '<b>全部账号</b>　' : '')
+    + '截至 <b>' + esc(j.at || '—') + '</b>'
+    + '　件数增加 <span class="up">' + cnt(up) + '</span> / 减少 <span class="down">' + cnt(down) + '</span>'
+    + '　<span class="flat">只列今日/昨日同刻件数 ≥3 的 SKU，按变动件数排序</span>';
+  all.sort(function(a, b){
+    var x = Math.abs(b.d) - Math.abs(a.d);
+    if(x !== 0) return x;
+    return Math.abs(b.pct || 0) - Math.abs(a.pct || 0);
+  });
+  var list = all.slice(0, 10);
+  if(!list.length){
+    box.innerHTML = '<div class="pwsub">今天还没有可比的销量数据。</div>';
+    return;
+  }
+  box.innerHTML = '<div class="pwrtlist"><table><thead><tr>'
+    + '<th class="l noSort">商品（销量变动前 10）</th>'
+    + '<th class="n noSort">今日件数</th><th class="n noSort">昨日同刻</th>'
+    + '<th class="n noSort">变动件数</th><th class="n noSort">变动幅度</th>'
+    + '<th class="n noSort">今日前台价</th></tr></thead><tbody>'
+    + list.map(function(x){
+        var r = x.r;
+        var pp = num(r.probePrice), sp = num(r.price);
+        var front = pp !== null ? pp : sp;
+        var dcls = x.d > 0 ? 'up' : (x.d < 0 ? 'down' : 'flat');
+        var dtxt = (x.d > 0 ? '+' : '') + cnt(x.d);
+        var pct = x.pct !== null ? pctCell(x.pct, '') : '<span class="flat">新增</span>';
+        var hasBadge = (r.probeBadges && r.probeBadges.length)
+          || (r.probeSeckill && num(r.probeSeckill.price) !== null);
+        var priceCell = pp !== null
+          ? (money(pp) + (hasBadge ? ' ' + badges(r.probeBadges, r.probeSeckill) : ''))
+          : money(sp);
+        return '<tr class="pwrow" data-sku="' + esc(r.skuId) + '" onclick="PW.pickSku(this.getAttribute(\'data-sku\'))">'
+          + '<td class="l"><div class="nm" title="' + esc(r.itemName) + '">' + esc(r.itemName || r.skuId) + '</div>'
+          + '<div class="id">' + skuLink(r.skuId) + '</div></td>'
+          + '<td>' + cnt(x.q) + '</td><td>' + cnt(x.c) + '</td>'
+          + '<td><span class="' + dcls + '">' + dtxt + '</span></td>'
+          + '<td>' + pct + '</td><td>' + priceCell + '</td></tr>';
+      }).join('')
+    + '</tbody></table></div>';
 }
 
 /* 自动探寻：本会话只触发一次，跳过 15 分钟内已探过的 SKU（服务端也会再筛一遍） */
@@ -4695,29 +4831,14 @@ function loadSnap(acc){
         {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(j){
-      if(j.ok && j.all){
-        // 全部账号：夜间核算是按账号分别算的，这里逐账号列出来
-        m.textContent = '全部账号：每个账号各自核算（不合并价格）';
-        box.innerHTML = '<div class="pwrtlist"><table><thead><tr>'
-          + '<th class="l noSort">账号</th><th class="n noSort">核算日</th>'
-          + '<th class="n noSort">有成交 SKU</th><th class="n noSort">涨 / 跌</th>'
-          + '<th class="n noSort">当日均价</th></tr></thead><tbody>'
-          + j.all.map(function(x){
-              return '<tr><td class="l"><b>' + esc(x.label || x.account) + '</b></td>'
-                + '<td>' + esc(x.day || '—') + '</td><td>' + cnt(x.skuCount) + '</td>'
-                + '<td><span class="up">' + cnt(x.up) + '</span> / <span class="down">'
-                + cnt(x.down) + '</span></td><td>' + money(x.avgPrice) + '</td></tr>';
-            }).join('')
-          + '</tbody></table></div>';
-        return;
-      }
       if(!j.ok){
         m.textContent = j.error || '还没有核算记录';
         return;
       }
       SNAP = j;
+      var allMode = !!(j.all && j.all.length);
       var at = String(j.generatedAt || '').replace('T', ' ').slice(0, 16);
-      m.innerHTML = '最近核算 <b>' + esc(j.day) + '</b>'
+      m.innerHTML = (allMode ? '<b>全部账号（按 SKU 合并）</b>　' : '') + '最近核算 <b>' + esc(j.day) + '</b>'
         + (at ? '（' + esc(at) + '）' : '')
         + '　核算日有成交 <b>' + cnt(j.skuCount) + '</b> 个 SKU'
         + '　涨 <span class="up">' + cnt(j.up) + '</span> / 跌 <span class="down">' + cnt(j.down) + '</span>'
@@ -4747,9 +4868,11 @@ function loadSnap(acc){
         + list.map(function(r){
             var tp = num(r.todayPrice);
             var fromProbe = num(r.probePrice) !== null;
+            var hasBadge = (r.probeBadges && r.probeBadges.length)
+              || (r.probeSeckill && num(r.probeSeckill.price) !== null);
             var todayCell = tp !== null
               ? ('<span class="pwcur">' + money(tp) + '</span> '
-                 + (fromProbe ? badges(r.probeBadges, r.probeSeckill) : '')
+                 + (fromProbe && hasBadge ? badges(r.probeBadges, r.probeSeckill) : '')
                  + '<div class="pwsub">' + (fromProbe ? '商品页' : '商智实时') + '</div>')
               : '<span class="flat">待探寻</span>';
             var snapSub = num(r.changeDodPct) !== null
@@ -5227,9 +5350,9 @@ def price_page(request: Request):
     """
     q = request.query_params
     keys = [a["key"] for a in settings.ACCOUNTS]
-    acc = q.get("account") or settings.MAIN_ACCOUNT
+    acc = q.get("account") or "all"
     if acc != "all" and acc not in keys:
-        acc = settings.MAIN_ACCOUNT
+        acc = "all"
     end = _today()
     start = end - dt.timedelta(days=29)
     if q.get("start") and q.get("end"):
@@ -5296,6 +5419,12 @@ def price_page(request: Request):
             title="立刻抓一次今天的商智实时商品明细（只抓这一个报表）">刷新今日实时</button></h2>
   <div class="hint" id="pwRtMsg" style="margin-bottom:0">读取今日实时…</div>
   <div id="pwRtBody"></div>
+</div>
+
+<div class="card" id="pwQtyCard" style="margin-top:18px">
+  <h2>销量变动榜 <span class="tagline">今日 00:00 到此刻 vs 昨天同一时刻 · 按件数变动排序</span></h2>
+  <div class="hint" id="pwQtyMsg" style="margin-bottom:0">读取今日实时…</div>
+  <div id="pwQtyBody"></div>
 </div>
 
 <div class="card" id="pwAutoCard" style="margin-top:18px">
@@ -5385,6 +5514,10 @@ def price_page(request: Request):
      页面白天每 30 分钟自动刷新一次（也可点「刷新今日实时」）。因为今天还没结束，
      对比用的是<b>昨天同一时刻</b>而不是昨天全天，避免「今天只过了一半」的误判；
      数字会随白天继续成交变化，只看趋势，不要当成最终价。</p>
+  <p><b>销量变动榜</b>：同口径对比「今日 00:00 到此刻」与「昨天同一时刻」的成交件数，
+     只列今日 / 昨日同刻件数 ≥3 的 SKU，按<b>变动件数</b>排序，同时给出变动幅度和今日前台价。
+     价格没怎么动但销量突然放大或掉零，通常不是价格问题，更像流量、竞价或活动节奏变化；
+     配合上面的价格变动和秒杀标识，可以更快定位是「降价带量」还是「流量变了」。</p>
   <p><b>降价探寻（本页新增）</b>：商智成交均价只能看出「降了」，看不出「为什么降」。
      页面对今天降价的 SKU 自动打开对应京东商品页（<code>item.jd.com/&lt;SKU&gt;.html</code>），
      把<b>页面展示价</b>和<b>秒杀标识</b>带回来。一旦取到商品页价，就用它显示「今日前台价」，
@@ -5435,49 +5568,18 @@ def api_price(account: str | None = None, start: str = "", end: str = ""):
     return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
 
-@app.get("/api/price/snapshot")
-def api_price_snapshot(account: str | None = None):
-    """最近一次「夜间自动核算」结果（凌晨抓完数据后由 pricewatch.run_nightly 落盘）。"""
-    keys = [a["key"] for a in settings.ACCOUNTS]
-    acc = account or settings.MAIN_ACCOUNT
-    if acc != "all" and acc not in keys:
-        acc = settings.MAIN_ACCOUNT
-    if str(acc).lower() == "all":
-        # 全部账号：夜间核算是按账号各算一份，这里列成一张表（不强行合并价格）
-        items = []
-        for a in settings.ACCOUNTS:
-            s = pricewatch.latest_snapshot(a["key"])
-            if s:
-                items.append({k: s.get(k) for k in
-                              ("account", "label", "day", "skuCount", "up", "down",
-                               "avgPrice", "generatedAt")})
-        if not items:
-            return JSONResponse({"ok": False, "empty": True,
-                                 "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）"},
-                                headers={"Cache-Control": "no-store"})
-        return JSONResponse({"ok": True, "all": items},
-                            headers={"Cache-Control": "no-store"})
-    snap = pricewatch.latest_snapshot(acc)
-    if not snap:
-        return JSONResponse({"ok": False, "empty": True,
-                             "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）；"
-                                      "下面价格表本身是现算的，可以先直接看"},
-                            headers={"Cache-Control": "no-store"})
-    # 夜间核算的是「已结算的昨天」；卡片要展示今天的前台价，得叠加：
-    #   ① 今天商品页探寻价（优先，用户看到的前台标价）
-    #   ② 今天商智实时价（商品页价没抓到时兜底）
-    today = ds.today().isoformat()
+def _snapshot_attach_today(rows: list, acc: str, today: str) -> dict:
+    """给夜间核算行补「今日前台价」：商品页价优先，商智实时价兜底。"""
     try:
-        snap["probe"] = itemprobe.attach(snap.get("rows") or [], today)
+        probe = itemprobe.attach(rows, today)
     except Exception as exc:  # noqa: BLE001
-        snap["probe"] = {"available": False,
-                         "error": f"{type(exc).__name__}: {exc}"[:200]}
+        probe = {"available": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
     try:
         rt = pricewatch.realtime_snapshot(acc, today)
     except Exception:  # noqa: BLE001
         rt = None
     rtmap = {str(x.get("skuId") or ""): x for x in ((rt or {}).get("rows") or [])}
-    for r in snap.get("rows") or []:
+    for r in rows or []:
         t = rtmap.get(str(r.get("skuId") or ""))
         if t:
             r["todaySzPrice"] = t.get("price")
@@ -5490,6 +5592,101 @@ def api_price_snapshot(account: str | None = None):
         if price is not None and base:
             r["todayChange"] = round(price - base, 2)
             r["todayChangePct"] = round((price - base) / base * 100, 2)
+    return probe
+
+
+def _merged_snapshot() -> dict | None:
+    """全部账号：把各账号最新核算按 SKU 合并（金额/件数相加，价格 Σ金额÷Σ件数）。"""
+    snaps = []
+    for a in settings.ACCOUNTS:
+        s = pricewatch.latest_snapshot(a["key"])
+        if s:
+            snaps.append(s)
+    if not snaps:
+        return None
+    day = max((s.get("day") or "") for s in snaps)
+    merged: dict = {}
+    for s in snaps:
+        if (s.get("day") or "") != day:
+            continue
+        for r in s.get("rows") or []:
+            sid = str(r.get("skuId") or "")
+            if not sid:
+                continue
+            e = merged.setdefault(sid, {"skuId": sid, "itemName": "", "amt": 0.0,
+                                        "qty": 0.0, "_wp": 0.0, "_wq": 0.0})
+            if not e["itemName"] and r.get("itemName"):
+                e["itemName"] = r["itemName"]
+            q = float(r.get("qty") or 0)
+            e["amt"] += float(r.get("amt") or 0)
+            e["qty"] += q
+            pct = r.get("changeDodPct")
+            if pct is not None and q > 0:
+                e["_wp"] += float(pct) * q
+                e["_wq"] += q
+    rows = []
+    for e in merged.values():
+        qty, amt, wp, wq = e["qty"], e["amt"], e["_wp"], e["_wq"]
+        if qty <= 0 or amt <= 0:
+            continue
+        rows.append({
+            "skuId": e["skuId"], "itemName": e["itemName"],
+            "priceLatest": round(amt / qty, 2),
+            "pricePrev": None, "changeDod": None,
+            "changeDodPct": round(wp / wq, 2) if wq else None,
+            "amt": round(amt, 2), "qty": int(qty),
+        })
+    rows.sort(key=lambda r: r["amt"], reverse=True)
+    total_amt = sum(r["amt"] for r in rows)
+    total_qty = sum(r["qty"] for r in rows)
+    up = sum(1 for r in rows if (r["changeDodPct"] or 0) > 0.5)
+    down = sum(1 for r in rows if (r["changeDodPct"] or 0) < -0.5)
+    return {
+        "account": "all", "label": "全部账号（总览）",
+        "accounts": [s.get("account") for s in snaps],
+        "day": day,
+        "generatedAt": max((s.get("generatedAt") or "") for s in snaps),
+        "skuCount": len(rows), "up": up, "down": down,
+        "amt": round(total_amt, 2), "qty": int(total_qty),
+        "avgPrice": round(total_amt / total_qty, 2) if total_qty else None,
+        "rows": rows,
+        "accountSummaries": [
+            {k: s.get(k) for k in ("account", "label", "day", "skuCount", "up", "down",
+                                   "avgPrice", "generatedAt")}
+            for s in snaps
+        ],
+    }
+
+
+@app.get("/api/price/snapshot")
+def api_price_snapshot(account: str | None = None):
+    """最近一次「夜间自动核算」结果（凌晨抓完数据后由 pricewatch.run_nightly 落盘）。
+
+    account='all' 时按 SKU 合并各账号，卡片仍能看到逐商品明细。
+    """
+    keys = [a["key"] for a in settings.ACCOUNTS]
+    acc = account or settings.MAIN_ACCOUNT
+    if acc != "all" and acc not in keys:
+        acc = settings.MAIN_ACCOUNT
+    today = ds.today().isoformat()
+    if str(acc).lower() == "all":
+        snap = _merged_snapshot()
+        if not snap:
+            return JSONResponse({"ok": False, "empty": True,
+                                 "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）"},
+                                headers={"Cache-Control": "no-store"})
+        snap["probe"] = _snapshot_attach_today(snap["rows"], "all", today)
+        snap["today"] = today
+        summaries = snap.pop("accountSummaries", [])
+        return JSONResponse({"ok": True, "all": summaries, **snap},
+                            headers={"Cache-Control": "no-store"})
+    snap = pricewatch.latest_snapshot(acc)
+    if not snap:
+        return JSONResponse({"ok": False, "empty": True,
+                             "error": "还没有夜间核算记录（每天凌晨抓完数据后自动生成）；"
+                                      "下面价格表本身是现算的，可以先直接看"},
+                            headers={"Cache-Control": "no-store"})
+    snap["probe"] = _snapshot_attach_today(snap.get("rows") or [], acc, today)
     snap["today"] = today
     return JSONResponse({"ok": True, **snap}, headers={"Cache-Control": "no-store"})
 
