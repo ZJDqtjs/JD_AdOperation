@@ -1421,7 +1421,7 @@ class PayCommRunner:
         """
         blocks: dict[str, dict] = {}
         missing: list[str] = []
-        for a in settings.ACCOUNTS:
+        for a in settings.ad_accounts():
             try:
                 d = self.cached_result(a["key"], start, end)
             except Exception:  # noqa: BLE001
@@ -1464,7 +1464,7 @@ class PayCommRunner:
 
     def _work_all(self, job_id: str, start: str, end: str) -> None:
         try:
-            accs = list(settings.ACCOUNTS)
+            accs = list(settings.ad_accounts())
             labels = {a["key"]: (a.get("label") or a["key"]) for a in accs}
             keys = [a["key"] for a in accs]
             for i, key in enumerate(keys, 1):

@@ -67,7 +67,7 @@ def _r(v, nd: int = 2) -> float:
 
 
 def _account_for(account: str | None) -> str:
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     if account and account in keys:
         return account
     return settings.MAIN_ACCOUNT

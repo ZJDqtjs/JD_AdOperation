@@ -192,6 +192,13 @@ SZ_RETRY_LOOKBACK = _env_int("JD_SZ_RETRY_LOOKBACK", 3)         # 只看最近�
 SZ_RT_ENABLED = _env_bool("JD_SZ_RT", True)
 SZ_RT_INTERVAL = _env_int("JD_SZ_RT_INTERVAL", 1800)            # 秒（默认 30 分钟）
 
+# ---------------- POP 店订单 ----------------
+# 「只看订单」的店铺（accounts.json 里 orders_only=true，或账号名带 pop）不抓广告，
+# 改为每天缓存商家后台订单列表（jd_roi/pop_orders.py），供 /pop 页面筛选统计。
+POP_ORDER_ENABLED = _env_bool("JD_POP_ORDER", True)
+POP_ORDER_REFRESH_DAYS = _env_int("JD_POP_ORDER_REFRESH_DAYS", 7)     # 每晚回刷最近 N 天
+POP_ORDER_BACKFILL_DAYS = _env_int("JD_POP_ORDER_BACKFILL_DAYS", 30)  # 首次补多少天
+
 # ---------------- 抓取 ----------------
 HEADLESS = _env_bool("JD_HEADLESS", True)
 SW_MAX_ROWS = _env_int("JD_SW_MAX_ROWS", 2000)
@@ -244,6 +251,8 @@ def _normalize(accs: list) -> list:
         acc["user_data_dir"] = a.get("user_data_dir") or default_profile_dir(key)
         # 「主账号」用显式标记，不再依赖列表第一位：调整显示顺序时主账号不会跟着漂
         acc["main"] = bool(a.get("main"))
+        # 「只看订单」的店铺（POP 店）：不参与任何广告抓取/报表，只按天缓存订单列表
+        acc["orders_only"] = bool(a.get("orders_only"))
         out.append(acc)
     return out
 
@@ -309,6 +318,25 @@ def get_account(key: str | None = None) -> dict:
                                          "user_data_dir": str(AUTH_DIR / "main")}
 
 
+def is_order_account(acc) -> bool:
+    """这个账号是否「只看订单」（不抓广告）。
+
+    显式标记 orders_only 优先；老配置没写标记时，账号名里带 pop 的也按订单账号处理，
+    避免升级后把 POP 店当成广告账号去抓京准通。
+    """
+    if not isinstance(acc, dict):
+        acc = get_account(str(acc)) if acc else get_account()
+    return bool(acc.get("orders_only")) or "pop" in str(acc.get("label") or "").lower()
+
+
+def order_accounts(accs: list | None = None) -> list:
+    return [a for a in (ACCOUNTS if accs is None else accs) if is_order_account(a)]
+
+
+def ad_accounts(accs: list | None = None) -> list:
+    return [a for a in (ACCOUNTS if accs is None else accs) if not is_order_account(a)]
+
+
 # ---------------- 账号管理（网页「登录」页可以增删改名） ----------------
 # 只把 key/label/account_id 写回 accounts.json；user_data_dir 用默认值时省略。
 def _accounts_payload(accs: list) -> list:
@@ -325,6 +353,8 @@ def _accounts_payload(accs: list) -> list:
             item["user_data_dir"] = str(custom_dir)
         if a.get("main"):
             item["main"] = True
+        if a.get("orders_only"):
+            item["orders_only"] = True
         out.append(item)
     return out
 

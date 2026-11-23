@@ -30,7 +30,7 @@ _NAV_ITEMS = [("/", "控制台"),
               ("广告情况", [("/paycomm", "CPS花费"), ("/paycomm/spend", "京准通花费"),
                            ("/cashflow", "广告费流水"),
                            ("/profit", "月度利润"), ("/maobao", "毛保诊断")]),
-              ("/price", "SKU前台价"), ("/activity", "团长活动")]
+              ("/price", "SKU前台价"), ("/pop", "pop店订单"), ("/activity", "团长活动")]
 
 
 def navtop(active: str = "", right: str = "") -> str:

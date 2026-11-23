@@ -425,7 +425,7 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
     """抓取报名日志 [start,end] + 最近 perf_days 天效果。"""
     from .browser import launch_profile, has_login, session_ok
 
-    accs = accounts or settings.ACCOUNTS
+    accs = accounts or settings.ad_accounts()
     today = settings.today()
     end = end or today.isoformat()
     start = start or (today - dt.timedelta(days=30)).isoformat()

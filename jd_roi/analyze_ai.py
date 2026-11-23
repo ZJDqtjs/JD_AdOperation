@@ -67,7 +67,7 @@ def local_range(accounts=None, days: int | None = None,
     这样 AI 分析的区间永远贴着本地真实数据，不会去分析一个没抓过的区间。
     """
     from . import dailystore as ds
-    accounts = accounts or settings.ACCOUNTS
+    accounts = accounts or settings.ad_accounts()
     dayset: set[str] = set()
     for a in accounts:
         dayset |= set(ds.days_for(a["key"], anchor))
@@ -1041,7 +1041,7 @@ def main() -> int:
     try:
         # 决定分析区间：显式给了就用；否则贴本地实际已抓取的天
         if not (start and end):
-            accs = [a for a in settings.ACCOUNTS if a["key"] == account] if account else None
+            accs = [a for a in settings.ad_accounts() if a["key"] == account] if account else None
             rng = local_range(accs)
             if not rng:
                 print("[缺少数据] 本地没有已抓取的数据，请先运行 python -m jd_roi.scrape_day")

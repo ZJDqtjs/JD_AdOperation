@@ -62,8 +62,8 @@ from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
                                RedirectResponse, Response, StreamingResponse)
 
 from . import (activity, aijobs, ai_page, analyze2, analyze_ai, cashflow, compete, config,
-               dailystore as ds, industry, itemprobe, llm, maobao, paycomm, pricewatch,
-               profit, report2, scrape_day, settings, vs)
+               dailystore as ds, industry, itemprobe, llm, maobao, paycomm, pop_orders,
+               pricewatch, profit, report2, scrape_day, settings, vs)
 
 settings.ensure_dirs()
 app = FastAPI(title="京东广告运营分析服务", docs_url="/api/docs", redoc_url=None)
@@ -81,7 +81,7 @@ _ATTR_RE = re.compile(r'\b(href|src|action)=(["\'])/(?!/)')
 # 只给已知的首段路径补前缀，避免误伤 JS 里的 split('/') 之类的普通字符串
 _URL_STR_RE = re.compile(
     r'(["\'])/(?=(?:api|login|report|vs|ai|assets|healthz|favicon\.ico'
-    r'|cashflow|paycomm|profit|price|cache)\b)')
+    r'|cashflow|paycomm|profit|price|cache|pop)\b)')
 
 
 @app.middleware("http")
@@ -150,7 +150,7 @@ def ui_range(start: str | None, end: str | None, days: int | None,
     if start and end:
         return ds.norm_day(start), ds.norm_day(end)
     n = int(days) if days else default_days
-    rng = analyze_ai.local_range(settings.ACCOUNTS, max(n, 1))
+    rng = analyze_ai.local_range(settings.ad_accounts(), max(n, 1))
     if rng:
         return rng
     return resolve_range(None, None, n)
@@ -169,7 +169,8 @@ def account_list(accounts) -> list:
     复选框同名提交会变成 `?accounts=main&accounts=b`（多值），
     而 FastAPI 对 `str` 类型只取最后一个值、Starlette 的 `query_params.get` 也是取最后一个，
     结果就是「两个都勾选，只有最后一个生效」。所以这里统一按列表接收，
-    同时兼容 `?accounts=main,b` 这种逗号串。空/无效值 = 全部账号。
+    同时兼容 `?accounts=main,b` 这种逗号串。空/无效值 = 全部**广告**账号
+    （只看订单的 POP 店不参与广告报表，走 /pop 页）。
 
     注意：以函数方式直接调用接口（测试、脚本）时，FastAPI 的 `Query(None)` 默认值
     会原样传进来，它不是字符串也不是列表 —— 这种情况按「未筛选」处理。
@@ -179,14 +180,14 @@ def account_list(accounts) -> list:
     elif isinstance(accounts, (list, tuple, set)):
         raw = list(accounts)
     else:
-        return settings.ACCOUNTS
+        return settings.ad_accounts()
     keys = set()
     for item in raw:
         keys.update(x.strip() for x in str(item).split(",") if x.strip())
     if not keys:
-        return settings.ACCOUNTS
-    got = [a for a in settings.ACCOUNTS if a["key"] in keys]
-    return got or settings.ACCOUNTS
+        return settings.ad_accounts()
+    got = [a for a in settings.ad_accounts() if a["key"] in keys]
+    return got or settings.ad_accounts()
 
 
 def _ensure_industry(keys: list, start: str, end: str, *, force: bool = False) -> dict:
@@ -227,7 +228,7 @@ def _range_bar(start: str, end: str, keys: list, action: str = "/report",
         boxes = "".join(
             f'<label><input type="checkbox" name="accounts" value="{_e(a["key"])}"'
             f'{" checked" if a["key"] in keys else ""}>{_e(a["label"])}</label>'
-            for a in settings.ACCOUNTS)
+            for a in settings.ad_accounts())
         acc_html = f'<span style="width:8px"></span>{boxes}'
     return f"""
 <form class="rangebar" method="get" action="{_e(action)}" id="rangeForm">
@@ -312,13 +313,13 @@ def dashboard(request: Request):
     st = ds.read_state()
     lr = st.get("lastRun") or {}
     run = scrape_day.runtime_status()
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     lr_html = "尚未执行过抓取"
     if lr.get("start"):
         lr_html = f"{_e(lr.get('start'))} ~ {_e(lr.get('end'))}（完成于 {_e(st.get('lastRunAt') or '-')}）"
 
     rows = []
-    for a in settings.ACCOUNTS:
+    for a in settings.ad_accounts():
         k = a["key"]
         c = cov.get(k) or {}
         d = c.get("days") or {}
@@ -350,7 +351,7 @@ def dashboard(request: Request):
                      f'（{len(ds.day_span(gap[0], gap[1]))} 天）')
 
     cal = ""
-    for a in settings.ACCOUNTS:
+    for a in settings.ad_accounts():
         k = a["key"]
         have = set(ds.days_for(k, "jzt_campaign"))
         cells = ""
@@ -863,12 +864,12 @@ def vs_page(request: Request):
         accounts = account_list(keys)
     else:
         # 默认只看做过切换的两个账号；其他账号可在页面上勾选
-        accounts = [a for a in settings.ACCOUNTS if a.get("key") in ("main", "b")] or settings.ACCOUNTS
+        accounts = [a for a in settings.ad_accounts() if a.get("key") in ("main", "b")] or settings.ad_accounts()
     try:
         data = vs.build(a_start, a_end, b_start, b_end, accounts)
     except FileNotFoundError as exc:
         return HTMLResponse(vs.error_page(str(exc)), status_code=200)
-    return HTMLResponse(vs.render(data, accounts_all=settings.ACCOUNTS, preset=preset))
+    return HTMLResponse(vs.render(data, accounts_all=settings.ad_accounts(), preset=preset))
 
 
 @app.post("/api/vs/insight")
@@ -1441,7 +1442,7 @@ else boot();
 def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     cfg = PAYCOMM_KINDS[kind]
     q = request.query_params
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     acc = q.get("account") or settings.MAIN_ACCOUNT
     if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
@@ -1454,7 +1455,7 @@ def _paycomm_page(kind: str, request: Request) -> HTMLResponse:
     opts = ('<option value="all"%s>全部账号（总览）</option>'
             % (" selected" if acc == "all" else "")) + "".join(
         f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+        f'{_e(a.get("label"))}</option>' for a in settings.ad_accounts())
     fields = paycomm.FIELDS if kind == "cps" else paycomm.SPEND_FIELDS
     init = {"mode": kind, "api": cfg["api"], "sort": cfg["sort"],
             # 带 start/end 打开（缓存管理点「查看」）：进页面自动查一次，命中缓存直接秒出
@@ -2803,7 +2804,7 @@ else boot();
 @app.get("/profit", response_class=HTMLResponse)
 def profit_page(request: Request):
     q = request.query_params
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     acc = q.get("account") or settings.MAIN_ACCOUNT
     if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
@@ -2816,14 +2817,14 @@ def profit_page(request: Request):
     opts = ('<option value="all"%s>全部账号（总览）</option>'
             % (" selected" if acc == "all" else "")) + "".join(
         f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+        f'{_e(a.get("label"))}</option>' for a in settings.ad_accounts())
     init = {"api": "/api/profit", "fields": [[k, lab, t] for k, lab, t in profit.FIELDS],
             # 带 start/end 打开（缓存管理点「查看」）：进页面自动查一次，命中缓存直接秒出
             "auto": bool(q.get("start") and q.get("end")),
-            "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS},
+            "labels": {a["key"]: (a.get("label") or a["key"]) for a in settings.ad_accounts()},
             "webKeys": PROFIT_WEB_KEYS, "kpis": PROFIT_KPIS,
             "ratioKeys": ["frontPrice", "supply", "grossPerOrder", "netRate"],
-            "maobao": maobao.page_rules(settings.ACCOUNTS)}
+            "maobao": maobao.page_rules(settings.ad_accounts())}
     quick_html = _quick_html("PF")
     today_iso = _today().isoformat()
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -3029,8 +3030,8 @@ def _mb_html(diag: dict, acc_label: str, start: str, end: str, saved_at: str = "
 def maobao_page(request: Request):
     """毛保诊断（京东毛保）独立页：读本地利润缓存，按温层判定是否触发毛保。"""
     q = request.query_params
-    keys = [a["key"] for a in settings.ACCOUNTS]
-    labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS}
+    keys = [a["key"] for a in settings.ad_accounts()]
+    labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ad_accounts()}
     acc = q.get("account") or next((k for k in keys if maobao.rules_for(k)), settings.MAIN_ACCOUNT)
     if acc not in keys:
         acc = settings.MAIN_ACCOUNT
@@ -3110,7 +3111,7 @@ def api_profit_run(account: str | None = None, start: str = "", end: str = "", f
     """
     try:
         wanted = [x for x in (accounts or "").split(",") if x.strip()]
-        all_keys = [a["key"] for a in settings.ACCOUNTS]
+        all_keys = [a["key"] for a in settings.ad_accounts()]
         if wanted:
             keys = [k for k in all_keys if k in wanted] or wanted
         elif account and account in all_keys:
@@ -3438,8 +3439,8 @@ def _act_status(start: str, end: str) -> tuple:
 @app.get("/activity", response_class=HTMLResponse)
 def activity_page(request: Request):
     q = request.query_params
-    keys = [a["key"] for a in settings.ACCOUNTS]
-    labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ACCOUNTS}
+    keys = [a["key"] for a in settings.ad_accounts()]
+    labels = {a["key"]: (a.get("label") or a["key"]) for a in settings.ad_accounts()}
     sel = q.get("account") or ""
     acc_keys = [sel] if sel in keys else keys
 
@@ -4109,7 +4110,7 @@ def api_activity_run(start: str = "", end: str = "", days: int = 0, perf_days: i
         e = _today().isoformat()
         s = (_today() - dt.timedelta(days=max(int(days), 1) - 1)).isoformat()
     pd = min(max(int(perf_days), 1), 90) if perf_days else None
-    return activity.run_background(accounts=settings.ACCOUNTS, start=s, end=e,
+    return activity.run_background(accounts=settings.ad_accounts(), start=s, end=e,
                                    perf_days=pd, log=_log_progress)
 
 
@@ -5349,7 +5350,7 @@ def price_page(request: Request):
     缺天 / 0 行天会在页面上点名，并可一键补抓（只抓 sz_product）。
     """
     q = request.query_params
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     acc = q.get("account") or "all"
     if acc != "all" and acc not in keys:
         acc = "all"
@@ -5366,7 +5367,7 @@ def price_page(request: Request):
     opts = ('<option value="all"%s>全部账号（总览）</option>'
             % (" selected" if acc == "all" else "")) + "".join(
         f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
-        f'{_e(a.get("label"))}</option>' for a in settings.ACCOUNTS)
+        f'{_e(a.get("label"))}</option>' for a in settings.ad_accounts())
     init = {"api": "/api/price", "account": acc, "today": _today().isoformat(),
             "start": start.isoformat(), "end": end.isoformat()}
     return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -5542,7 +5543,7 @@ def price_page(request: Request):
 @app.get("/api/price")
 def api_price(account: str | None = None, start: str = "", end: str = ""):
     """某个账号某个区间内，每个 SKU 的逐日前台价与区间汇总（纯本地读）。"""
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     acc = account or settings.MAIN_ACCOUNT
     if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
@@ -5598,7 +5599,7 @@ def _snapshot_attach_today(rows: list, acc: str, today: str) -> dict:
 def _merged_snapshot() -> dict | None:
     """全部账号：把各账号最新核算按 SKU 合并（金额/件数相加，价格 Σ金额÷Σ件数）。"""
     snaps = []
-    for a in settings.ACCOUNTS:
+    for a in settings.ad_accounts():
         s = pricewatch.latest_snapshot(a["key"])
         if s:
             snaps.append(s)
@@ -5664,7 +5665,7 @@ def api_price_snapshot(account: str | None = None):
 
     account='all' 时按 SKU 合并各账号，卡片仍能看到逐商品明细。
     """
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     acc = account or settings.MAIN_ACCOUNT
     if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
@@ -5694,7 +5695,7 @@ def api_price_snapshot(account: str | None = None):
 @app.post("/api/price/snapshot/run")
 def api_price_snapshot_run(account: str | None = None):
     """立刻重算一次前台价核算（与夜间任务同一个函数），补完数据后不用等夜里。"""
-    accounts = [settings.get_account(account)] if account else settings.ACCOUNTS
+    accounts = [settings.get_account(account)] if account else settings.ad_accounts()
     try:
         done = pricewatch.run_nightly(accounts, log=_log_progress)
     except Exception as exc:  # noqa: BLE001
@@ -5706,7 +5707,7 @@ def api_price_snapshot_run(account: str | None = None):
 @app.get("/api/price/realtime")
 def api_price_realtime(account: str | None = None):
     """今日实时前台价（商智 realtime 口径，对比昨天同一时刻），读本地快照。"""
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     acc = account or settings.MAIN_ACCOUNT
     if acc != "all" and acc not in keys:
         acc = settings.MAIN_ACCOUNT
@@ -5733,7 +5734,7 @@ def api_price_realtime(account: str | None = None):
 @app.post("/api/price/probe")
 def api_price_probe(skus: str = "", account: str = "", force: int = 0):
     """探寻降价商品的前台原因：逐个打开商品页取展示价 + 活动标识（后台线程）。"""
-    keys = [a["key"] for a in settings.ACCOUNTS]
+    keys = [a["key"] for a in settings.ad_accounts()]
     acc = account if account in keys else settings.MAIN_ACCOUNT
     ids = [s for s in re.split(r"[,\s]+", skus or "") if s.strip()]
     res = itemprobe.start(ids, day=ds.today().isoformat(), account=acc,
@@ -5755,7 +5756,7 @@ def api_price_probe_status():
 @app.post("/api/price/realtime/fetch")
 def api_price_realtime_fetch(account: str | None = None):
     """立刻抓一次今日实时商品明细（只抓 sz_product_rt，需要浏览器登录态）。"""
-    accs = (settings.ACCOUNTS if not account or str(account).lower() == "all"
+    accs = (settings.ad_accounts() if not account or str(account).lower() == "all"
             else [settings.get_account(account)])
     info = scrape_day.lock_info()
     if info.get("locked") and info.get("alive"):
@@ -5767,6 +5768,433 @@ def api_price_realtime_fetch(account: str | None = None):
                                          name="sz-realtime", trigger="manual")
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
+
+
+# ================================================================ POP 店订单
+# 数据在 jd_roi/pop_orders.py：用已登录的商家后台页面按天缓存订单列表。
+# 这里只做页面与接口：页面查询/筛选纯本地读缓存；「抓取」才开浏览器。
+POP_CSS = """
+.popbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.popbar input[type=date],.popbar input[type=time],.popbar input[type=text],.popbar select{
+  padding:7px 10px;border-radius:8px;border:1px solid var(--hair);background:var(--canvas);
+  color:var(--ink);font-size:13px}
+.popbar input[type=time]{width:108px}
+.popbar input[type=text]{min-width:230px}
+.popbar .fld{display:inline-flex;align-items:center;gap:6px;margin:0;font-size:12.5px;color:var(--muted)}
+.popkpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:16px 0 4px}
+@media(max-width:900px){.popkpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.popkpis .kpi .val{font-size:26px}
+.popday td,.popday th{white-space:nowrap}
+.popday tr.off td{color:var(--muted2)}
+.popday tr.today td{background:var(--amberbg)}
+.popday tfoot td{font-weight:600;background:var(--soft);border-top:1px solid var(--hair)}
+.popprod{max-height:420px}
+.popprod img,.poporder img{width:38px;height:38px;object-fit:cover;border-radius:6px;
+  border:1px solid var(--hair);background:var(--soft);flex:none}
+.popprod .pname{display:flex;align-items:center;gap:10px;min-width:260px;text-align:left}
+.poporder .pname{display:flex;align-items:center;gap:8px;min-width:260px;text-align:left}
+.poporder td{vertical-align:top}
+.popmono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.pill{display:inline-block;padding:2px 9px;border-radius:9999px;font-size:11.5px;font-weight:600;
+  white-space:nowrap;background:var(--surface-card);color:var(--muted)}
+.pill.ok{background:var(--greenbg);color:var(--greenink)}
+.pill.warn{background:var(--amberbg);color:var(--amberink)}
+.pill.bad{background:var(--redbg);color:var(--redink)}
+.pill.info{background:var(--tealbg);color:var(--tealink)}
+.poplog{background:var(--dark);color:var(--on-dark);border-radius:var(--r-sm);padding:10px 12px;
+  font-size:11.5px;line-height:1.7;max-height:160px;overflow:auto;white-space:pre-wrap;
+  font-family:var(--mono);margin-top:10px;display:none}
+.popwarn{color:var(--amberink);background:var(--amberbg);border-radius:8px;padding:7px 11px;
+  font-size:12.5px;margin:6px 0}
+"""
+
+POP_JS = r"""
+(function(){
+var INIT = window.POP_INIT || {};
+function $(id){ return document.getElementById(id); }
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function num(n){ return (n == null || isNaN(n)) ? '—' : Number(n).toLocaleString('zh-CN'); }
+function money(n){
+  if(n == null || isNaN(n)) return '—';
+  return '¥' + Number(n).toLocaleString('zh-CN', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+function pill(s){
+  var cls = '';
+  if(s === '已完成') cls = 'ok';
+  else if(s === '已取消') cls = 'bad';
+  else if(s === '未付款') cls = 'warn';
+  else if(s === '待出库' || s === '已出库' || s === '锁定') cls = 'info';
+  return '<span class="pill ' + cls + '">' + esc(s || '—') + '</span>';
+}
+function msg(s, bad){
+  var el = $('popMsg'); if(!el) return;
+  el.textContent = s || '';
+  el.style.color = bad ? 'var(--redink)' : 'var(--muted)';
+}
+function params(){
+  var p = new URLSearchParams();
+  p.set('start', $('popStart').value || INIT.start || '');
+  p.set('end', $('popEnd').value || INIT.end || '');
+  p.set('start_time', $('popStartTime').value || '16:00:00');
+  p.set('end_time', $('popEndTime').value || '16:00:00');
+  p.set('keyword', ($('popKw').value || '').trim());
+  p.set('status', $('popStatus').value || '');
+  if($('popAcc') && $('popAcc').value) p.set('account', $('popAcc').value);
+  return p.toString();
+}
+function renderKpis(j){
+  var t = j.totals || {};
+  var canceled = 0, unpaid = 0;
+  (j.byDay || []).forEach(function(d){ canceled += d.canceled || 0; unpaid += d.unpaid || 0; });
+  var valid = Math.max((t.orders || 0) - canceled - unpaid, 0);
+  var html = ''
+    + '<div class="kpi"><span class="lbl">订单数</span><span class="val">' + num(t.orders)
+    + '</span><span class="sub">有效 ' + num(valid) + ' · 取消 ' + num(canceled)
+    + (unpaid ? ' · 未付款 ' + num(unpaid) : '') + '</span></div>'
+    + '<div class="kpi"><span class="lbl">商品件数</span><span class="val">' + num(t.items)
+    + '</span><span class="sub">按 skuTotalNum 累加</span></div>'
+    + '<div class="kpi"><span class="lbl">下单金额</span><span class="val">' + money(t.amount)
+    + '</span><span class="sub">实付（shouldPay）</span></div>'
+    + '<div class="kpi"><span class="lbl">客单价</span><span class="val">' + money(t.avg)
+    + '</span><span class="sub">下单金额 ÷ 订单数</span></div>';
+  $('popKpis').innerHTML = html;
+}
+function renderDays(j){
+  var days = (j.byDay || []).slice().reverse();
+  var today = INIT.today || '';
+  var rows = days.map(function(d){
+    var cls = d.cached ? '' : 'off';
+    if(d.day === today) cls += ' today';
+    return '<tr class="' + cls + '">'
+      + '<td class="l mono">' + esc(d.day) + (d.day === today ? ' <span class="pill warn">今天</span>' : '') + '</td>'
+      + '<td class="n"><b>' + num(d.orders) + '</b></td>'
+      + '<td class="n">' + num(d.valid) + '</td>'
+      + '<td class="n">' + num(d.canceled) + '</td>'
+      + '<td class="n">' + num(d.items) + '</td>'
+      + '<td class="n mono">' + money(d.amount) + '</td>'
+      + '<td class="n mono">' + money(d.avg) + '</td>'
+      + '<td class="l">' + (d.cached ? '<span class="pill ok">已缓存</span>'
+                                     : '<span class="pill">未抓取</span>') + '</td></tr>';
+  }).join('');
+  $('popDayBody').innerHTML = rows || '<tr><td colspan="8" class="l">区间内没有缓存，点「抓取 / 刷新」</td></tr>';
+  // 合计行：跟随当前筛选（商品名/状态/日期）后的总单量
+  var t = j.totals || {};
+  var sumValid = 0, sumCanceled = 0;
+  (j.byDay || []).forEach(function(d){
+    sumValid += d.valid || 0;
+    sumCanceled += d.canceled || 0;
+  });
+  $('popDayFoot').innerHTML = '<tr><td class="l">合计（筛选结果）</td>'
+    + '<td class="n">' + num(t.orders) + '</td>'
+    + '<td class="n">' + num(sumValid) + '</td>'
+    + '<td class="n">' + num(sumCanceled) + '</td>'
+    + '<td class="n">' + num(t.items) + '</td>'
+    + '<td class="n mono">' + money(t.amount) + '</td>'
+    + '<td class="n mono">' + money(t.avg) + '</td>'
+    + '<td class="l">已缓存 ' + num(t.cachedDays) + '/' + num(t.days) + ' 天</td></tr>';
+}
+function renderProducts(j){
+  var list = (j.byProduct || []).slice(0, 300);
+  var rows = list.map(function(p, i){
+    return '<tr><td class="n">' + (i + 1) + '</td>'
+      + '<td class="l"><div class="pname">' + (p.img ? '<img loading="lazy" src="' + esc(p.img) + '">' : '')
+      + '<span>' + esc(p.name || p.skuId) + '<div class="mini mono" style="color:var(--muted2)">'
+      + esc(p.skuId) + '</div></span></div></td>'
+      + '<td class="n">' + num(p.orders) + '</td>'
+      + '<td class="n">' + num(p.items) + '</td>'
+      + '<td class="n mono">' + money(p.amount) + '</td></tr>';
+  }).join('');
+  $('popProdBody').innerHTML = rows || '<tr><td colspan="5" class="l">没有匹配的商品</td></tr>';
+  $('popProdCount').textContent = '共 ' + (j.byProduct || []).length + ' 个商品';
+}
+function renderOrders(j){
+  var list = (j.rows || []);
+  var shown = list.slice(0, 600);
+  var rows = shown.map(function(o){
+    var items = (o.items || []).map(function(it){
+      return '<div class="mini">' + esc(it.name) + ' <span style="color:var(--muted2)">×'
+        + num(it.num) + '</span></div>';
+    }).join('');
+    return '<tr><td class="l mono" style="white-space:nowrap">' + esc(o.orderTime) + '</td>'
+      + '<td class="l mono">' + esc(o.orderId) + '</td>'
+      + '<td class="l"><div class="pname">' + (o.img ? '<img loading="lazy" src="' + esc(o.img) + '">' : '')
+      + '<div>' + items + '</div></div></td>'
+      + '<td class="n">' + num(o.skuTotalNum) + '</td>'
+      + '<td class="n mono">' + money(o.amount) + '</td>'
+      + '<td class="l">' + pill(o.status) + '</td>'
+      + '<td class="l">' + esc(o.consName || '') + '<div class="mini" style="color:var(--muted2)">'
+      + esc(o.userPin || '') + '</div></td></tr>';
+  }).join('');
+  $('popOrderBody').innerHTML = rows || '<tr><td colspan="7" class="l">没有匹配的订单</td></tr>';
+  var totItems = 0, totAmt = 0;
+  list.forEach(function(o){ totItems += o.skuTotalNum || 0; totAmt += o.amount || 0; });
+  $('popOrderCount').textContent = '共 ' + list.length + ' 单 · ' + num(totItems) + ' 件 · '
+    + money(totAmt) + (list.length > shown.length ? '（显示前 ' + shown.length + ' 单）' : '');
+}
+function render(j){
+  if(!j || !j.ok){ msg((j && j.error) || '查询失败', true); return; }
+  var t = j.totals || {};
+  var extra = '';
+  if((j.missingDays || []).length){
+    extra = '　·　未抓取 ' + j.missingDays.length + ' 天：'
+      + j.missingDays.slice(0, 6).join('、') + (j.missingDays.length > 6 ? ' …' : '');
+  }
+  msg((j.label || j.account || '') + ' · ' + j.start + ' ' + (j.startTime || '')
+      + ' ~ ' + j.end + ' ' + (j.endTime || '')
+      + '　·　已缓存 ' + num(t.cachedDays) + '/' + num(t.days) + ' 天' + extra);
+  renderKpis(j);
+  renderDays(j);
+  renderProducts(j);
+  renderOrders(j);
+  var sel = $('popStatus'), cur = sel.value;
+  var opts = '<option value="">全部状态</option>' + (j.statuses || []).map(function(s){
+    return '<option value="' + esc(s) + '">' + esc(s) + '</option>';
+  }).join('');
+  sel.innerHTML = opts;
+  sel.value = cur;
+}
+var TIMER = null;
+function run(){
+  msg('读取本地订单缓存…');
+  fetch('/api/pop/orders?' + params()).then(function(r){ return r.json(); })
+    .then(render).catch(function(e){ msg('查询失败：' + e, true); });
+}
+function debounce(){
+  clearTimeout(TIMER);
+  TIMER = setTimeout(run, 350);
+}
+function quick(k){
+  var end = new Date(), start = new Date();
+  if(k === 'd7') start.setDate(end.getDate() - 6);
+  else if(k === 'd30') start.setDate(end.getDate() - 29);
+  else if(k === 'month') start = new Date(end.getFullYear(), end.getMonth(), 1);
+  $('popEnd').value = iso(end); $('popStart').value = iso(start);
+  run();
+}
+function iso(d){
+  var m = d.getMonth() + 1, day = d.getDate();
+  return d.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (day < 10 ? '0' : '') + day;
+}
+function poll(){
+  fetch('/api/pop/orders/status').then(function(r){ return r.json(); }).then(function(j){
+    var box = $('popLog');
+    if((j.log || []).length){
+      box.style.display = 'block';
+      box.textContent = j.log.join('\n');
+      box.scrollTop = box.scrollHeight;
+    }
+    if(j.running){
+      msg('正在抓取订单…' + (j.message || ''));
+      setTimeout(poll, 2500);
+    } else {
+      $('popRun').disabled = false;
+      if(j.error) msg('抓取失败：' + j.error, true);
+      else if(j.finishedAt) msg((j.message || '完成') + '，正在刷新数据…');
+      setTimeout(run, 600);
+    }
+  }).catch(function(){ setTimeout(poll, 4000); });
+}
+function fetchNow(){
+  var btn = $('popRun');
+  btn.disabled = true;
+  var p = new URLSearchParams({start: $('popStart').value, end: $('popEnd').value});
+  if($('popAcc') && $('popAcc').value) p.set('account', $('popAcc').value);
+  fetch('/api/pop/orders/run?' + p.toString(), {method:'POST'})
+    .then(function(r){ return r.json(); }).then(function(j){
+      if(!j.ok){ btn.disabled = false; msg(j.error || '启动失败', true); return; }
+      msg('已开始抓取 ' + (j.days || []).length + ' 天订单…');
+      poll();
+    }).catch(function(e){ btn.disabled = false; msg('启动失败：' + e, true); });
+}
+window.POP = {run: run, fetchNow: fetchNow, quick: quick, debounce: debounce};
+document.addEventListener('keydown', function(ev){
+  if(ev.key === 'Enter' && ev.target && ev.target.id === 'popKw') run();
+});
+run();
+})();
+"""
+
+
+@app.get("/pop", response_class=HTMLResponse)
+def pop_orders_page(request: Request):
+    """POP 店订单：按天下单量 + 商品名筛选（只读本地缓存，抓取才开浏览器）。"""
+    q = request.query_params
+    accs = settings.order_accounts()
+    acc = q.get("account") or (accs[0]["key"] if accs else "")
+    if accs and acc not in [a["key"] for a in accs]:
+        acc = accs[0]["key"]
+    end = _today()
+    start = end - dt.timedelta(days=6)
+    if q.get("start") and q.get("end"):
+        try:
+            s0 = dt.date.fromisoformat(ds.norm_day(q.get("start")))
+            e0 = dt.date.fromisoformat(ds.norm_day(q.get("end")))
+            if s0 <= e0:
+                start, end = s0, e0
+        except ValueError:
+            pass
+    opts = "".join(f'<option value="{_e(a["key"])}"{" selected" if a["key"] == acc else ""}>'
+                   f'{_e(a.get("label"))}</option>' for a in accs)
+    acc_sel = (f'<label class="fld">店铺 <select id="popAcc" onchange="POP.run()">{opts}</select></label>'
+               if len(accs) > 1 else "")
+    init = {"start": start.isoformat(), "end": end.isoformat(),
+            "today": _today().isoformat(), "account": acc}
+    notice = ""
+    if not accs:
+        notice = ('<div class="popwarn">还没有配置「只看订单」的店铺账号：在 '
+                  '<code>config/accounts.json</code> 给该账号加 <code>"orders_only": true</code>，'
+                  '或账号名里带 pop；在 /login 登录后即可抓取订单。</div>')
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>POP 店订单 · 京东广告运营</title>
+<style>{DASH_CSS}</style><style>{report2.UI_CSS}</style><style>{POP_CSS}</style>
+</head><body>
+{report2.navtop("/pop")}
+<header class="top"><div class="wrap pagehead">
+  <div class="eyebrow">{report2.SPIKE_SVG}订单</div>
+  <h1>POP 店订单</h1>
+  <div class="metaline">
+    <span>数据来自京东商家后台「订单列表」，按天下单时间归集</span><span class="dot"></span>
+    <span>页面查询只读本地缓存；「抓取 / 刷新」才会打开浏览器</span>
+  </div>
+  <div class="actions">
+    <a class="btn ghost mini" href="/">控制台 →</a>
+    <a class="btn ghost mini" href="/price">SKU 前台价 →</a>
+    <a class="btn ghost mini" href="/login">账号登录 →</a>
+  </div>
+</div></header>
+<div class="wrap">
+{notice}
+<div class="card">
+  <h2>概览 <span class="tagline">当前筛选结果汇总 · 筛选条件见下方「订单明细」</span></h2>
+  <div class="hint" id="popMsg" style="margin:0;min-height:20px">读取本地订单缓存…</div>
+  <div class="poplog" id="popLog"></div>
+  <div class="popkpis" id="popKpis"></div>
+</div>
+
+<div class="card">
+  <h2>每日单量 <span class="tagline">按下单日期归集 · 单量按订单号计</span></h2>
+  <div class="tblwrap short">
+    <table class="popday"><thead><tr>
+      <th class="l noSort">日期</th><th class="n noSort">订单数</th><th class="n noSort">有效</th>
+      <th class="n noSort">已取消</th><th class="n noSort">商品件数</th>
+      <th class="n noSort">下单金额</th><th class="n noSort">客单价</th><th class="l noSort">数据</th>
+    </tr></thead><tbody id="popDayBody"></tbody><tfoot id="popDayFoot"></tfoot></table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>商品汇总 <span class="tagline" id="popProdCount">—</span>
+    <span class="tagline">一单多个商品时每个商品各计 1 单</span></h2>
+  <div class="tblwrap popprod">
+    <table><thead><tr>
+      <th class="n noSort">#</th><th class="l noSort">商品</th>
+      <th class="n noSort">订单数</th><th class="n noSort">件数</th><th class="n noSort">分摊实付</th>
+    </tr></thead><tbody id="popProdBody"></tbody></table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>订单明细 <span class="tagline" id="popOrderCount">—</span></h2>
+  <div class="popbar">
+    {acc_sel}
+    <label class="fld">起 <input type="date" id="popStart" value="{_e(start.isoformat())}">
+      <input type="time" id="popStartTime" step="1" value="16:00:00" title="起时刻（默认 16:00:00）"></label>
+    <label class="fld">止 <input type="date" id="popEnd" value="{_e(end.isoformat())}">
+      <input type="time" id="popEndTime" step="1" value="16:00:00" title="止时刻（默认 16:00:00）"></label>
+    <input type="text" id="popKw" placeholder="筛选商品名 / 订单号" oninput="POP.debounce()">
+    <label class="fld">状态 <select id="popStatus" onchange="POP.run()"><option value="">全部状态</option></select></label>
+    <button class="btn" onclick="POP.run()">查询</button>
+    <span class="qrow" style="margin:0">
+      <button type="button" class="chip" onclick="POP.quick('d7')">近 7 天</button>
+      <button type="button" class="chip" onclick="POP.quick('d30')">近 30 天</button>
+      <button type="button" class="chip" onclick="POP.quick('month')">本月</button>
+    </span>
+    <button class="btn sec" id="popRun" style="margin-left:auto" onclick="POP.fetchNow()"
+            title="按上面选的起止日期重新抓取并覆盖缓存（会打开商家后台页面）">抓取 / 刷新</button>
+  </div>
+  <div class="hint" style="margin:-4px 0 12px">筛选同时作用于上方「每日单量」和「商品汇总」。</div>
+  <div class="tblwrap long">
+    <table class="poporder"><thead><tr>
+      <th class="l noSort">下单时间</th><th class="l noSort">订单号</th><th class="l noSort">商品</th>
+      <th class="n noSort">件数</th><th class="n noSort">实付</th><th class="l noSort">状态</th>
+      <th class="l noSort">买家</th>
+    </tr></thead><tbody id="popOrderBody"></tbody></table>
+  </div>
+</div>
+
+<div class="note" style="margin-top:18px">
+  <p><b>口径</b>：下单时间筛选 = 起日期 + 起时刻 至 止日期 + 止时刻（两边默认 16:00:00，
+     即 <code>11/22 16:00:00 ~ 11/23 16:00:00</code> 这样的跨日窗口）；
+     每日单量仍按下单时间的自然日归集，跨日窗口里 16:00 前后的订单会分别落在对应日期行。
+     单量按订单号计，一个订单含多个 SKU 仍是 1 单；件数按 skuTotalNum 累加；
+     金额取实付 <code>shouldPay</code>（未付款时退回商品金额 orderSum）。</p>
+  <p><b>缓存</b>：每晚广告回刷后会顺带抓最近 {settings.POP_ORDER_REFRESH_DAYS} 天订单
+     （首次自动补 {settings.POP_ORDER_BACKFILL_DAYS} 天），今天的订单可以随时点「抓取 / 刷新」更新。
+     订单状态（取消/完成）后续会变，所以最近几天每晚都会重抓覆盖。</p>
+  <p><b>这个店铺不抓广告</b>：账号配置了 <code>orders_only</code>（或名称带 pop）后，
+     夜间广告抓取、报表、AI 解读都会自动跳过它，避免拿没有广告账户的店铺去请求京准通。</p>
+</div>
+
+</div>
+<script>window.POP_INIT = {json.dumps(init, ensure_ascii=False)};</script>
+<script>{POP_JS}</script>
+</body></html>""")
+
+
+@app.get("/api/pop/orders")
+def api_pop_orders(start: str = "", end: str = "", keyword: str = "",
+                   status: str = "", account: str = "",
+                   start_time: str = "", end_time: str = ""):
+    """POP 订单汇总（纯本地读缓存）：每日单量、商品汇总、订单明细。"""
+    accs = settings.order_accounts()
+    if not accs:
+        return JSONResponse({"ok": False, "error": "未配置 POP 订单账号"},
+                            headers={"Cache-Control": "no-store"})
+    if not (start and end):
+        e = _today()
+        start, end = (e - dt.timedelta(days=6)).isoformat(), e.isoformat()
+    try:
+        span = ds.day_span(start, end)
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "日期格式应为 YYYY-MM-DD"},
+                            headers={"Cache-Control": "no-store"})
+    if len(span) > 200:
+        return JSONResponse({"ok": False, "error": "区间最长 200 天，请缩小范围"},
+                            headers={"Cache-Control": "no-store"})
+    key = account if account in [a["key"] for a in accs] else None
+    data = pop_orders.summary(span[0], span[-1], keyword=keyword, status=status,
+                              key=key, start_time=start_time, end_time=end_time)
+    return JSONResponse(data, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/pop/orders/run")
+def api_pop_orders_run(start: str = "", end: str = "", account: str = ""):
+    """后台抓取订单（会打开商家后台页面，h5st 签名由页面自己生成）。"""
+    accs = settings.order_accounts()
+    if not accs:
+        return {"ok": False, "error": "未配置 POP 订单账号"}
+    if not (start and end):
+        e = _today()
+        start, end = (e - dt.timedelta(days=6)).isoformat(), e.isoformat()
+    try:
+        span = ds.day_span(start, end)
+    except ValueError:
+        return {"ok": False, "error": "日期格式应为 YYYY-MM-DD"}
+    if len(span) > 92:
+        return {"ok": False, "error": "一次最多抓 92 天，请缩小范围"}
+    key = account if account in [a["key"] for a in accs] else None
+    return pop_orders.start(span, key=key, log=_log_progress)
+
+
+@app.get("/api/pop/orders/status")
+def api_pop_orders_status():
+    return JSONResponse({"ok": True, **pop_orders.status()},
+                        headers={"Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------- 竞品与关键词分析
@@ -5921,7 +6349,7 @@ def api_status():
                          "todayAt": _schedule_target()[0].strftime("%Y-%m-%d %H:%M"),
                          "todayOffset": _schedule_target()[1],
                          "refreshDays": settings.REFRESH_DAYS},
-            "accounts": [{"key": a["key"], "label": a.get("label")} for a in settings.ACCOUNTS],
+            "accounts": [{"key": a["key"], "label": a.get("label")} for a in settings.ad_accounts()],
             "scrape": scrape_day.runtime_status(),
             "login": _login.snapshot(),
             "state": ds.read_state()}
@@ -6337,6 +6765,18 @@ class LoginSession:
                     if not has_login(ctx):
                         self._set_account_state(key, "logged_out", "未登录：Profile 里没有登录票据")
                         continue
+                    # 只看订单的 POP 店没有京准通账户，用商家后台订单页判断会话
+                    if settings.is_order_account(settings.get_account(key)):
+                        page.goto(pop_orders.ORDER_PAGE_URL, wait_until="domcontentloaded",
+                                  timeout=60000)
+                        page.wait_for_timeout(3000)
+                        if ("passport.jd.com" not in page.url
+                                and "login" not in page.url.lower()):
+                            self._set_account_state(key, "logged_in", "已登录（商家后台订单）")
+                            n_ok += 1
+                        else:
+                            self._set_account_state(key, "logged_out", "登录态已失效，需要重新登录")
+                        continue
                     page.goto(config.JZT_HOME, wait_until="domcontentloaded", timeout=60000)
                     page.wait_for_timeout(3000)
                     if session_ok(page):
@@ -6452,6 +6892,11 @@ class LoginSession:
         for key in keys:
             if self._keep_stop.is_set():
                 break
+            acc = settings.get_account(key)
+            is_order = settings.is_order_account(acc)
+            # POP 店只看商家后台订单：续期要打开它真正会用的页面，
+            # 打开京准通既没有广告账户，也无法用它判断 POP 会话是否有效。
+            acc_pages = ([pop_orders.ORDER_PAGE_URL] if is_order else pages)
             # 有别的登录流程在跑（扫码/密码）就别抢同一个 Profile
             with self._lock:
                 busy = self.state in ("starting", "waiting")
@@ -6484,7 +6929,7 @@ class LoginSession:
                         self.keep_last_ok[key] = False
                     continue
                 # 依次打开业务页并停留，让页面 JS 把三层心跳都发完（模仿京麦）
-                for purl in pages:
+                for purl in acc_pages:
                     if self._keep_stop.is_set():
                         break
                     try:
@@ -6492,7 +6937,11 @@ class LoginSession:
                         page.wait_for_timeout(dwell)
                     except Exception:  # noqa: BLE001  单页失败不影响整体
                         pass
-                ok = session_ok(page)
+                if is_order:
+                    ok = (has_login(ctx) and "passport.jd.com" not in page.url
+                          and "login" not in page.url.lower())
+                else:
+                    ok = session_ok(page)
                 with self._lock:
                     self.keep_last_ok[key] = bool(ok)
                     self.keep_last_requests[key] = seen[:20]
@@ -6997,7 +7446,7 @@ class AiRunner:
         with self._lock:
             if self._state.get("running"):
                 return {"ok": False, "error": "已有 AI 生成任务在运行"}
-            keys = [a.get("key") for a in (accounts or settings.ACCOUNTS)]
+            keys = [a.get("key") for a in (accounts or settings.ad_accounts())]
             job = aijobs.JOBS.new("report", {"start": start, "end": end, "accounts": keys})
             self._state.update({"running": True, "startedAt": settings.now_iso(),
                                 "finishedAt": None, "error": None, "ok": True,
@@ -7013,7 +7462,7 @@ class AiRunner:
                     job.emit("phase", "行业大盘缓存补齐中（地域/关键词/客户/趋势）…")
                     industry.wait_for(ind_res["missing"], start, end, timeout=300)
                 data = analyze2.build(start=start, end=end,
-                                      accounts=[a for a in settings.ACCOUNTS if a["key"] in keys])
+                                      accounts=[a for a in settings.ad_accounts() if a["key"] in keys])
                 job.emit("phase", "数据就绪（保本线 / 词分层 / 定向缺口已算好），交给模型套方法论判断…")
                 out = analyze_ai.analyze_data(data, None, on_event=job.emit)
                 job.emit("phase", "生成完成，正在落盘…")
@@ -7052,7 +7501,7 @@ def _ai_after_scrape(summary: dict) -> None:
         return
     if summary.get("cancelled"):
         return
-    rng = analyze_ai.local_range(settings.ACCOUNTS)
+    rng = analyze_ai.local_range(settings.ad_accounts())
     if rng:
         start, end = rng
     else:
@@ -7061,7 +7510,7 @@ def _ai_after_scrape(summary: dict) -> None:
         _log_progress("AI 解读：本地没有可用数据，跳过")
         return
     _log_progress(f"开始生成 AI 解读（贴本地数据 {start} ~ {end}）")
-    _ai.run_background(start, end, settings.ACCOUNTS)
+    _ai.run_background(start, end, settings.ad_accounts())
 
 
 def _price_snapshot() -> None:
@@ -7071,7 +7520,7 @@ def _price_snapshot() -> None:
     所以同时 print 到容器日志 —— 否则夜里核算失败会完全看不到原因。
     """
     try:
-        done = pricewatch.run_nightly(settings.ACCOUNTS, log=_log_progress)
+        done = pricewatch.run_nightly(settings.ad_accounts(), log=_log_progress)
     except Exception as exc:  # noqa: BLE001
         text = f"前台价核算失败：{type(exc).__name__}: {exc}"
         _log_progress(text)
@@ -7593,7 +8042,7 @@ def _activity_nightly():
         today = _today()
         start = (today - dt.timedelta(days=30)).isoformat()
         _log_progress("团长活动：开始抓取报名日志（近 30 天）与效果数据")
-        res = activity.run(accounts=settings.ACCOUNTS, start=start,
+        res = activity.run(accounts=settings.ad_accounts(), start=start,
                            end=today.isoformat(), perf_days=settings.REFRESH_DAYS,
                            log=_log_progress)
         total = sum(v.get("signups", 0) for v in (res.get("accounts") or {}).values())
@@ -7605,7 +8054,7 @@ def _activity_nightly():
 def _activity_fresh(hours: int = 6) -> bool:
     """全部账号都在最近 N 小时内抓过，就不再重复跑（容器频繁重启时省时间）。"""
     now = settings.now().replace(tzinfo=None)
-    for a in settings.ACCOUNTS:
+    for a in settings.ad_accounts():
         st = activity._read(activity.acct_dir(a["key"]) / "state.json", {})
         last = st.get("lastRun")
         if not last:
@@ -7618,7 +8067,7 @@ def _activity_fresh(hours: int = 6) -> bool:
     # 还要确认「昨天」的订单明细在：夜间任务偶尔会被抓取锁/重启打断，
     # 只按 lastRun 判断会漏掉整天的数据。
     yday = (settings.today() - dt.timedelta(days=1)).isoformat()
-    for a in settings.ACCOUNTS:
+    for a in settings.ad_accounts():
         od = activity.acct_dir(a["key"]) / "orders"
         if od.is_dir() and not (od / f"{yday}.json").exists():
             return False
@@ -7642,14 +8091,47 @@ def _spawn_activity_nightly() -> None:
     threading.Thread(target=_activity_nightly, name="activity-nightly", daemon=True).start()
 
 
+_POP_SPAWN_AT = {"t": 0.0}
+
+
+def _pop_orders_nightly() -> None:
+    """POP 店订单：夜间回刷最近 N 天（首次自动补更早的历史）。"""
+    try:
+        days = pop_orders.recent_days()
+        res = pop_orders.start(days, log=_log_progress)
+        _log_progress(f"POP 店订单：{'开始抓取 ' + str(len(days)) + ' 天' if res.get('ok') else res.get('error')}")
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"POP 店订单抓取失败：{type(exc).__name__}: {exc}")
+
+
+def _spawn_pop_orders(delay: int = 0) -> None:
+    """起一个后台线程抓 POP 订单；10 小时内只安排一次，避免调度/重启重复触发。"""
+    if not settings.POP_ORDER_ENABLED or not settings.order_accounts():
+        return
+    if pop_orders.status().get("running"):
+        return
+    if time.time() - _POP_SPAWN_AT["t"] < 36000:
+        return
+    _POP_SPAWN_AT["t"] = time.time()
+
+    def _work():
+        if delay:
+            time.sleep(delay)
+        _pop_orders_nightly()
+
+    threading.Thread(target=_work, name="pop-orders", daemon=True).start()
+
+
 def _nightly_job():
     """回刷最近 REFRESH_DAYS 天，并补齐停机期间的空洞。"""
+    # POP 店订单是独立口径，和广告抓取互不影响，先起线程再跑广告回刷
+    _spawn_pop_orders()
     # 行业大盘按「本地实际有数据的区间」单独补一份缓存：
     # 即使按天数据已经最新，也要让明天的报表 / AI 解读能直接命中行业基准。
     try:
-        lr = analyze_ai.local_range(settings.ACCOUNTS)
+        lr = analyze_ai.local_range(settings.ad_accounts())
         if lr:
-            industry.ensure([a["key"] for a in settings.ACCOUNTS], lr[0], lr[1])
+            industry.ensure([a["key"] for a in settings.ad_accounts()], lr[0], lr[1])
     except Exception as exc:  # noqa: BLE001
         _log_progress(f"行业大盘补齐未启动：{type(exc).__name__}: {exc}")
     rng = scrape_day.catchup_range()
@@ -7727,7 +8209,7 @@ def _sz_retry_days() -> list:
     """最近几天里「商智商品明细还没文件 / 0 行」的天（不算今天）。"""
     today = _today()
     out = set()
-    for a in settings.ACCOUNTS:
+    for a in settings.ad_accounts():
         for i in range(1, max(settings.SZ_RETRY_LOOKBACK, 1) + 1):
             day = (today - dt.timedelta(days=i)).isoformat()
             if ds.payload_rows(ds.load_day(a["key"], day, "sz_product")) == 0:
@@ -7797,6 +8279,10 @@ def _startup():
         _login.start_keepalive()
         print(f"[webapp] 登录态保活已启动：每 {settings.KEEPALIVE_INTERVAL // 60} 分钟续一次会话",
               flush=True)
+    if settings.POP_ORDER_ENABLED and settings.order_accounts():
+        # 首次部署/缓存为空时，启动后自动补一段历史订单；有缓存时也只回刷最近几天
+        _spawn_pop_orders(delay=45)
+        print("[webapp] POP 店订单：已安排启动后抓取", flush=True)
     if settings.ENABLE_SCHEDULER:
         try:
             from apscheduler.schedulers.background import BackgroundScheduler

@@ -339,7 +339,7 @@ def _load_accounts(windows=None, accounts=None):
     """从「按天库」聚合出每个窗口的数据。"""
     from . import dailystore as dstore
     windows = windows or WINDOWS
-    accounts = accounts if accounts is not None else config.ACCOUNTS
+    accounts = accounts if accounts is not None else settings.ad_accounts()
     accts = []
     for a in accounts:
         k, label = a["key"], a.get("label") or a["key"]

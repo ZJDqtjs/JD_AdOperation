@@ -899,7 +899,7 @@ class ProfitRunner:
         want = [str(a) for a in (accounts or [account or ""]) if str(a)]
         if not want or "all" in want:
             # 「全部账号」：把当前所有账号都算一遍，再合成一张总览表
-            keys = [a["key"] for a in settings.ACCOUNTS]
+            keys = [a["key"] for a in settings.ad_accounts()]
         else:
             keys = [settings.get_account(a)["key"] for a in want]
         keys = list(dict.fromkeys(keys))

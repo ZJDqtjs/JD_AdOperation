@@ -45,6 +45,10 @@ services:
       JD_HOURLY_PLANS: "${JD_HOURLY_PLANS:-20}"
       JD_HOURLY_SLEEP: "${JD_HOURLY_SLEEP:-0.4}"
       JD_HOURLY_DAYS: "${JD_HOURLY_DAYS:-1}"
+      # ---- POP 店订单（accounts.json 里 orders_only=true 的店铺）----
+      JD_POP_ORDER: "${JD_POP_ORDER:-1}"
+      JD_POP_ORDER_REFRESH_DAYS: "${JD_POP_ORDER_REFRESH_DAYS:-7}"
+      JD_POP_ORDER_BACKFILL_DAYS: "${JD_POP_ORDER_BACKFILL_DAYS:-30}"
       # ---- AI 解读层（jd_roi.analyze_ai / jd_roi.llm）----
       # OpenAI 兼容端点；Key 只写 .env，别提交。容器内不挂 .env，只能靠这里注入
       LLM_BASE_URL: "${LLM_BASE_URL:-}"

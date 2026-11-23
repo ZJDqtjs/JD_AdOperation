@@ -53,13 +53,13 @@ PLAN_MAX_TOKENS = 4000
 def _accounts(spec) -> list[dict]:
     """把 "main" / "main,b" / None 归一成账号字典列表。"""
     if not spec or str(spec).lower() in ("all", "*", "全部"):
-        return list(settings.ACCOUNTS)
+        return list(settings.ad_accounts())
     if isinstance(spec, (list, tuple)):
         keys = {str(x).strip() for x in spec}
     else:
         keys = {x.strip() for x in str(spec).split(",") if x.strip()}
-    got = [a for a in settings.ACCOUNTS if a["key"] in keys]
-    return got or list(settings.ACCOUNTS)
+    got = [a for a in settings.ad_accounts() if a["key"] in keys]
+    return got or list(settings.ad_accounts())
 
 
 def _acc_label(accs) -> str:
@@ -379,7 +379,7 @@ def run(job, task: str, *, accounts=None, start=None, end=None,
     rng = analyze_ai.local_range(_accounts(accounts))
     ctx = {
         "today": settings.today().isoformat(),
-        "accounts": [a["key"] for a in settings.ACCOUNTS],
+        "accounts": [a["key"] for a in settings.ad_accounts()],
         "local_days_latest": _newest_day(),
         "ai_default_range": list(rng or []),
         "ui_selected_range": [start, end] if start and end else None,
