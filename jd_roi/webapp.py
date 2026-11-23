@@ -839,7 +839,7 @@ def vs_page(request: Request):
     yday = _today() - dt.timedelta(days=1)
     if preset == "switch":
         a_start, a_end = "2026-11-06", "2026-11-17"
-        b_start, b_end = "2026-11-19", "2026-11-20"
+        b_start, b_end = "2026-11-19", "2026-11-22"
     elif preset == "week":
         b_end_d = yday
         b_start_d = b_end_d - dt.timedelta(days=6)

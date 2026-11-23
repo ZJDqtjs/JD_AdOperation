@@ -22,7 +22,7 @@ from .indicators import SZ_AMT, SZ_ORDN, SZ_QTY, SZ_UV
 from .report2 import _e, _money, _pct
 
 DEFAULT_A = ("2026-11-06", "2026-11-17")
-DEFAULT_B = ("2026-11-19", "2026-11-20")
+DEFAULT_B = ("2026-11-19", "2026-11-22")
 
 
 def _f(v, d=0.0) -> float:
@@ -312,9 +312,9 @@ def build(a_start: str, a_end: str, b_start: str, b_end: str, accounts: list) ->
 
     valid = lambda r: not r["orphan"]  # noqa: E731
     plan_only = lambda r: r["isPlan"] and not r["orphan"]  # noqa: E731
-    # 图表多给 17 天前置上下文 + 1 天后置，和独立 HTML 报告的走势图对齐
+    # 图表多给 17 天前置上下文；末端就到 B 期最后一天，避免把今天未结算的数据画进来
     chart_start = (dt.date.fromisoformat(min(a_start, b_start)) - dt.timedelta(days=17)).isoformat()
-    chart_end = (dt.date.fromisoformat(max(a_end, b_end)) + dt.timedelta(days=1)).isoformat()
+    chart_end = max(a_end, b_end)
     series = _daily_series(accounts, groups, chart_start, chart_end)
     return {
         "meta": {
@@ -415,7 +415,67 @@ code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
   background:#f8fafc;border:1px solid var(--line);border-radius:8px}
 .sku-group summary span{font-weight:400;color:var(--muted);font-size:12px}
 .tblwrap{overflow:auto;max-height:620px;border:1px solid var(--line);border-radius:10px;background:#fff}
-@media(max-width:820px){.kpis{grid-template-columns:1fr 1fr}.grid2{grid-template-columns:1fr}}
+.freshness{background:#fffbeb;border:1px solid #fde68a;color:#78350f;border-radius:8px;
+  padding:8px 12px;font-size:12px;margin-top:10px}
+.verdict{border-radius:12px;padding:18px 22px;margin-top:16px;border:1px solid}
+.verdict.warn{background:#fffbeb;border-color:#fde68a}
+.verdict.good{background:#ecfdf5;border-color:#a7f3d0}
+.verdict.info{background:#eff6ff;border-color:#dbeafe}
+.verdict .vtitle{font-size:20px;font-weight:700;line-height:1.5}
+.verdict .vsub{font-size:13px;color:var(--muted);margin-top:4px}
+.bigkpis{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:16px}
+.bigkpi{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.bigkpi .l{font-size:12px;color:var(--muted)}
+.bigkpi .big{font-size:30px;font-weight:700;letter-spacing:-.5px;margin:2px 0}
+.bigkpi .d{font-size:13px;font-weight:600}
+.bigkpi .d.good{color:var(--green)} .bigkpi .d.bad{color:var(--red)}
+.bigkpi .plain{font-size:12px;color:var(--muted);margin-top:4px}
+.gcards{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+.gcard{background:#fff;border:1px solid var(--line);border-left:5px solid var(--line);
+  border-radius:12px;padding:16px 18px}
+.gcard.warn{border-left-color:#f59e0b}
+.gcard.good{border-left-color:#10b981}
+.gcard.bad{border-left-color:#ef4444}
+.gcard.info{border-left-color:#3b82f6}
+.ghead{display:flex;align-items:center;justify-content:space-between;font-size:15px}
+.pill{font-size:11px;padding:2px 8px;border-radius:999px}
+.pill.warn{background:#fffbeb;color:#b45309}
+.pill.good{background:#ecfdf5;color:#047857}
+.pill.bad{background:#fef2f2;color:#b91c1c}
+.pill.info{background:#eff6ff;color:#1d4ed8}
+.gverdict{font-size:13px;color:#334155;margin:8px 0}
+.gmetrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}
+.gmetrics div{background:#f8fafc;border-radius:8px;padding:8px 10px}
+.gmetrics span{display:block;font-size:11px;color:var(--muted)}
+.gmetrics b{display:block;font-size:13px}
+.gmetrics em{font-style:normal;font-size:11px;font-weight:600}
+.gwhy{font-size:12px;color:var(--muted);line-height:1.7;border-top:1px dashed var(--line);padding-top:8px}
+.em-good{color:#059669}.em-bad{color:#dc2626}
+.simple-list{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+.simple-col h3{margin:0 0 8px;font-size:14px}
+.simple-row{display:flex;align-items:center;gap:10px;padding:8px 0;
+  border-bottom:1px solid #f1f5f9;font-size:13px}
+.simple-row .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.simple-row .mt{color:var(--muted);font-size:11.5px;white-space:nowrap}
+.tag.bad{background:#fef2f2;color:#b91c1c}
+.tag.warn{background:#fffbeb;color:#b45309}
+.tag.ok{background:#ecfdf5;color:#047857}
+.steps{counter-reset:s;margin:0;padding:0;list-style:none}
+.steps li{position:relative;padding:10px 0 10px 34px;border-bottom:1px solid #f1f5f9;font-size:13px}
+.steps li:last-child{border-bottom:0}
+.steps li:before{counter-increment:s;content:counter(s);position:absolute;left:0;top:10px;
+  width:22px;height:22px;border-radius:50%;background:#eff6ff;color:#2563eb;font-size:12px;
+  font-weight:700;display:flex;align-items:center;justify-content:center}
+details.tech,details.glossary{margin-top:16px;background:#fff;border:1px solid var(--line);
+  border-radius:12px;padding:14px 18px}
+details.tech summary,details.glossary summary{cursor:pointer;font-weight:600;font-size:14px}
+details.tech h2,details.glossary h3{margin-top:22px}
+.glossary dl{margin:10px 0 0}
+.glossary dt{font-weight:600;margin-top:8px}
+.glossary dd{margin:2px 0 0 0;color:var(--muted);font-size:13px}
+@media(max-width:820px){.kpis{grid-template-columns:1fr 1fr}.grid2{grid-template-columns:1fr}
+  .bigkpis{grid-template-columns:1fr}.gcards{grid-template-columns:1fr}
+  .simple-list{grid-template-columns:1fr}.gmetrics{grid-template-columns:1fr}}
 """
 
 
@@ -447,8 +507,9 @@ def _conclusion(d) -> list:
     ds, _ = _delta_pct(b["spend"] / db, a["spend"] / da)
     dg, _ = _delta_pct(b["gmv"] / db, a["gmv"] / da)
     out.append(
-        f"<b>{scope}</b>：总花费 ¥{_money(a['spend']/da)}/天 → ¥{_money(b['spend']/db)}/天（{ds}）；"
-        f"商智成交 ¥{_money(a['gmv']/da)}/天 → ¥{_money(b['gmv']/db)}/天（{dg}）；"
+        f"<b>{scope}</b>：A 花费 ¥{_money(a['spend']/da)}/天（快车 ¥{_money(a['adCost']/da)} + 全站 ¥{_money(a['swaCost']/da)}）"
+        f" → B 花费 ¥{_money(b['spend']/db)}/天（快车 ¥{_money(b['adCost']/db)} + 全站 ¥{_money(b['swaCost']/db)}），"
+        f"合计 {ds}；商智成交 ¥{_money(a['gmv']/da)}/天 → ¥{_money(b['gmv']/db)}/天（{dg}）；"
         f"费比 {_pctv(a['fee'], 2)} → {_pctv(b['fee'], 2)}（{(b['fee']-a['fee'])*100:+.2f}pp）。")
     best = None
     for g in d["groups"]:
@@ -464,6 +525,30 @@ def _conclusion(d) -> list:
             f"{_pctv(_f(g['a'].get('fee')), 2)} → {_pctv(_f(g['b'].get('fee')), 2)}"
             f"（{(_f(g['b'].get('fee')) - _f(g['a'].get('fee')))*100:+.2f}pp），"
             f"商智成交 ¥{_money(_f(g['a'].get('gmv'))/da)}/天 → ¥{_money(_f(g['b'].get('gmv'))/db)}/天。")
+    # 全账号（含没切全站的快车）与最差组
+    aa, ab = d["totals"]["all"]["a"], d["totals"]["all"]["b"]
+    out.append(
+        f"<b>全账号（含其他快车商品）</b>：花费 ¥{_money(aa['spend']/da)}/天 → ¥{_money(ab['spend']/db)}/天"
+        f"（快车 ¥{_money(ab['adCost']/db)} + 全站 ¥{_money(ab['swaCost']/db)}），"
+        f"商智成交 ¥{_money(aa['gmv']/da)}/天 → ¥{_money(ab['gmv']/db)}/天，"
+        f"费比 {_pctv(aa['fee'], 2)} → {_pctv(ab['fee'], 2)}（{(ab['fee']-aa['fee'])*100:+.2f}pp）。")
+    worst = None
+    for g in d["groups"]:
+        if g.get("orphan"):
+            continue
+        fa, fb = _f(g["a"].get("fee")), _f(g["b"].get("fee"))
+        if fa > 0 and fb > 0 and _f(g["a"].get("gmv")) + _f(g["b"].get("gmv")) > 500:
+            worsen = fb - fa
+            if worst is None or worsen > worst[0]:
+                worst = (worsen, g)
+    if worst and worst[0] > 0.005:
+        g = worst[1]
+        out.append(
+            f"费比恶化最大：<b>{_e(g['label'][:26])}</b> "
+            f"{_pctv(_f(g['a'].get('fee')), 2)} → {_pctv(_f(g['b'].get('fee')), 2)}"
+            f"（{(_f(g['b'].get('fee')) - _f(g['a'].get('fee')))*100:+.2f}pp），"
+            f"商智成交 ¥{_money(_f(g['a'].get('gmv'))/da)}/天 → ¥{_money(_f(g['b'].get('gmv'))/db)}/天；"
+            f"这块是快车/其他商品，不是本次全站调整的对象，但会拖累全账号费比，建议单独排查。")
     risks = []
     scan = [g for g in d["groups"] if g.get("isPlan") and not g.get("orphan")]
     if not scan:
@@ -497,10 +582,16 @@ def insight_prompt(d) -> str:
         "两者平台 ROI 不能直接比，只能比『广告总花费 ÷ 商智成交额』（费比）和净利。",
         f"A 期：{d['meta']['a']['start']} ~ {d['meta']['a']['end']}（{da}天）；"
         f"B 期：{d['meta']['b']['start']} ~ {d['meta']['b']['end']}（{db}天）。",
-        f"总计（{scope}）：A 花费 {a['spend']/da:.0f}/天、商智成交 {a['gmv']/da:.0f}/天、"
-        f"费比 {a['fee']*100:.2f}%、净利 {a['profit']/da:.0f}/天；"
-        f"B 花费 {b['spend']/db:.0f}/天、商智成交 {b['gmv']/db:.0f}/天、"
-        f"费比 {b['fee']*100:.2f}%、净利 {b['profit']/db:.0f}/天。",
+        f"总计（{scope}）：A 花费 {a['spend']/da:.0f}/天（快车 {a['adCost']/da:.0f} + 全站 {a['swaCost']/da:.0f}）、"
+        f"商智成交 {a['gmv']/da:.0f}/天、费比 {a['fee']*100:.2f}%、净利 {a['profit']/da:.0f}/天；"
+        f"B 花费 {b['spend']/db:.0f}/天（快车 {b['adCost']/db:.0f} + 全站 {b['swaCost']/db:.0f}）、"
+        f"商智成交 {b['gmv']/db:.0f}/天、费比 {b['fee']*100:.2f}%、净利 {b['profit']/db:.0f}/天。",
+        f"全账号合计（含其他快车商品）：A 花费 {d['totals']['all']['a']['spend']/da:.0f}/天"
+        f"（快车 {d['totals']['all']['a']['adCost']/da:.0f} + 全站 {d['totals']['all']['a']['swaCost']/da:.0f}）、"
+        f"B 花费 {d['totals']['all']['b']['spend']/db:.0f}/天"
+        f"（快车 {d['totals']['all']['b']['adCost']/db:.0f} + 全站 {d['totals']['all']['b']['swaCost']/db:.0f}）。"
+        "注意：有 SPU 计划的组只覆盖本次调整的商品；梓云茶快车大部分在『其他快车商品』组，"
+        "不能因为它不在计划组 KPI 里就认为没算快车花费。",
         "分组：",
     ]
     for g in d["groups"]:
@@ -509,12 +600,23 @@ def insight_prompt(d) -> str:
         x, y = g["a"], g["b"]
         lines.append(
             f"- {g['label'][:36]}（{g['sub']}）："
-            f"A 花费 {_f(x.get('spend'))/da:.0f}/天、成交 {_f(x.get('gmv'))/da:.0f}/天、"
-            f"费比 {_f(x.get('fee'))*100:.2f}%、毛利 {_f(x.get('margin'))*100:.1f}%、"
-            f"净利 {_f(x.get('profit'))/da:.0f}/天；"
-            f"B 花费 {_f(y.get('spend'))/db:.0f}/天、成交 {_f(y.get('gmv'))/db:.0f}/天、"
-            f"费比 {_f(y.get('fee'))*100:.2f}%、毛利 {_f(y.get('margin'))*100:.1f}%、"
-            f"净利 {_f(y.get('profit'))/db:.0f}/天。")
+            f"A 花费 {_f(x.get('spend'))/da:.0f}/天（快车 {_f(x.get('adCost'))/da:.0f} + 全站 {_f(x.get('swaCost'))/da:.0f}）、"
+            f"成交 {_f(x.get('gmv'))/da:.0f}/天、费比 {_f(x.get('fee'))*100:.2f}%、"
+            f"毛利 {_f(x.get('margin'))*100:.1f}%、净利 {_f(x.get('profit'))/da:.0f}/天；"
+            f"B 花费 {_f(y.get('spend'))/db:.0f}/天（快车 {_f(y.get('adCost'))/db:.0f} + 全站 {_f(y.get('swaCost'))/db:.0f}）、"
+            f"成交 {_f(y.get('gmv'))/db:.0f}/天、费比 {_f(y.get('fee'))*100:.2f}%、"
+            f"毛利 {_f(y.get('margin'))*100:.1f}%、净利 {_f(y.get('profit'))/db:.0f}/天。")
+    lines.append("其他快车/非计划组（未切全站，但影响全账号费比）：")
+    for g in d["groups"]:
+        if g.get("isPlan") or g.get("orphan"):
+            continue
+        x, y = g["a"], g["b"]
+        if _f(x.get("gmv")) + _f(y.get("gmv")) < 500:
+            continue
+        lines.append(
+            f"- {g['label'][:30]}：A 花费 {_f(x.get('spend'))/da:.0f}/天、成交 {_f(x.get('gmv'))/da:.0f}/天、"
+            f"费比 {_f(x.get('fee'))*100:.2f}%；B 花费 {_f(y.get('spend'))/db:.0f}/天、"
+            f"成交 {_f(y.get('gmv'))/db:.0f}/天、费比 {_f(y.get('fee'))*100:.2f}%。")
     risks = []
     for g in d["groups"]:
         if not g.get("isPlan") or g.get("orphan"):
@@ -614,10 +716,38 @@ def _same_sku_table(d) -> str:
 全站营销的 ROI 正是后者的口径。所以两个 ROI 的差距主要是<b>分子</b>，不是效率。</div>"""
 
 
+def _channel_table(d) -> str:
+    """把 A/B 花费拆成 快车/智能 vs 全站营销，明确两边都算进去了。"""
+    da, db = d["meta"]["a"]["days"], d["meta"]["b"]["days"]
+    rows = []
+    for g in d["groups"]:
+        if not g.get("isPlan") or g.get("orphan"):
+            continue
+        rows.append((g["label"][:26], g["a"], g["b"]))
+    t = d["totals"]
+    rows.append(("有 SPU 计划的组合计", t["plan"]["a"], t["plan"]["b"]))
+    rows.append(("全账号合计（含其他快车商品）", t["all"]["a"], t["all"]["b"]))
+    trs = []
+    for label, a, b in rows:
+        trs.append(
+            f"<tr><td class='l'><b>{_e(label)}</b></td>"
+            f"<td class='num'>¥{_money(_f(a.get('adCost'))/da)}</td>"
+            f"<td class='num'>¥{_money(_f(a.get('swaCost'))/da)}</td>"
+            f"<td class='num'><b>¥{_money(_f(a.get('spend'))/da)}</b></td>"
+            f"<td class='num'>¥{_money(_f(b.get('adCost'))/db)}</td>"
+            f"<td class='num'>¥{_money(_f(b.get('swaCost'))/db)}</td>"
+            f"<td class='num'><b>¥{_money(_f(b.get('spend'))/db)}</b></td></tr>")
+    return ("<table class='tbl'><thead><tr><th class='l'>分组</th>"
+            "<th class='num'>A 快车/天</th><th class='num'>A 全站/天</th><th class='num'>A 合计/天</th>"
+            "<th class='num'>B 快车/天</th><th class='num'>B 全站/天</th><th class='num'>B 合计/天</th></tr>"
+            f"</thead><tbody>{''.join(trs)}</tbody></table>")
+
+
 def _group_table(d) -> str:
     da, db = d["meta"]["a"]["days"], d["meta"]["b"]["days"]
     th = ("<tr><th class='l'>分组</th>"
-          "<th class='num'>A 花费/天</th><th class='num'>B 花费/天</th><th class='num'>花费Δ</th>"
+          "<th class='num'>A 花费/天</th><th class='num'>B 花费/天</th>"
+          "<th class='num'>B 快车/天</th><th class='num'>B 全站/天</th><th class='num'>花费Δ</th>"
           "<th class='num'>A 商智/天</th><th class='num'>B 商智/天</th><th class='num'>商智Δ</th>"
           "<th class='num'>A 费比</th><th class='num'>B 费比</th><th class='num'>费比Δ</th>"
           "<th class='num'>毛利率</th><th class='num'>A 净利/天</th><th class='num'>B 净利/天</th></tr>")
@@ -629,6 +759,8 @@ def _group_table(d) -> str:
                 f"<tr><td class='l'><b>{_e(g['label'][:34])}</b><div class='sub'>{_e(g['sub'])}</div></td>"
                 f"<td class='num'>¥{_money(_f(a.get('spend'))/da)}</td>"
                 f"<td class='num'>¥{_money(_f(b.get('spend'))/db)}</td>"
+                f"<td class='num'>¥{_money(_f(b.get('adCost'))/db)}</td>"
+                f"<td class='num'>¥{_money(_f(b.get('swaCost'))/db)}</td>"
                 f"<td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td>"
                 f"<td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td>"
                 f"<td class='l' colspan='2'><span class='tag warn'>纯广告，商智无成交（不计入费比）</span></td></tr>")
@@ -640,6 +772,8 @@ def _group_table(d) -> str:
             f"<tr><td class='l'><b>{_e(g['label'][:34])}</b><div class='sub'>{_e(g['sub'])}</div></td>"
             f"<td class='num'>¥{_money(_f(a.get('spend'))/da)}</td>"
             f"<td class='num'>¥{_money(_f(b.get('spend'))/db)}</td>"
+            f"<td class='num'>¥{_money(_f(b.get('adCost'))/db)}</td>"
+            f"<td class='num'>¥{_money(_f(b.get('swaCost'))/db)}</td>"
             f"<td class='num'>{ds}</td>"
             f"<td class='num'>¥{_money(_f(a.get('gmv'))/da)}</td>"
             f"<td class='num'>¥{_money(_f(b.get('gmv'))/db)}</td>"
@@ -657,6 +791,7 @@ def _sku_table(d, g) -> str:
     da, db = d["meta"]["a"]["days"], d["meta"]["b"]["days"]
     th = ("<tr><th class='l'>商品</th><th class='num'>毛利率</th><th class='num'>保本ROI</th>"
           "<th class='num'>A 花费/天</th><th class='num'>B 花费/天</th>"
+          "<th class='num'>B 快车/天</th><th class='num'>B 全站/天</th>"
           "<th class='num'>A 商智/天</th><th class='num'>B 商智/天</th><th class='num'>GMVΔ</th>"
           "<th class='num'>A 费比</th><th class='num'>B 费比</th><th class='l'>判断</th></tr>")
     trs = []
@@ -685,6 +820,8 @@ def _sku_table(d, g) -> str:
             f"<td class='num'>{_f(s.get('breakeven')):.2f}</td>"
             f"<td class='num'>¥{_money(_f((sa or {}).get('spend'))/da)}</td>"
             f"<td class='num'>¥{_money(_f((sb or {}).get('spend'))/db)}</td>"
+            f"<td class='num'>¥{_money(_f((sb or {}).get('adCost'))/db)}</td>"
+            f"<td class='num'>¥{_money(_f((sb or {}).get('swaCost'))/db)}</td>"
             f"<td class='num'>¥{_money(ga/da)}</td>"
             f"<td class='num'>¥{_money(gb/db)}</td>"
             f"<td class='num'>{dg}</td>"
@@ -692,7 +829,7 @@ def _sku_table(d, g) -> str:
             f"<td class='num'>{_pctv(fee, 2) if fee else '—'}</td>"
             f"<td class='l'><span class='tag {cls}'>{verdict}</span></td></tr>")
     if extra:
-        trs.append(f"<tr><td colspan='11' class='l sub'>其余 {extra} 个 SKU 省略（合计看上方分组表）</td></tr>")
+        trs.append(f"<tr><td colspan='13' class='l sub'>其余 {extra} 个 SKU 省略（合计看上方分组表）</td></tr>")
     return f"<div class='tblwrap'><table class='tbl small'><thead>{th}</thead><tbody>{''.join(trs)}</tbody></table></div>"
 
 
@@ -721,7 +858,9 @@ def _svg_trend(series, color: str, b_start: str, w=540, h=240) -> str:
                      f'<text x="{pad_l-5}" y="{y+3.5:.1f}" text-anchor="end" font-size="10" fill="#8a94a6">{v/1000:.0f}k</text>')
     for i, p in enumerate(series):
         if i in label_idx:
-            parts.append(f'<text x="{X(i):.1f}" y="{h-8}" text-anchor="middle" font-size="10" fill="#8a94a6">{_e(p["d"][5:])}</text>')
+            anchor = "start" if i == 0 else ("end" if i == n - 1 else "middle")
+            x = pad_l if i == 0 else (w - 2 if i == n - 1 else X(i))
+            parts.append(f'<text x="{x:.1f}" y="{h-8}" text-anchor="{anchor}" font-size="10" fill="#8a94a6">{_e(p["d"][5:])}</text>')
     idx = next((i for i, p in enumerate(series) if p["d"] >= b_start), 0)
     parts.append(f'<line x1="{X(idx):.1f}" y1="{pad_t}" x2="{X(idx):.1f}" y2="{pad_t+ih}" '
                  f'stroke="#f59e0b" stroke-dasharray="4 4" stroke-width="1.2"/>'
@@ -760,7 +899,9 @@ def _svg_spend(series, b_start: str, w=540, h=240) -> str:
                      f'<text x="{pad_l-5}" y="{y+3.5:.1f}" text-anchor="end" font-size="10" fill="#8a94a6">{v/1000:.1f}k</text>')
     for i, p in enumerate(series):
         if i in label_idx:
-            parts.append(f'<text x="{pad_l + iw*i/max(n-1,1):.1f}" y="{h-8}" text-anchor="middle" font-size="10" fill="#8a94a6">{_e(p["d"][5:])}</text>')
+            anchor = "start" if i == 0 else ("end" if i == n - 1 else "middle")
+            x = pad_l if i == 0 else (w - 2 if i == n - 1 else pad_l + iw*i/max(n-1,1))
+            parts.append(f'<text x="{x:.1f}" y="{h-8}" text-anchor="{anchor}" font-size="10" fill="#8a94a6">{_e(p["d"][5:])}</text>')
     idx = next((i for i, p in enumerate(series) if p["d"] >= b_start), 0)
     parts.append(f'<line x1="{pad_l + iw*idx/max(n-1,1):.1f}" y1="{pad_t}" x2="{pad_l + iw*idx/max(n-1,1):.1f}" '
                  f'y2="{pad_t+ih}" stroke="#f59e0b" stroke-dasharray="4 4" stroke-width="1.2"/>')
@@ -774,6 +915,14 @@ def _chart_groups(d):
     return gs[:4]
 
 
+def _chart_name(g) -> str:
+    if "100004361356" in g["key"]:
+        return "梓云茶 · 玉米系列"
+    if "100006799721" in g["key"]:
+        return "雨润禾 · 蔬菜系列"
+    return g["label"][:14]
+
+
 def _chart_lines(d) -> str:
     b_start = d["meta"]["b"]["start"]
     boxes = []
@@ -782,7 +931,7 @@ def _chart_lines(d) -> str:
         if not series:
             continue
         boxes.append(
-            f'<div class="chartbox"><div class="cap"><b style="color:#2563eb">{_e(g["sub"])}</b>'
+            f'<div class="chartbox"><div class="cap"><b style="color:#2563eb">{_e(_chart_name(g))}</b>'
             f' 商智成交额/天（元）</div>{_svg_trend(series, "#2563eb", b_start)}'
             f'<div class="legend"><span><i class="dot" style="background:#2563eb"></i>商智成交额</span>'
             f'<span style="color:#b45309">虚线 = B 期开始</span></div></div>')
@@ -797,7 +946,7 @@ def _chart_spends(d) -> str:
         if not series:
             continue
         boxes.append(
-            f'<div class="chartbox"><div class="cap"><b>{_e(g["sub"])}</b>'
+            f'<div class="chartbox"><div class="cap"><b>{_e(_chart_name(g))}</b>'
             f' 每日广告花费：<span style="color:#2563eb">快车/智能</span> + <span style="color:#ea580c">全站营销</span></div>'
             f'{_svg_spend(series, b_start)}'
             f'<div class="legend"><span><i class="dot" style="background:#2563eb"></i>快车/智能</span>'
@@ -827,11 +976,180 @@ def _conclusion_table(d) -> str:
 </tbody></table>"""
 
 
+def _chg(cur, pre) -> float:
+    return (cur / pre - 1) if pre else 0.0
+
+
+def _control_group(d):
+    cands = [g for g in d["groups"]
+             if not g.get("isPlan") and not g.get("orphan") and _f(g["a"].get("gmv")) > 0]
+    cands.sort(key=lambda g: -_f(g["a"].get("gmv")))
+    return cands[0] if cands else None
+
+
+def _verdict_banner(d) -> str:
+    a, b, scope = _headline(d)
+    da, db = d["meta"]["a"]["days"], d["meta"]["b"]["days"]
+    sg = _chg(_f(b["spend"]) / db, _f(a["spend"]) / da)
+    gg = _chg(_f(b["gmv"]) / db, _f(a["gmv"]) / da)
+    pg = _chg(_f(b["profit"]) / db, _f(a["profit"]) / da)
+    if pg >= 0 and gg >= -0.05:
+        cls, sub = "good", "广告费省了，成交基本保住，净利还提升了。"
+    elif pg < 0 and gg < 0:
+        cls, sub = "warn", "广告费是省了，但成交和毛利掉得更多；要不要继续，看下面两个商品组。"
+    else:
+        cls, sub = "info", "广告费和成交各有变化，下面按商品组拆开看。"
+    title = (f"这次调整：广告费{'省' if sg < 0 else '多'}了 {abs(sg)*100:.0f}%，"
+             f"成交{'少' if gg < 0 else '多'}了 {abs(gg)*100:.0f}%，"
+             f"净利{'少' if pg < 0 else '多'}了 {abs(pg)*100:.0f}%")
+    tags = []
+    for g in d["groups"]:
+        if not g.get("isPlan") or g.get("orphan"):
+            continue
+        gp = _chg(_f(g["b"].get("profit")) / db, _f(g["a"].get("profit")) / da)
+        gq = _chg(_f(g["b"].get("gmv")) / db, _f(g["a"].get("gmv")) / da)
+        name = "玉米" if "100004361356" in g["key"] else ("蔬菜" if "100006799721" in g["key"] else g["label"][:8])
+        icon = "✅" if gp >= 0 and gq >= -0.05 else ("⚠️" if gp < 0 and gq < -0.1 else "➖")
+        tags.append(f"{icon} {name}")
+    sub = "；".join(tags) + "。" + sub if tags else sub
+    return f'<div class="verdict {cls}"><div class="vtitle">{_e(title)}</div><div class="vsub">{_e(sub)}</div></div>'
+
+
+def _big_kpis(d) -> str:
+    a, b, scope = _headline(d)
+    da, db = d["meta"]["a"]["days"], d["meta"]["b"]["days"]
+
+    def card(label, av, bv, fmt, lower_better):
+        chg = _chg(bv, av)
+        if chg == 0:
+            cls = ""
+        elif lower_better:
+            cls = "good" if chg < 0 else "bad"
+        else:
+            cls = "good" if chg > 0 else "bad"
+        word = "少" if chg < 0 else ("多" if chg > 0 else "持平")
+        plain = f"每天{word}{fmt(abs(bv - av))}" if chg else "基本持平"
+        return (f'<div class="bigkpi"><div class="l">{label}</div><div class="big">{fmt(bv)}</div>'
+                f'<div class="d {cls}">比 A {word} {fmt(abs(bv - av))}（{chg*100:+.0f}%）</div>'
+                f'<div class="plain">{plain}</div></div>')
+
+    return ('<div class="bigkpis">'
+            + card("广告费 / 天", _f(a["spend"])/da, _f(b["spend"])/db, lambda v: "¥"+_money(v), True)
+            + card("商智成交 / 天", _f(a["gmv"])/da, _f(b["gmv"])/db, lambda v: "¥"+_money(v), False)
+            + card("净利 / 天", _f(a["profit"])/da, _f(b["profit"])/db, lambda v: "¥"+_money(v), False)
+            + '</div>')
+
+
+def _group_cards(d) -> str:
+    da, db = d["meta"]["a"]["days"], d["meta"]["b"]["days"]
+    control = _control_group(d)
+    cg = _chg(_f(control["b"].get("gmv"))/db, _f(control["a"].get("gmv"))/da) if control else 0
+    cards = []
+    for g in d["groups"]:
+        if not g.get("isPlan") or g.get("orphan"):
+            continue
+        a, b = g["a"], g["b"]
+        sa, sb = _f(a.get("spend"))/da, _f(b.get("spend"))/db
+        ga, gb = _f(a.get("gmv"))/da, _f(b.get("gmv"))/db
+        pa, pb = _f(a.get("profit"))/da, _f(b.get("profit"))/db
+        sg, gg, pg = _chg(sb, sa), _chg(gb, ga), _chg(pb, pa)
+        ma, mb = _f(a.get("margin")), _f(b.get("margin"))
+        if pg >= 0 and gg >= -0.05:
+            cls, pill, txt = "good", "✅ 切对了", "广告费省了，成交基本保住，净利变好。"
+        elif pg < 0 and gg < -0.1:
+            cls, pill, txt = "warn", "⚠️ 需关注", "广告费省了，但成交和毛利掉得更多，净利变差。"
+        else:
+            cls, pill, txt = "info", "➖ 效果一般", "有省有花，需要再观察。"
+        name = "玉米 SPU" if "100004361356" in g["key"] else (
+            "蔬菜 SPU" if "100006799721" in g["key"] else g["label"][:12])
+        cname = "其他快车"
+        why = (f"对照“{cname}”成交 {cg*100:+.1f}%，本组 {gg*100:+.1f}%；"
+               f"毛利率 {ma*100:.1f}% → {mb*100:.1f}%。")
+        cards.append(f"""<div class="gcard {cls}">
+<div class="ghead"><b>{_e(name)}</b><span class="pill {cls}">{pill}</span></div>
+<div class="gverdict">{_e(txt)}</div>
+<div class="gmetrics">
+<div><span>广告费/天</span><b>¥{_money(sa)} → ¥{_money(sb)}</b><em class="{'em-good' if sg<0 else 'em-bad'}">{sg*100:+.0f}%</em></div>
+<div><span>成交/天</span><b>¥{_money(ga)} → ¥{_money(gb)}</b><em class="{'em-good' if gg>0 else 'em-bad'}">{gg*100:+.0f}%</em></div>
+<div><span>净利/天</span><b>¥{_money(pa)} → ¥{_money(pb)}</b><em class="{'em-good' if pg>0 else 'em-bad'}">{pg*100:+.0f}%</em></div>
+</div>
+<div class="gwhy">{_e(why)}</div></div>""")
+    return f'<div class="gcards">{"".join(cards)}</div>'
+
+
+def _simple_skus(d) -> str:
+    da, db = d["meta"]["a"]["days"], d["meta"]["b"]["days"]
+    rows = []
+    for g in d["groups"]:
+        if g.get("orphan") or not g.get("isPlan"):
+            continue
+        for sid, sa, sb in g["sku"]:
+            s = sb or sa
+            if not s:
+                continue
+            ga = _f((sa or {}).get("gmv")) / da
+            gb = _f((sb or {}).get("gmv")) / db
+            if gb < 1000:
+                continue
+            rows.append({
+                "name": (s.get("name") or sid)[:26], "sid": sid,
+                "fee": _f(s.get("fee")), "mg": _f(s.get("margin")),
+                "gmv": gb, "spend": _f(s.get("spend")) / db,
+                "gg": _chg(gb, ga) if ga else 0,
+            })
+    bad = [r for r in rows if r["mg"] > 0 and (r["fee"] >= r["mg"] * 0.75 or r["gg"] < -0.2)]
+    bad.sort(key=lambda r: (-(r["fee"] - r["mg"]), r["gg"]))
+    good = [r for r in rows if r["mg"] > 0 and r["fee"] < r["mg"] * 0.75 and r["gg"] >= -0.1]
+    good.sort(key=lambda r: -r["gmv"])
+
+    def line(r):
+        if r["mg"] > 0 and r["fee"] >= r["mg"]:
+            tag, txt = "bad", "费比高于毛利，亏"
+        elif r["mg"] > 0 and r["fee"] >= r["mg"] * 0.75:
+            tag, txt = "warn", "接近保本，观察"
+        elif r["gg"] < -0.2:
+            tag, txt = "warn", "成交下滑 >20%"
+        else:
+            tag, txt = "ok", "安全"
+        return (f'<div class="simple-row"><div class="nm">{_e(r["name"])}</div>'
+                f'<div class="mt">花 ¥{_money(r["spend"])} · 卖 ¥{_money(r["gmv"])} · 费比 {_pctv(r["fee"], 1)}</div>'
+                f'<span class="tag {tag}">{txt}</span></div>')
+
+    left = "".join(line(r) for r in bad[:5]) or '<p class="sub">没有明显风险 SKU。</p>'
+    right = "".join(line(r) for r in good[:5]) or '<p class="sub">暂无明显表现好的 SKU。</p>'
+    return (f'<div class="simple-list">'
+            f'<div class="simple-col"><h3>⚠️ 需要关注（费比高或成交掉得多）</h3>{left}</div>'
+            f'<div class="simple-col"><h3>✅ 表现较好（费比安全）</h3>{right}</div></div>')
+
+
+def _next_steps(d) -> str:
+    control = _control_group(d)
+    return f"""<ol class="steps">
+<li><b>玉米：</b>先查 11/19 后有没有改价、活动结束、库存或流量变化；如果没有，选 2~3 个 top SKU
+    把快车加回来，做 7 天 A/B，再决定要不要继续全站。</li>
+<li><b>蔬菜：</b>保留全站，先别猛加预算；当前它跑赢对照（其他快车），
+    先小步加 10%~20% 跑 7 天 A/B。</li>
+<li><b>其他快车：</b>单独优化，不要和全站调整混在一起看；它现在是全账号费比的主要拖累。</li>
+<li><b>数据：</b>B 期最后 1~2 天商智还在回补，先看 11/19~20 的终值，T+2/T+3 后再复算。</li>
+</ol>"""
+
+
+def _glossary() -> str:
+    return """<details class="glossary"><summary>看不懂这些词？点这里（费比、毛利率、保本 ROI…）</summary>
+<dl>
+<dt>费比</dt><dd>广告花费占商智成交额的比例。10% = 每卖 100 元，花 10 元广告。</dd>
+<dt>商智成交额</dt><dd>店铺后台统计的真实成交，包含自然流量订单，不全是广告带来的。</dd>
+<dt>全站成交</dt><dd>全站营销报表里的成交，几乎等于整店成交；不能当成“纯广告成交”。</dd>
+<dt>毛利率</dt><dd>扣掉货款、运费、包材后剩下的比例。比如卖 100 元剩 25 元，毛利 25%。</dd>
+<dt>保本 ROI</dt><dd>1 ÷ 毛利率。毛利 25% 时保本 ROI = 4；广告 ROI 低于 4 就亏钱。</dd>
+<dt>净利</dt><dd>商智成交 × 毛利率 − 广告花费（简化口径，不含人工/房租等）。</dd>
+</dl></details>"""
+
+
 def render(d, accounts_all=None, preset: str = "") -> str:
     meta = d["meta"]
     a, b = meta["a"], meta["b"]
     ta, tb, scope = _headline(d)
-    aa, ab = d["totals"]["all"]["a"], d["totals"]["all"]["b"]
     da, db = a["days"], b["days"]
     dn, _ = _delta_pct(_f(tb["profit"])/db, _f(ta["profit"])/da)
     selected = {y["key"] for y in meta["accounts"]}
@@ -843,28 +1161,11 @@ def render(d, accounts_all=None, preset: str = "") -> str:
         f'<label><input type="checkbox" name="accounts" value="{_e(x["key"])}"'
         f'{" checked" if x["key"] in selected else ""}>{_e(x["label"])}</label>'
         for x in (accounts_all or meta["accounts"]))
-    bullets = "".join(f"<li>{x}</li>" for x in _conclusion(d))
-    kpis = "".join([
-        _kpi("花费/天", _f(ta["spend"])/da, _f(tb["spend"])/db, lambda v: "¥"+_money(v)),
-        _kpi("商智成交/天", _f(ta["gmv"])/da, _f(tb["gmv"])/db, lambda v: "¥"+_money(v), good_low=False),
-        _kpi("费比", _f(ta["fee"]), _f(tb["fee"]), lambda v: _pctv(v, 2)),
-        _kpi("净利/天", _f(ta["profit"])/da, _f(tb["profit"])/db, lambda v: "¥"+_money(v), good_low=False),
-    ])
     groups_html = "".join(
         f'<details class="sku-group"{" open" if i == 0 else ""}>'
         f'<summary>{_e(g["label"][:40])} <span>{_e(g["sub"])} · {len(g["sku"])} 个 SKU</span></summary>'
         f'{_sku_table(d, g)}</details>'
         for i, g in enumerate([x for x in d["groups"] if not x.get("orphan")]))
-    # 最佳组的推荐数字
-    best = None
-    for g in d["groups"]:
-        fa, fb = _f(g["a"].get("fee")), _f(g["b"].get("fee"))
-        if fa > 0 and fb > 0 and _f(g["a"].get("gmv")) + _f(g["b"].get("gmv")) > 500:
-            gain = fa - fb
-            if best is None or gain > best[0]:
-                best = (gain, g)
-    best_txt = (f"{_e(best[1]['label'][:24])}（{_pctv(_f(best[1]['a'].get('fee')),2)} → "
-                f"{_pctv(_f(best[1]['b'].get('fee')),2)}）") if best else "—"
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -899,64 +1200,39 @@ def render(d, accounts_all=None, preset: str = "") -> str:
   </form>
 </div>
 
-<div class="card lead">
-  <b>一句话结论：</b>把 A 期和 B 期放在同一把尺下——费比 {_pctv(ta['fee'],2)} → {_pctv(tb['fee'],2)}，
-  商智成交 ¥{_money(ta['gmv']/da)}/天 → ¥{_money(tb['gmv']/db)}/天，
-  净利 ¥{_money(ta['profit']/da)}/天 → ¥{_money(tb['profit']/db)}/天（{dn}）。
-  <ul>{bullets}</ul>
-</div>
+<div class="freshness">数据提醒：B 期最后 1~2 天商智仍在回补，最近数字可能偏低；建议先看 11/19~20 的终值，T+2/T+3 后再复算。</div>
 
-<div class="kpis">{kpis}</div>
-<p class="sub" style="margin-top:10px">以上 KPI 统计范围：<b>{_e(scope)}</b>。
-  全账号合计（含其他品类）：花费 ¥{_money(_f(aa["spend"])/da)}/天 → ¥{_money(_f(ab["spend"])/db)}/天，
-  商智成交 ¥{_money(_f(aa["gmv"])/da)}/天 → ¥{_money(_f(ab["gmv"])/db)}/天，
-  费比 {_pctv(_f(aa["fee"]), 2)} → {_pctv(_f(ab["fee"]), 2)}。</p>
+{_verdict_banner(d)}
+{_big_kpis(d)}
+<p class="sub" style="margin-top:8px">以上只统计<b>有 SPU 计划的组</b>（本次调整的商品）；
+  全账号含其他快车商品，数字会更大，见下方“详细数据”。</p>
+{_group_cards(d)}
 
-<h2>1. 先把两把尺子换成同一把</h2>
-<div class="card">
-  <table class="tbl">
-    <thead><tr><th style="width:22%">维度</th><th style="width:39%">快车 / 智能投放</th><th>全站营销（单品推广）</th></tr></thead>
-    <tbody>
-      <tr><td>计费方式</td><td>CPC，按点击扣费</td><td>CPC，按“目标成交投产比”智能出价</td></tr>
-      <tr><td>成交口径</td><td>点击后 15 天归因订单（广告成交）</td><td>全站成交（含自然流量、全店归因订单）</td></tr>
-      <tr><td>ROI 分子</td><td>广告归因成交额</td><td>商智全店成交额（几乎全部订单）</td></tr>
-      <tr><td>能直接比吗</td><td colspan="2"><b class="down">不能。</b>分子不是同一批订单，全站 ROI 天然高 1~3 倍。</td></tr>
-      <tr><td>应该比什么</td><td colspan="2"><b>费比 = 广告总花费 ÷ 商智成交额</b>；以及“多花 1 元带来的增量成交”。</td></tr>
-    </tbody>
-  </table>
-</div>
-
-<h2>2. 口径证据：全站营销的“成交”是整店口径</h2>
-<div class="card">
-  <p class="sub">拿两个区间里带 SPU 计划的分组，把“全站成交/全站订单行”和同一批 SKU 的商智成交/订单对照：</p>
-  {_evidence_table(d)}
-  <div class="note"><b>结论：</b>全站营销的“全站订单行”与商智订单大体对应（本页 44.9%~93%），
-    覆盖比例取决于计划预算/投放范围；B 期普遍在 74%~93%，说明它统计的是<b>整店成交</b>，
-    不是广告点击带来的成交。因此“全站 ROI 12”只代表“整店成交是广告花费的 12 倍”，
-    并不代表“每花 1 元多赚 12 元”。</div>
-</div>
-
-<h2>3. 同一 SKU 的两个 ROI，差距来自分子</h2>
-<div class="card">{_same_sku_table(d)}</div>
-
-<h2>4. 调整前后：SPU 走势与花费</h2>
+<h2>每天卖多少、每天花多少</h2>
 {_chart_lines(d)}
+<p class="sub">蓝线 = 商智成交额；橙色虚线 = 11/19 开始切全站 / 进入 B 期。</p>
 <div class="card">
-  <p class="sub">A 列是「史上最强」区间，B 列是「现代最强」区间；花费包含快车/智能/全站智能 + 全站营销。
-    费比 = 总花费 ÷ 商智成交额；净利 = 商智成交额 × 加权毛利率 − 总花费。</p>
-  {_group_table(d)}
+  <h3 style="margin-top:0">每天广告花多少：<span style="color:#2563eb">快车/智能</span> + <span style="color:#ea580c">全站营销</span></h3>
+  {_chart_spends(d)}
+  <p class="sub">蓝柱 = 快车/智能，橙柱 = 全站营销；蔬菜 11/22 起快车重新开投，蓝柱会重新出现。</p>
 </div>
-<h3>每日广告花费：快车/智能 + 全站营销</h3>
-{_chart_spends(d)}
+
+<h2>商品红黑榜</h2>
+<div class="card">{_simple_skus(d)}
+<p class="sub">“费比高于毛利”= 广告本身在亏钱；“接近保本”= 只剩很薄的安全垫。B 期全站花费按商智成交占比分摊，同一计划内费比相同。</p>
+</div>
+
+<h2>下一步怎么做</h2>
+<div class="card">{_next_steps(d)}</div>
 
 <div class="card">
-  <h3 style="margin-top:0">AI 解读 <span class="sub">用现有 LLM 接口，基于当前 A/B 数据生成 3~5 条结论</span></h3>
+  <h3 style="margin-top:0">AI 用大白话再解释一遍 <span class="sub">用现有 LLM 接口，约 20~60 秒</span></h3>
   <button class="btn" id="vsAiBtn" onclick="vsAi(this)">AI 解读这组对比</button>
   <div id="vsAi" class="ai-out"></div>
 </div>
 <script>
 var VS_ARGS = {ai_args};
-async function vsAi(btn){{
+async function vsAi(btn) {{
   var box = document.getElementById('vsAi');
   btn.disabled = true; btn.textContent = '生成中…';
   box.style.display = 'block'; box.textContent = '正在调用现有 AI 接口（约 20~60 秒）…';
@@ -978,30 +1254,60 @@ async function vsAi(btn){{
 }}
 </script>
 
-<h2>5. 逐商品：现在谁在赚钱，谁贴着保本线</h2>
+<details class="tech">
+<summary>详细数据（给分析师）：口径对照、证据、同一 SKU ROI、花费构成、完整分组表、逐商品、数据说明</summary>
+
+<h2>1. 口径对照：为什么不能直接比平台 ROI</h2>
+<div class="card">
+  <table class="tbl">
+    <thead><tr><th style="width:22%">维度</th><th style="width:39%">快车 / 智能投放</th><th>全站营销（单品推广）</th></tr></thead>
+    <tbody>
+      <tr><td>计费方式</td><td>CPC，按点击扣费</td><td>CPC，按“目标成交投产比”智能出价</td></tr>
+      <tr><td>成交口径</td><td>点击后 15 天归因订单（广告成交）</td><td>全站成交（含自然流量、全店归因订单）</td></tr>
+      <tr><td>ROI 分子</td><td>广告归因成交额</td><td>商智全店成交额（几乎全部订单）</td></tr>
+      <tr><td>能直接比吗</td><td colspan="2"><b class="down">不能。</b>分子不是同一批订单，全站 ROI 天然高 1~3 倍。</td></tr>
+      <tr><td>应该比什么</td><td colspan="2"><b>费比 = 广告总花费 ÷ 商智成交额</b>；以及“多花 1 元带来的增量成交”。</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2>2. 口径证据：全站成交 vs 商智成交</h2>
+<div class="card">
+  <p class="sub">拿两个区间里带 SPU 计划的分组，把“全站成交/全站订单行”和同一批 SKU 的商智成交/订单对照：</p>
+  {_evidence_table(d)}
+  <div class="note"><b>结论：</b>全站营销的“全站订单行”与商智订单大体对应（本页 44.9%~93%），
+    覆盖比例取决于计划预算/投放范围；B 期普遍在 74%~93%，说明它统计的是<b>整店成交</b>，
+    不是广告点击带来的成交。因此“全站 ROI 12”只代表“整店成交是广告花费的 12 倍”，
+    并不代表“每花 1 元多赚 12 元”。</div>
+</div>
+
+<h2>3. 同一 SKU 的两个 ROI，差距来自分子</h2>
+<div class="card">{_same_sku_table(d)}</div>
+
+<h2>4. 花费构成：快车 + 全站营销</h2>
+<div class="card">
+  {_channel_table(d)}
+  <p class="sub">有 SPU 计划的组只覆盖本次调整的商品；梓云茶其他快车商品在下面的
+    “梓云茶 · 快车/智能（其他）”组，不进入计划组 KPI。本次默认 B 期（11/19~11/22）
+    已包含 11/22 快车重新开投的花费；如果你改了区间，以实际日期为准。</p>
+</div>
+
+<h2>5. 完整分组表</h2>
+<div class="card">
+  <p class="sub">A 列是「史上最强」区间，B 列是「现代最强」区间；花费包含快车/智能/全站智能 + 全站营销。
+    费比 = 总花费 ÷ 商智成交额；净利 = 商智成交额 × 加权毛利率 − 总花费。</p>
+  {_group_table(d)}
+</div>
+
+<h2>6. 逐商品明细</h2>
 <div class="card">
   <p class="sub">判断规则：B 期费比 ≥ 毛利率 → 亏损/临界；≥ 毛利率 × 75% → 接近保本；否则安全。
-    毛利率来自 ERP 真实成本，保本 ROI = 1 ÷ 毛利率。
-    B 期全站营销花费按成员商智成交占比分摊，所以同一计划内各 SKU 的 B 费比会相同；这是结构分摊，不是平台 SKU 级真实花费。</p>
+    B 期全站营销花费按成员商智成交占比分摊，所以同一计划内各 SKU 的 B 费比会相同。</p>
   {groups_html or '<p class="sub">两个区间都没有可对比的商品。</p>'}
 </div>
 
-<h2>6. 结论：哪种方案更好？</h2>
+<h2>7. 结论表</h2>
 <div class="card">{_conclusion_table(d)}</div>
-
-<h2>7. 建议动作</h2>
-<div class="card">
-  <ol>
-    <li><b>先看费比改善最大的组：</b>{best_txt}。这类组可以优先保留全站营销，并用 7 天小步放量验证增量。</li>
-    <li><b>费比 ≥ 毛利率的 SKU 单独处理：</b>见上方逐商品表的红色/黄色标记；先降目标 ROI、缩预算或移除计划，不要用“全站 ROI 高”掩盖。</li>
-    <li><b>把“全站 ROI”从考核里拿掉：</b>改用 <code>费比 = 广告总花费 ÷ 商智成交额</code> 和
-      <code>净利 = 商智成交额 × 毛利率 − 广告花费</code>；全站 ROI 只作为计划内部的目标出价参数。</li>
-    <li><b>检查账户/店铺归属：</b>如果 A 期有大量花费投在“商智里没有的 SKU”，先确认是不是跨店投放/账户归属错配，
-      否则单店铺商智会把该账户的费比算得偏高。</li>
-    <li><b>做 7 天 A/B 验证增量：</b>固定总预算，按 SKU 分组一半快车一半全站，避开大促日，
-      比较同口径的商智成交/总花费和增量成交。</li>
-  </ol>
-</div>
 
 <h2>8. 数据口径与局限</h2>
 <div class="card">
@@ -1015,6 +1321,9 @@ async function vsAi(btn){{
       纯增量需要 A/B 或地理/时段对照，当前页面只能做方向判断。</li>
   </ul>
 </div>
+</details>
+
+{_glossary()}
 
 <div class="foot">数据来源：京准通（概览 / 智能投放 / 快车关键词 / 全站营销）+ 商智（商品明细）。金额单位：元；ROI 为倍数。</div>
 </div></body></html>"""
