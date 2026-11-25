@@ -1161,6 +1161,7 @@ class ProfitRunner:
                 sz_rows = sz_rows_local(account, start, end)
                 cps_data = paycomm.read_cached("cps", account, start, end)
                 jzt_data = paycomm.read_cached("spend", account, start, end)
+                filled_cps = False
                 if sz_rows is None or cps_data is None or jzt_data is None:
                     self._set(message=f"本地缺数据，准备抓取（{acc_label}，"
                                       f"{idx}/{len(accounts)}）…")
@@ -1204,7 +1205,14 @@ class ProfitRunner:
                                     f"{account} 的{label}自动补抓失败（{type(exc).__name__}: {exc}），"
                                     f"本次该列按 0 计；可稍后到「{label}」页重试。")
                                 continue
-                            if got:
+                            if got and got.get("source") == "activity_orders":
+                                filled_cps = True
+                                notes.append(
+                                    f"{account} 的 CPS 花费已用团长活动订单明细按完成日补齐"
+                                    f"（{got.get('days')} 天，{float(got.get('total') or 0):,.2f} 元），"
+                                    f"与数据看板付款佣金同口径，并已写入按天缓存；"
+                                    f"以后任意子区间可直接复用，不用再抓 CPS。")
+                            elif got:
                                 notes.append(
                                     f"{account} 的{label}本地没有 {start} ~ {end} 的缓存，"
                                     f"已在本次查询中自动抓取（{len(got.get('rows') or [])} 个 SKU）"
@@ -1231,6 +1239,12 @@ class ProfitRunner:
                                  f"自动补抓也没取到数据（该区间可能没有 CPS 成交）。")
                 if cps_data is None and jzt_data is None:
                     notes.append(f"{account} 没有任何花费数据，本次只统计成交与毛利。")
+                if (cps_data and cps_data.get("source") == "activity_orders"
+                        and not filled_cps):
+                    notes.append(
+                        f"{acc_label} 的 CPS 花费取自团长活动订单明细（按订单完成日汇总"
+                        f"「总佣金」，与数据看板付款佣金同口径，覆盖 {start} ~ {end}）；"
+                        f"本次没有请求 CPS 数据看板。")
                 cps, jzt = _cost_map(cps_data, jzt_data)
                 names: dict[int, str] = {}
                 for src in (jzt_data, cps_data):

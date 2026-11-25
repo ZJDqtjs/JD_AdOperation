@@ -3446,6 +3446,10 @@ def activity_page(request: Request):
 
     # 效果区间：默认昨天；支持 days=1/7/30 或自定义 start/end
     start, end = resolve_range(q.get("start"), q.get("end"), q.get("days") or 1)
+    span_days = len(ds.day_span(start, end))
+    # CPS 按天缓存（完成日口径，与数据看板付款佣金同口径）：给月度利润直接复用
+    cps_days = sum(1 for k in acc_keys for d in ds.day_span(start, end)
+                   if activity.cps_day_good(k, d))
     since = q.get("since") or (_today() - dt.timedelta(days=90)).isoformat()
     kw = (q.get("q") or "").strip()
     union_sel = q.get("union") or ""
@@ -3732,7 +3736,8 @@ def activity_page(request: Request):
         odata = activity.load_orders(acc_keys, start, end)
         order_cov = len({x.get("date") for x in odata.get("days") or []})
         if order_cov:
-            act_ord = {"orders": 0, "qty": 0, "gmv": 0.0, "fee": 0.0, "skus": {}}
+            act_ord = {"orders": 0, "qty": 0, "gmv": 0.0, "fee": 0.0,
+                       "cosFee": 0.0, "cpFee": 0.0, "skus": {}}
             for x in odata["days"]:
                 a = (x.get("acts") or {}).get(act_sel)
                 if not a:
@@ -3743,6 +3748,8 @@ def activity_page(request: Request):
                 act_ord["qty"] += int(a.get("qty") or 0)
                 act_ord["gmv"] += float(a.get("gmv") or 0)
                 act_ord["fee"] += day_fee
+                act_ord["cosFee"] += float(a.get("cosFee") or 0)
+                act_ord["cpFee"] += float(a.get("cpFee") or 0)
                 dcur = order_days.setdefault(day, {"orders": 0.0, "gmv": 0.0})
                 dcur["orders"] += int(a.get("orders") or 0)
                 dcur["gmv"] += float(a.get("gmv") or 0)
@@ -3750,10 +3757,13 @@ def activity_page(request: Request):
                     sid = str(sid)
                     e = act_ord["skus"].setdefault(sid, {
                         "name": sk.get("name") or sku_names.get(sid) or sid,
-                        "orders": 0, "qty": 0, "gmv": 0.0, "fee": 0.0})
+                        "orders": 0, "qty": 0, "gmv": 0.0, "fee": 0.0,
+                        "cosFee": 0.0, "cpFee": 0.0})
                     e["orders"] += int(sk.get("orders") or 0)
                     e["qty"] += int(sk.get("qty") or 0)
                     e["gmv"] += float(sk.get("gmv") or 0)
+                    e["cosFee"] += float(sk.get("cosFee") or 0)
+                    e["cpFee"] += float(sk.get("cpFee") or 0)
                     e["fee"] += float(sk.get("cosFee") or 0) + float(sk.get("cpFee") or 0)
     use_orders = bool(act_sel and act_ord is not None)
     if act_sel and not use_orders:
@@ -3805,20 +3815,59 @@ def activity_page(request: Request):
         + '</td></tr>')
 
     if use_orders:
-        sku_head = ('<th class="l">商品</th><th class="n">订单量</th><th class="n">件数</th>'
-                    '<th class="n">预估 GMV</th><th class="n">预估费用</th><th class="n">ROI</th>')
-        _ord_rows = sorted((act_ord or {}).get("skus", {}).items(),
-                           key=lambda kv: kv[1]["gmv"], reverse=True)
+        # 同一条计划里各商品的佣金率可能不同：把报名时的佣金率/服务费率
+        # 和订单明细里的实际佣金金额合到一张表里
+        signup_by_sku: dict = {}
+        for r in act_all:
+            sid = str(r.get("skuId") or "")
+            if not sid:
+                continue
+            if sid not in signup_by_sku:
+                signup_by_sku[sid] = {
+                    "name": sku_names.get(sid) or r.get("skuName") or sid,
+                    "commission": r.get("commission"),
+                    "serviceFee": r.get("serviceFee"),
+                    "start": r.get("startDate"), "end": r.get("endDate")}
+        _ord_skus = (act_ord or {}).get("skus", {})
+        _ids = list(dict.fromkeys(list(signup_by_sku.keys()) + list(_ord_skus.keys())))
+        _rows = []
+        for sid in _ids:
+            a = _ord_skus.get(sid) or {}
+            s = signup_by_sku.get(sid) or {}
+            _rows.append((sid, {
+                "name": a.get("name") or s.get("name") or sku_names.get(sid) or sid,
+                "commission": s.get("commission"), "serviceFee": s.get("serviceFee"),
+                "start": s.get("start"), "end": s.get("end"),
+                "orders": a.get("orders", 0), "qty": a.get("qty", 0),
+                "gmv": a.get("gmv", 0.0), "cosFee": a.get("cosFee", 0.0),
+                "cpFee": a.get("cpFee", 0.0), "fee": a.get("fee", 0.0)}))
+        _rows.sort(key=lambda kv: (-kv[1]["gmv"], -kv[1]["orders"]))
+        sku_head = ('<th class="l">商品 / 活动期</th><th class="n">报名佣金率</th>'
+                    '<th class="n">服务费率</th><th class="n">订单量</th><th class="n">件数</th>'
+                    '<th class="n">预估 GMV</th><th class="n">佣金金额</th><th class="n">服务费</th>'
+                    '<th class="n">费用合计</th><th class="n">ROI</th>')
+
+        def _pct(v):
+            return f"{_an(float(v), 1)}%" if v not in (None, "") else "—"
+
         sku_html = "".join(
             '<tr>'
             f'<td class="l sku"><span class="nm" title="{_e(e["name"])}">{_e(e["name"])}</span>'
-            f'<span class="sub">SKU {_e(sid)}</span></td>'
+            f'<span class="sub">SKU {_e(sid)}'
+            + (f' · {_e(e["start"])} ~ {_e(e["end"])}' if (e.get("start") or e.get("end")) else "")
+            + '</span></td>'
+            f'<td class="n">{_pct(e["commission"])}</td>'
+            f'<td class="n">{_pct(e["serviceFee"])}</td>'
             f'<td class="n">{_an(e["orders"])}</td><td class="n">{_an(e["qty"])}</td>'
-            f'<td class="n">{_amoney(e["gmv"])}</td><td class="n">{_amoney(e["fee"])}</td>'
-            f'<td class="n"><b>{_an(e["gmv"] / e["fee"] if e["fee"] else 0, 2)}</b></td></tr>'
-            for sid, e in _ord_rows) or (
-            '<tr><td colspan="6" class="l hint" style="padding:18px">'
-            '该活动在所选区间没有有效订单</td></tr>')
+            f'<td class="n">{_amoney(e["gmv"])}</td>'
+            f'<td class="n">{_amoney(e["cosFee"])}</td>'
+            f'<td class="n">{_amoney(e["cpFee"])}</td>'
+            f'<td class="n">{_amoney(e["fee"])}</td>'
+            f'<td class="n"><b>{_an(e["gmv"] / e["fee"], 2) if e["fee"] else "—"}</b></td>'
+            '</tr>'
+            for sid, e in _rows) or (
+            '<tr><td colspan="10" class="l hint" style="padding:18px">'
+            '该活动在所选区间没有报名商品</td></tr>')
     else:
         sku_head = ('<th class="l">商品</th><th class="n">点击量</th><th class="n">预估订单</th>'
                     '<th class="n">预估 GMV</th><th class="n">预估费用</th><th class="n">ROI</th>'
@@ -3866,7 +3915,7 @@ def activity_page(request: Request):
         if use_orders:
             eff_hint = (f"{_e(start)} ~ {_e(end)} · 订单明细按活动ID精确归集"
                         f"（覆盖 {order_cov} 天）")
-            sku_title = "商品效果（该活动有效订单）"
+            sku_title = "商品佣金明细（该活动报名商品）"
         else:
             eff_hint = (f"{_e(start)} ~ {_e(end)} · 暂无订单明细缓存，"
                         f"按系统记录的报名商品（{len(act_skus)} 个）估算")
@@ -3912,7 +3961,11 @@ def activity_page(request: Request):
     run_state = activity.runtime_status()
     wait_days = max(len(ds.day_span(start, end)) - len({d.get("date") for d in days}), 0)
     warn = ""
-    if not days:
+    if use_orders:
+        if not days:
+            warn = ('<div class="hint">该区间的团长诊断（点击量 / 团长整体）未缓存；'
+                    '活动订单、GMV、佣金来自订单明细，已精确统计。</div>')
+    elif not days:
         warn = ('<div class="warn">本地还没有这个区间的效果数据。点「立即抓取」补抓，'
                 '或等凌晨自动任务；默认只回刷最近 '
                 f'{settings.REFRESH_DAYS} 天。</div>')
@@ -3955,7 +4008,7 @@ def activity_page(request: Request):
             f'<div class="kpi"><div class="lbl">预估 GMV</div><div class="val">{_amoney(act_ord["gmv"])}</div>'
             '<div class="sub">商品金额合计</div></div>'
             f'<div class="kpi"><div class="lbl">预估费用</div><div class="val">{_amoney(act_ord["fee"])}</div>'
-            '<div class="sub">佣金 + 团长服务费</div></div>'
+            f'<div class="sub">佣金 {_amoney(act_ord["cosFee"])} · 服务费 {_amoney(act_ord["cpFee"])}</div></div>'
             f'<div class="kpi"><div class="lbl">ROI</div><div class="val">{_an(act_roi, 2)}</div>'
             '<div class="sub">GMV ÷ 预估费用</div></div>'
             '</div>')
@@ -3994,6 +4047,7 @@ def activity_page(request: Request):
   </div>
   <div class="actions">
     <button class="btn" id="actRunBtn" onclick="actRun()">立即抓取</button>
+    <a class="btn ghost mini" href="/profit?account={_e(sel or 'all')}&start={_e(start)}&end={_e(end)}">月度利润（复用 CPS 缓存）→</a>
     <a class="btn ghost mini" href="https://jzt.jd.com/jtk/#/activity-cp" target="_blank">团长招商页 ↗</a>
   </div>
 </div></header>
@@ -4016,6 +4070,9 @@ def activity_page(request: Request):
     最近一次抓取：{_e(last_state.get('lastRun') or '尚未执行')}
     {('· 报名库存 ' + str(last_state.get('signupRows')) + ' 条') if last_state.get('signupRows') else ''}
     · 自动任务每天回刷最近 {settings.REFRESH_DAYS} 天效果 + 最近 30 天报名日志
+    {('· CPS 按天缓存 ' + str(cps_days) + '/' + str(span_days * max(len(acc_keys), 1))
+      + ' 天（按完成日，月度利润自动复用，不再逐个 SKU 抓 CPS）')
+     if settings.CPS_DAYS_ENABLED else ''}
   </div>
 </div>
 
@@ -8070,6 +8127,8 @@ def _activity_fresh(hours: int = 6) -> bool:
     for a in settings.ad_accounts():
         od = activity.acct_dir(a["key"]) / "orders"
         if od.is_dir() and not (od / f"{yday}.json").exists():
+            return False
+        if settings.CPS_DAYS_ENABLED and not activity.cps_day_good(a["key"], yday):
             return False
     return True
 

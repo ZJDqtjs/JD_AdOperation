@@ -49,6 +49,8 @@ services:
       JD_POP_ORDER: "${JD_POP_ORDER:-1}"
       JD_POP_ORDER_REFRESH_DAYS: "${JD_POP_ORDER_REFRESH_DAYS:-7}"
       JD_POP_ORDER_BACKFILL_DAYS: "${JD_POP_ORDER_BACKFILL_DAYS:-30}"
+      # CPS 按天缓存（订单明细完成日口径，供月度利润任意子区间复用）
+      JD_CPS_DAYS: "${JD_CPS_DAYS:-1}"
       # ---- AI 解读层（jd_roi.analyze_ai / jd_roi.llm）----
       # OpenAI 兼容端点；Key 只写 .env，别提交。容器内不挂 .env，只能靠这里注入
       LLM_BASE_URL: "${LLM_BASE_URL:-}"

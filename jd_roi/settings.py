@@ -199,6 +199,12 @@ POP_ORDER_ENABLED = _env_bool("JD_POP_ORDER", True)
 POP_ORDER_REFRESH_DAYS = _env_int("JD_POP_ORDER_REFRESH_DAYS", 7)     # 每晚回刷最近 N 天
 POP_ORDER_BACKFILL_DAYS = _env_int("JD_POP_ORDER_BACKFILL_DAYS", 30)  # 首次补多少天
 
+# ---------------- CPS 按天缓存 ----------------
+# 京准通「订单明细」按**完成日**查询，逐单 totalCosFee（佣金+团长服务费+平台服务费）
+# 与「数据看板 → 商品数据」的付款佣金 payCommAmount 完全同口径（已逐日核对）。
+# 抓一次按天落盘后，CPS 花费/月度利润在任意子区间都能本地拼出来，不必再逐个 SKU 抓。
+CPS_DAYS_ENABLED = _env_bool("JD_CPS_DAYS", True)
+
 # ---------------- 抓取 ----------------
 HEADLESS = _env_bool("JD_HEADLESS", True)
 SW_MAX_ROWS = _env_int("JD_SW_MAX_ROWS", 2000)
