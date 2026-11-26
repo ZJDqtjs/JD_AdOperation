@@ -183,6 +183,11 @@ MAX_BACKFILL_DAYS = _env_int("JD_MAX_BACKFILL_DAYS", 120)
 # 商智「昨天」的商品明细凌晨 1 点还没出，接口会「成功但 0 行」。白天定时只补商智：
 # 只在 08:00~23:00 之间、最近 3 天仍有 0 行天时尝试，两次尝试至少间隔 1 小时。
 SZ_RETRY_ENABLED = _env_bool("JD_SZ_RETRY", True)
+# 团长诊断（出单团长）D-1 数据要次日早上才更新，凌晨抓只能拿到空包。
+# 默认早上 09:40 补抓最近 2 天，保证页面「出单团长」表不缺最新一天。
+ACTIVITY_PERF_ENABLED = _env_bool("JD_ACTIVITY_PERF_REFRESH", True)
+ACTIVITY_PERF_HOUR = _env_int("JD_ACTIVITY_PERF_HOUR", 9)
+ACTIVITY_PERF_MINUTE = _env_int("JD_ACTIVITY_PERF_MINUTE", 40)
 SZ_RETRY_START_HOUR = _env_int("JD_SZ_RETRY_START_HOUR", 8)
 SZ_RETRY_END_HOUR = _env_int("JD_SZ_RETRY_END_HOUR", 23)
 SZ_RETRY_INTERVAL = _env_int("JD_SZ_RETRY_INTERVAL", 3600)      # 秒

@@ -8108,6 +8108,17 @@ def _activity_nightly():
         _log_progress(f"团长活动抓取失败：{type(exc).__name__}: {exc}")
 
 
+def _activity_perf_morning():
+    """白天补抓最近 2 天的团长诊断：凌晨 01:00 抓 D-1 仍是空包，早上才有数。"""
+    try:
+        _log_progress("团长诊断：补抓最近 2 天（出单团长 / 商品效果）")
+        res = activity.refresh_recent_perf(days=2, log=_log_progress)
+        filled = sum(v.get("filled", 0) for v in (res.get("accounts") or {}).values())
+        _log_progress(f"团长诊断补抓完成：写入 {filled} 天")
+    except Exception as exc:  # noqa: BLE001
+        _log_progress(f"团长诊断补抓失败：{type(exc).__name__}: {exc}")
+
+
 def _activity_fresh(hours: int = 6) -> bool:
     """全部账号都在最近 N 小时内抓过，就不再重复跑（容器频繁重启时省时间）。"""
     now = settings.now().replace(tzinfo=None)
@@ -8352,12 +8363,25 @@ def _startup():
             sch.add_job(_scheduler_tick, IntervalTrigger(minutes=1, timezone=settings.TZ),
                         id="nightly", replace_existing=True,
                         max_instances=1, coalesce=True, misfire_grace_time=120)
+            if settings.ACTIVITY_PERF_ENABLED:
+                # 团长诊断 D-1 早上才更新，固定白天的时刻补一次最近 2 天
+                from apscheduler.triggers.cron import CronTrigger
+                sch.add_job(_activity_perf_morning,
+                            CronTrigger(hour=settings.ACTIVITY_PERF_HOUR,
+                                        minute=settings.ACTIVITY_PERF_MINUTE,
+                                        timezone=settings.TZ),
+                            id="activity-perf", replace_existing=True,
+                            max_instances=1, coalesce=True, misfire_grace_time=3600)
             sch.start()
             app.state.scheduler = sch
             _t, _off = _schedule_target()
             print(f"[webapp] 调度已启动：基准 {settings.SCHEDULE_HOUR:02d}:"
                   f"{settings.SCHEDULE_MINUTE:02d} ± {settings.SCHEDULE_JITTER_MIN} 分钟"
                   f"（{settings.TZ}）｜今天实际 { _t.strftime('%H:%M') }", flush=True)
+            if settings.ACTIVITY_PERF_ENABLED:
+                print(f"[webapp] 团长诊断补抓已启动：每天 "
+                      f"{settings.ACTIVITY_PERF_HOUR:02d}:{settings.ACTIVITY_PERF_MINUTE:02d} "
+                      f"补最近 2 天", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[webapp] 调度启动失败：{exc}", flush=True)
         if settings.SZ_RETRY_ENABLED:

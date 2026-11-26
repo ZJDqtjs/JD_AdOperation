@@ -644,8 +644,23 @@ def _merge_activities(key: str, applied: list, unions: dict) -> dict:
     return {"items": items, "unions": uu}
 
 
-def _save_perf(key: str, perf: dict) -> None:
-    _write(acct_dir(key) / "perf" / f"{perf['date']}.json", perf)
+def _perf_empty(perf: dict) -> bool:
+    """summary 全是 null 且团长/商品都为空，视为「这天没抓到」。"""
+    s = perf.get("summary") or {}
+    if any(isinstance(v, (int, float)) for v in s.values()):
+        return False
+    return not (perf.get("cp") or perf.get("sku"))
+
+
+def _save_perf(key: str, perf: dict) -> bool:
+    """空结果不覆盖已有数据；返回是否真正写入。"""
+    path = acct_dir(key) / "perf" / f"{perf['date']}.json"
+    if _perf_empty(perf):
+        old = _read(path, None)
+        if old and not _perf_empty(old):
+            return False
+    _write(path, perf)
+    return True
 
 
 def _save_state(key: str, info: dict) -> None:
@@ -670,8 +685,13 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
     end = end or today.isoformat()
     start = start or (today - dt.timedelta(days=30)).isoformat()
     perf_days = int(perf_days or settings.REFRESH_DAYS or 15)
-    perf_end = min(dt.date.fromisoformat(end), today - dt.timedelta(days=1)).isoformat()
+    # 团长诊断（actReport）D-1 的数据要到次日早上才更新，凌晨抓只能拿到空包；
+    # 所以窗口包含今天，由白天的补抓把 D-1 / 今天补上（见 refresh_recent_perf）。
+    perf_end = min(dt.date.fromisoformat(end), today).isoformat()
     perf_start = (dt.date.fromisoformat(perf_end) - dt.timedelta(days=perf_days - 1)).isoformat()
+    # 订单明细 / CPS 仍只抓到昨天：当天订单还没跑完，抓了也是半截
+    data_end = min(dt.date.fromisoformat(end), today - dt.timedelta(days=1)).isoformat()
+    data_start = (dt.date.fromisoformat(data_end) - dt.timedelta(days=perf_days - 1)).isoformat()
 
     from . import scrape_day
     if acquire_lock and not scrape_day.acquire(timeout=3600, name="activity"):
@@ -729,7 +749,7 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                         page.goto("https://jzt.jd.com/jtk/#/order-detail",
                                   wait_until="domcontentloaded", timeout=90000)
                         page.wait_for_timeout(12000)
-                        for day in _days(perf_start, perf_end):
+                        for day in _days(data_start, data_end):
                             path = acct_dir(key) / "orders" / f"{day}.json"
                             try:
                                 od = fetch_order_day(page, day)
@@ -755,7 +775,7 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                         log(f"[{label}] 订单明细 {rec.get('orderDays', 0)} 天")
                         # 补漏：被限流/会话断开时可能连续多天没写成，整段跑完再重载页面补一遍
                         _odir = acct_dir(key) / "orders"
-                        _missing = [d for d in _days(perf_start, perf_end)
+                        _missing = [d for d in _days(data_start, data_end)
                                     if not (_odir / f"{d}.json").exists()]
                         if _missing:
                             log(f"[{label}] 补漏 {len(_missing)} 天：{_missing[0]} ~ {_missing[-1]}")
@@ -776,7 +796,7 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                         # CPS 按天：同一页面按「订单完成日」再查一遍，逐单 totalCosFee
                         # 与数据看板付款佣金同口径。抓过就跳过，月度利润任意子区间可直接复用。
                         if settings.CPS_DAYS_ENABLED:
-                            for day in _days(perf_start, perf_end):
+                            for day in _days(data_start, data_end):
                                 if cps_day_good(key, day):
                                     continue
                                 got = None
@@ -863,6 +883,78 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
         if acquire_lock:
             scrape_day.release()
     return summary
+
+
+def refresh_recent_perf(days: int = 2, accounts=None, log=lambda m: None) -> dict:
+    """只补抓最近 N 天的团长诊断（出单概览 / 出单团长 / 商品效果）。
+
+    京东「团长诊断」的 D-1 数据要次日早上才更新，凌晨 01:00 主抓取拿到的是空包，
+    所以白天再补一次，避免页面「出单团长」表一直缺最新 1~2 天。
+    """
+    from . import scrape_day
+    from .browser import launch_profile, has_login, session_ok
+
+    accs = accounts or settings.ad_accounts()
+    today = settings.today()
+    start = today - dt.timedelta(days=max(int(days), 1) - 1)
+    out = {"start": start.isoformat(), "end": today.isoformat(), "accounts": {}}
+    if not scrape_day.acquire(timeout=1800, name="activity-perf"):
+        raise RuntimeError("抓取锁被占用，稍后再试")
+    try:
+        for acc in accs:
+            key = acc["key"]
+            label = acc.get("label") or key
+            rec = {"label": label, "filled": 0, "empty": [], "errors": []}
+            out["accounts"][key] = rec
+            log(f"[{label}] 团长诊断补抓：{start}~{today}")
+            pw = ctx = None
+            try:
+                pw, ctx = launch_profile(headless=settings.HEADLESS, account=key)
+                page = ctx.new_page()
+                page.goto(JZT_HOME, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(5000)
+                if not (has_login(ctx) and session_ok(page)):
+                    rec["errors"].append("登录态失效")
+                    log(f"[{label}] 登录态失效，跳过")
+                    continue
+                page.goto(JTK_URL, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(6000)
+                if not _jtk_ok(page):
+                    rec["errors"].append("团长招商页不可访问")
+                    continue
+                unions = (_read(acct_dir(key) / "activities.json", {}) or {}).get("unions") or {}
+                for day in _days(start.isoformat(), today.isoformat()):
+                    try:
+                        perf = fetch_perf_day(page, day)
+                        for row in perf.get("cp") or []:
+                            u = unions.get(str(row.get("cpUnionId"))) or {}
+                            row["cpUnionName"] = row.get("cpUnionName") or u.get("name")
+                        if _perf_empty(perf):
+                            rec["empty"].append(day)
+                        if _save_perf(key, perf):
+                            rec["filled"] += 1
+                    except Exception as exc:  # noqa: BLE001
+                        rec["errors"].append(f"perf {day}: {exc}")
+                    time.sleep(1)
+                log(f"[{label}] 团长诊断补抓完成：写入 {rec['filled']} 天"
+                    + (f"，仍为空 {','.join(rec['empty'])}" if rec["empty"] else ""))
+            except Exception as exc:  # noqa: BLE001
+                rec["errors"].append(f"{type(exc).__name__}: {exc}")
+                log(f"[{label}] 团长诊断补抓失败：{type(exc).__name__}: {exc}")
+            finally:
+                try:
+                    if ctx:
+                        ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    if pw:
+                        pw.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+    finally:
+        scrape_day.release()
+    return out
 
 
 def run_background(accounts=None, start: str | None = None, end: str | None = None,
