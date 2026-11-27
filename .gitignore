@@ -91,3 +91,7 @@ Desktop.ini
 
 # ---- 报表产物（含真实商品别名/经营数据/隐私账号，不入库）----
 account_b_plan_review.html
+# 仓库根目录的一次性 HTML 报表（页面路由里的 HTML 在代码里，不受影响）
+/*.html
+# HTML 分享包（.trae-html-share-packages 导出的 zip）
+.trae-html-share-packages/

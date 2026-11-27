@@ -183,6 +183,11 @@ MAX_BACKFILL_DAYS = _env_int("JD_MAX_BACKFILL_DAYS", 120)
 # 商智「昨天」的商品明细凌晨 1 点还没出，接口会「成功但 0 行」。白天定时只补商智：
 # 只在 08:00~23:00 之间、最近 3 天仍有 0 行天时尝试，两次尝试至少间隔 1 小时。
 SZ_RETRY_ENABLED = _env_bool("JD_SZ_RETRY", True)
+# 团长诊断（出单团长）D-1 数据要次日早上才更新，凌晨抓只能拿到空包。
+# 默认早上 09:40 补抓最近 2 天，保证页面「出单团长」表不缺最新一天。
+ACTIVITY_PERF_ENABLED = _env_bool("JD_ACTIVITY_PERF_REFRESH", True)
+ACTIVITY_PERF_HOUR = _env_int("JD_ACTIVITY_PERF_HOUR", 9)
+ACTIVITY_PERF_MINUTE = _env_int("JD_ACTIVITY_PERF_MINUTE", 40)
 SZ_RETRY_START_HOUR = _env_int("JD_SZ_RETRY_START_HOUR", 8)
 SZ_RETRY_END_HOUR = _env_int("JD_SZ_RETRY_END_HOUR", 23)
 SZ_RETRY_INTERVAL = _env_int("JD_SZ_RETRY_INTERVAL", 3600)      # 秒
@@ -191,6 +196,19 @@ SZ_RETRY_LOOKBACK = _env_int("JD_SZ_RETRY_LOOKBACK", 3)         # 只看最近�
 # 白天按这个间隔刷新一次，前台价页「今日实时」卡片用它（每账号 1 个请求）。
 SZ_RT_ENABLED = _env_bool("JD_SZ_RT", True)
 SZ_RT_INTERVAL = _env_int("JD_SZ_RT_INTERVAL", 1800)            # 秒（默认 30 分钟）
+
+# ---------------- POP 店订单 ----------------
+# 「只看订单」的店铺（accounts.json 里 orders_only=true，或账号名带 pop）不抓广告，
+# 改为每天缓存商家后台订单列表（jd_roi/pop_orders.py），供 /pop 页面筛选统计。
+POP_ORDER_ENABLED = _env_bool("JD_POP_ORDER", True)
+POP_ORDER_REFRESH_DAYS = _env_int("JD_POP_ORDER_REFRESH_DAYS", 7)     # 每晚回刷最近 N 天
+POP_ORDER_BACKFILL_DAYS = _env_int("JD_POP_ORDER_BACKFILL_DAYS", 30)  # 首次补多少天
+
+# ---------------- CPS 按天缓存 ----------------
+# 京准通「订单明细」按**完成日**查询，逐单 totalCosFee（佣金+团长服务费+平台服务费）
+# 与「数据看板 → 商品数据」的付款佣金 payCommAmount 完全同口径（已逐日核对）。
+# 抓一次按天落盘后，CPS 花费/月度利润在任意子区间都能本地拼出来，不必再逐个 SKU 抓。
+CPS_DAYS_ENABLED = _env_bool("JD_CPS_DAYS", True)
 
 # ---------------- 抓取 ----------------
 HEADLESS = _env_bool("JD_HEADLESS", True)
@@ -244,6 +262,8 @@ def _normalize(accs: list) -> list:
         acc["user_data_dir"] = a.get("user_data_dir") or default_profile_dir(key)
         # 「主账号」用显式标记，不再依赖列表第一位：调整显示顺序时主账号不会跟着漂
         acc["main"] = bool(a.get("main"))
+        # 「只看订单」的店铺（POP 店）：不参与任何广告抓取/报表，只按天缓存订单列表
+        acc["orders_only"] = bool(a.get("orders_only"))
         out.append(acc)
     return out
 
@@ -309,6 +329,25 @@ def get_account(key: str | None = None) -> dict:
                                          "user_data_dir": str(AUTH_DIR / "main")}
 
 
+def is_order_account(acc) -> bool:
+    """这个账号是否「只看订单」（不抓广告）。
+
+    显式标记 orders_only 优先；老配置没写标记时，账号名里带 pop 的也按订单账号处理，
+    避免升级后把 POP 店当成广告账号去抓京准通。
+    """
+    if not isinstance(acc, dict):
+        acc = get_account(str(acc)) if acc else get_account()
+    return bool(acc.get("orders_only")) or "pop" in str(acc.get("label") or "").lower()
+
+
+def order_accounts(accs: list | None = None) -> list:
+    return [a for a in (ACCOUNTS if accs is None else accs) if is_order_account(a)]
+
+
+def ad_accounts(accs: list | None = None) -> list:
+    return [a for a in (ACCOUNTS if accs is None else accs) if not is_order_account(a)]
+
+
 # ---------------- 账号管理（网页「登录」页可以增删改名） ----------------
 # 只把 key/label/account_id 写回 accounts.json；user_data_dir 用默认值时省略。
 def _accounts_payload(accs: list) -> list:
@@ -325,6 +364,8 @@ def _accounts_payload(accs: list) -> list:
             item["user_data_dir"] = str(custom_dir)
         if a.get("main"):
             item["main"] = True
+        if a.get("orders_only"):
+            item["orders_only"] = True
         out.append(item)
     return out
 

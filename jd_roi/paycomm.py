@@ -1101,7 +1101,7 @@ def _fill():
 
 
 def build_cps_xlsx(rows: list[dict], daily: list[dict], start: str, end: str,
-                   account_label: str = "", dim: str = "sku") -> bytes:
+                   account_label: str = "", dim: str = "sku", source: str = "") -> bytes:
     """CPS 花费（付款佣金）导出。"""
     from openpyxl import Workbook
     from openpyxl.utils import get_column_letter
@@ -1194,8 +1194,12 @@ def build_cps_xlsx(rows: list[dict], daily: list[dict], start: str, end: str,
     ws3.append(["统计区间", f"{start} ~ {end}"])
     ws3.append(["账号", account_label or "-"])
     ws3.append(["导出时间", time.strftime("%Y-%m-%d %H:%M:%S")])
-    ws3.append(["数据来源", "京准通 数据看板 → 商品数据（atoms-api /union/dataBoard）"])
-    ws3.append(["口径", "每个 SKU 单独取 orderData；付款佣金金额=payCommAmount（与页面「商品数据」一致）"])
+    if source == "activity_orders":
+        ws3.append(["数据来源", "团长活动 → 订单明细（按订单完成日查询，逐单 totalCosFee 汇总）"])
+        ws3.append(["口径", "总佣金=佣金+团长服务费+平台技术服务费；与数据看板付款佣金逐日核对一致"])
+    else:
+        ws3.append(["数据来源", "京准通 数据看板 → 商品数据（atoms-api /union/dataBoard）"])
+        ws3.append(["口径", "每个 SKU 单独取 orderData；付款佣金金额=payCommAmount（与页面「商品数据」一致）"])
     ws3.column_dimensions["A"].width = 14
     ws3.column_dimensions["B"].width = 92
 
@@ -1421,7 +1425,7 @@ class PayCommRunner:
         """
         blocks: dict[str, dict] = {}
         missing: list[str] = []
-        for a in settings.ACCOUNTS:
+        for a in settings.ad_accounts():
             try:
                 d = self.cached_result(a["key"], start, end)
             except Exception:  # noqa: BLE001
@@ -1464,7 +1468,7 @@ class PayCommRunner:
 
     def _work_all(self, job_id: str, start: str, end: str) -> None:
         try:
-            accs = list(settings.ACCOUNTS)
+            accs = list(settings.ad_accounts())
             labels = {a["key"]: (a.get("label") or a["key"]) for a in accs}
             keys = [a["key"] for a in accs]
             for i, key in enumerate(keys, 1):
@@ -1567,7 +1571,8 @@ class PayCommRunner:
                      f"_{data['start']}_{data['end']}.xlsx")
         else:
             xlsx = build_cps_xlsx(data["rows"], data.get("daily") or [],
-                                  data["start"], data["end"], label, dim=dim)
+                                  data["start"], data["end"], label, dim=dim,
+                                  source=data.get("source") or "")
             fname = (f"CPS花费{suffix}_{data.get('account')}"
                      f"_{data['start']}_{data['end']}.xlsx")
         return xlsx, fname
@@ -1579,30 +1584,47 @@ class PayCommRunner:
     def cached_result(self, account: str, start: str, end: str) -> dict | None:
         key = settings.get_account(account)["key"]
         fp, _ = self._disk_paths(key, start, end)
-        if not fp.exists():
-            return None
-        try:
-            data = json.loads(fp.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            return None
-        if not data.get("rows") and not data.get("noSpend"):
-            return None
-        if self.mode == "spend" and int(data.get("schema") or 1) < SPEND_SCHEMA:
-            # 旧口径（无全站营销、漏已删计划）当缓存未命中：文件保留不删，重抓一次即可
-            return None
-        for r in data.get("rows") or []:
-            if not r.get("category"):
-                r["category"] = catalog.category_of(r.get("itemName") or "")
-        st = fp.stat()
-        data.setdefault("start", start)
-        data.setdefault("end", end)
-        data.setdefault("account", key)
-        if not data.get("accountLabel"):
-            data["accountLabel"] = settings.get_account(key).get("label") or key
-        data["file"] = fp.name
-        data["savedAt"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
-        data["sizeKB"] = round(st.st_size / 1024, 1)
-        return data
+        data = None
+        if fp.exists():
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                data = None
+        if data is not None:
+            if not data.get("rows") and not data.get("noSpend"):
+                data = None
+            elif self.mode == "spend" and int(data.get("schema") or 1) < SPEND_SCHEMA:
+                # 旧口径（无全站营销、漏已删计划）当缓存未命中：文件保留不删，重抓一次即可
+                data = None
+        if data is not None:
+            for r in data.get("rows") or []:
+                if not r.get("category"):
+                    r["category"] = catalog.category_of(r.get("itemName") or "")
+            st = fp.stat()
+            data.setdefault("start", start)
+            data.setdefault("end", end)
+            data.setdefault("account", key)
+            if not data.get("accountLabel"):
+                data["accountLabel"] = settings.get_account(key).get("label") or key
+            data["file"] = fp.name
+            data["savedAt"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+            data["sizeKB"] = round(st.st_size / 1024, 1)
+            return data
+
+        # CPS 还有一份「按天」缓存（团长活动 → 订单明细，完成日口径）：
+        # 整段文件没命中时，只要区间内每一天都有完整日缓存，就本地拼出来。
+        # 这样 11/1~11/24 抓过以后，再查 11/11~11/24 不用重新逐个 SKU 抓。
+        if self.mode == "cps":
+            from . import activity
+            try:
+                got = activity.cps_payload(key, start, end)
+            except Exception:  # noqa: BLE001
+                got = None
+            if got:
+                got.setdefault("file", "cpsdays")
+                got.setdefault("sizeKB", None)
+                return got
+        return None
 
     def use_cache(self, account: str, start: str, end: str) -> dict | None:
         """命中缓存时把结果直接摆到状态里（不启动浏览器、不请求接口）。"""
@@ -1618,10 +1640,12 @@ class PayCommRunner:
         data["jobId"] = job_id
         self._results[job_id] = data
         rows = data.get("rows") or []
+        src = ("（来自团长活动订单明细的按天缓存，完成日口径）"
+               if data.get("source") == "activity_orders" else "")
         self._set(running=False, cancelled=False, cached=True, jobId=job_id,
                   account=key, range=[start, end], total=len(rows), done=len(rows),
                   error=None, finishedAt=settings.now_iso(),
-                  message=(f"命中本地缓存（{data.get('savedAt')} 抓取，本次未请求京准通）；"
+                  message=(f"命中本地缓存{src}（{data.get('savedAt')} 抓取，本次未请求京准通）；"
                            f"需要最新数据请点「重新抓取」"))
         return {"ok": True, "cached": True, "jobId": job_id, "account": key,
                 "start": start, "end": end, "savedAt": data.get("savedAt"),
@@ -1648,22 +1672,47 @@ class PayCommRunner:
         return sorted({(e["start"], e["end"]) for e in self.cache_entries()
                        if e.get("account") == key and e.get("start") and e.get("end")})
 
+    def _cps_day_runs(self, key: str, start: str, end: str) -> list[tuple[str, str]]:
+        """把连续的「CPS 日缓存」合并成段，用于和整段文件一起铺满区间。"""
+        if self.mode != "cps":
+            return []
+        from . import activity
+        runs: list[tuple[str, str]] = []
+        run_start = prev = None
+        cur, last = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+        while cur <= last:
+            day = cur.isoformat()
+            if activity.cps_day_good(key, day):
+                if run_start is None:
+                    run_start = day
+                prev = day
+            elif run_start is not None:
+                runs.append((run_start, prev))
+                run_start = None
+            cur += dt.timedelta(days=1)
+        if run_start is not None:
+            runs.append((run_start, prev))
+        return runs
+
     def use_stitched(self, account: str, start: str, end: str) -> dict | None:
         """用多段相邻缓存拼出完整区间（如 8 月 + 9 月 → 8/1~9/30），完全不请求京准通。
 
         只接受「首尾正好相接、完整覆盖且不外溢」的组合，避免把区间外的数据算进来。
+        CPS 额外的按天缓存也当作可拼接的段：整段文件 + 日缓存混着铺满也行，
+        这样 1/1~1/24 算过之后，再查 1/11~1/24 不必重新逐个 SKU 抓。
         """
         start, end = norm_range(start, end)
         key = settings.get_account(account)["key"]
         with self._lock:
             if self._state.get("running"):
                 return {"ok": False, "error": f"已有{MODES[self.mode][2]}任务在运行，请等它结束"}
-        spans = self._spans(key)
+        spans = [(s, e, "file") for s, e in self._spans(key)]
+        spans += [(s, e, "days") for s, e in self._cps_day_runs(key, start, end)]
         cur, picked = start, []
         while cur <= end:
             # 同一开始日可能有多段（如 9/1~9/3 与 9/1~9/30）：取「不越过 end 的最长一段」，
             # 既保证覆盖，又不会把区间外的数据带进来
-            cands = [(s, e) for s, e in spans if s == cur and e <= end]
+            cands = [x for x in spans if x[0] == cur and x[1] <= end]
             if not cands:
                 return None
             hit = max(cands, key=lambda x: x[1])
@@ -1671,9 +1720,13 @@ class PayCommRunner:
             cur = (dt.date.fromisoformat(hit[1]) + dt.timedelta(days=1)).isoformat()
         if len(picked) < 2:
             return None                      # 单段就是精确命中，交给 use_cache
+        from . import activity
         parts = []
-        for s, e in picked:
-            data = self.cached_result(key, s, e)
+        for s, e, kind in picked:
+            if kind == "days":
+                data = activity.cps_payload(key, s, e)
+            else:
+                data = self.cached_result(key, s, e)
             if not data:
                 return None
             parts.append(data)
@@ -1744,9 +1797,13 @@ class PayCommRunner:
 
         job_id = f"stitch-{self.mode}-{key}-{start}_{end}"
         label = settings.get_account(key).get("label") or key
+        used_days = any(kind == "days" for _s, _e, kind in picked)
         payload = {"jobId": job_id, "mode": self.mode, "account": key, "accountLabel": label,
                    "start": start, "end": end, "rows": out_rows,
-                   "stitched": [f"{a}~{b}" for a, b in picked],
+                   "stitched": [f"{a}~{b}" for a, b, _k in picked],
+                   "source": ("activity_orders" if used_days and all(
+                       kind == "days" for _s, _e, kind in picked) else
+                       ("mixed" if used_days else None)),
                    "finishedAt": settings.now_iso()}
         if self.mode == "cps":
             payload["daily"] = daily
@@ -1762,14 +1819,14 @@ class PayCommRunner:
             payload["spend"] = {"totals": sums, "keywordRows": kw_rows,
                                 "unattrRows": unattr_rows, "hints": hints}
         self._results[job_id] = payload
-        pieces = " + ".join(f"{a}~{b}" for a, b in picked)
+        pieces = " + ".join(f"{a}~{b}" for a, b, _k in picked)
         self._set(running=False, cancelled=False, cached=True, jobId=job_id,
                   account=key, range=[start, end], total=len(out_rows), done=len(out_rows),
                   error=None, finishedAt=settings.now_iso(),
                   message=f"命中本地缓存拼接（{pieces}），未请求京准通；需要最新数据请点「重新抓取」")
         return {"ok": True, "cached": True, "stitched": True, "jobId": job_id,
                 "account": key, "start": start, "end": end,
-                "pieces": [f"{a}~{b}" for a, b in picked], "rows": len(out_rows)}
+                "pieces": [f"{a}~{b}" for a, b, _k in picked], "rows": len(out_rows)}
 
     def cache_entries(self) -> list[dict]:
         """已落地的缓存清单（按同账号+区间去重，按抓取时间倒序）。"""
@@ -2062,6 +2119,18 @@ def fetch_into_cache(page, mode: str, account: str, start: str, end: str,
     """
     start, end = norm_range(start, end)
     key = settings.get_account(account)["key"]
+    if mode == "cps" and settings.CPS_DAYS_ENABLED:
+        # 优先走「订单明细 → 按完成日」：一次分页就覆盖所有 SKU，金额与数据看板
+        # 的付款佣金同口径，而且按天落盘后任意子区间都能复用；比逐个 SKU 抓更省请求。
+        from . import activity
+        try:
+            got = activity.fetch_cps_into_cache(page, key, start, end, on_progress)
+        except Exception as exc:  # noqa: BLE001
+            if on_progress:
+                on_progress(f"订单明细按天补齐失败（{type(exc).__name__}），改用逐 SKU 抓取…")
+            got = None
+        if got:
+            return got
     runner = PayCommRunner(mode)
     rows, extra = runner._collect(page, key, start, end, on_progress)
     no_spend = False

@@ -25,7 +25,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import settings
+from . import catalog, settings
 
 JTK_URL = "https://jzt.jd.com/jtk/#/activity-cp"
 LOG_URL = "https://jzt.jd.com/logging/#/business?businessType=32"
@@ -266,6 +266,10 @@ def fetch_perf_day(page, day: str) -> dict:
 # 团长诊断只按团长/商品汇总，没有活动维度；订单明细里每单带 cpActId，
 # 按它汇总才能拿到「这个活动自己的订单/GMV/佣金」，这是活动视图的数据来源。
 ORDER_URL = "https://atoms-api.jd.com/union/pop/report/detail/orders?requestFrom=0"
+ORDER_PAGE = "https://jzt.jd.com/jtk/#/order-detail"
+# CPS 花费（数据看板 → 付款佣金）按「订单完成时间」统计；订单明细用完成日筛选后，
+# 逐单 totalCosFee = 佣金 + 团长服务费 + 京东平台技术服务费，与 payCommAmount 完全一致。
+CPS_BASIS = "finishTime"
 _ORDER_BASE = {
     "startDate": "", "endDate": "", "startCptDay": None, "endCptDay": None,
     "sourceEmt": None, "isValid": 1, "pageIndex": 1, "pageSize": 100,
@@ -295,9 +299,11 @@ def fetch_order_day(page, day: str, max_pages: int = 30) -> dict:
         if t:
             total = int(t)
         if not batch:
+            # 空包多半是「刚拉完一个几百单的大日子，被限流了」，2 秒重试救不回来；
+            # 按 3/8/18 秒退避，等限流窗口过去再试同一页。
             if retry < 3:
+                time.sleep((3, 8, 18)[retry])
                 retry += 1
-                time.sleep(2)
                 continue
             break
         retry = 0
@@ -347,6 +353,242 @@ def fetch_order_day(page, day: str, max_pages: int = 30) -> dict:
         sk["cpFee"] += cpfee
     return {"date": day, "fetchedAt": settings.now_iso(), "total": len(rows),
             "expected": total or None, "complete": complete, "acts": acts}
+
+
+# ---------------------------------------------------------------- CPS 按天（完成日）
+def cps_day_path(key: str, day: str) -> Path:
+    return acct_dir(key) / "cpsdays" / f"{day}.json"
+
+
+def _fee_of(row: dict) -> float:
+    """一单的 CPS 费用：优先 totalCosFee，缺失时用三项相加兜底。"""
+    if row.get("totalCosFee") is not None:
+        try:
+            return float(row.get("totalCosFee") or 0)
+        except (TypeError, ValueError):
+            pass
+    total = 0.0
+    for k in ("cosFee", "cpFee", "platformServiceFee"):
+        try:
+            total += float(row.get(k) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def fetch_cps_day(page, day: str, max_pages: int = 60) -> dict:
+    """拉某天「订单完成」的全部有效订单，按 SKU 汇总 CPS 费用。
+
+    口径与京准通「数据看板 → 商品数据」的付款佣金完全一致：
+      * 订单明细按**完成日**（cptTimeFlag=1 + startCptDay/endCptDay）查询；
+      * 取每单 totalCosFee（佣金 + 团长服务费 + 平台技术服务费）；
+      * 只统计有效订单（isValid=1）。
+    这样一次分页抓取即可覆盖当天所有 SKU，不必再逐个 SKU 请求 orderData。
+    """
+    rows, page_no, total, retry = [], 1, None, 0
+    seen: set = set()
+    complete = False
+    while page_no <= max_pages:
+        payload = dict(_ORDER_BASE, startDate=None, endDate=None,
+                       startCptDay=day, endCptDay=day, orderTimeFlag=0,
+                       cptTimeFlag=1, isValid=1, pageIndex=page_no)
+        d = _post(page, ORDER_URL, payload)
+        body = d.get("content") or d.get("data") or {}
+        batch = body.get("data") or []
+        if body.get("total") is not None:
+            total = int(body.get("total") or 0)
+        if not batch:
+            # 与订单明细页相同的坑：首页偶发空包 / 单次超过约 20 页被限流
+            if retry < 3:
+                retry += 1
+                time.sleep(2)
+                continue
+            if total == 0 and page_no == 1:
+                complete = True          # 这一天确实没有完成订单
+            break
+        retry = 0
+        for r in batch:
+            k = (r.get("orderId"), r.get("skuId"))
+            if k in seen:
+                continue
+            seen.add(k)
+            rows.append(r)
+        if total and len(rows) >= total:
+            complete = True
+            break
+        if len(batch) < 100:
+            complete = True
+            break
+        page_no += 1
+        time.sleep(0.7)
+
+    skus: dict = {}
+    for r in rows:
+        try:
+            if int(r.get("isValid") or 1) != 1:
+                continue
+        except (TypeError, ValueError):
+            continue
+        sid = str(r.get("skuId") or "").strip()
+        if not sid:
+            continue
+        fee = _fee_of(r)
+        e = skus.setdefault(sid, {"skuId": int(sid) if sid.isdigit() else sid,
+                                  "name": str(r.get("skuName") or ""),
+                                  "fee": 0.0, "cosFee": 0.0, "cpFee": 0.0,
+                                  "platformFee": 0.0, "orders": 0})
+        e["fee"] += fee
+        for src, dst in (("cosFee", "cosFee"), ("cpFee", "cpFee"),
+                         ("platformServiceFee", "platformFee")):
+            try:
+                e[dst] += float(r.get(src) or 0)
+            except (TypeError, ValueError):
+                pass
+        e["orders"] += 1
+        if not e["name"] and r.get("skuName"):
+            e["name"] = str(r.get("skuName"))
+
+    for e in skus.values():
+        for k in ("fee", "cosFee", "cpFee", "platformFee"):
+            e[k] = round(float(e[k]), 2)
+    return {"date": day, "basis": CPS_BASIS, "source": "order-detail",
+            "fetchedAt": settings.now_iso(), "orders": len(rows),
+            "expected": total, "complete": complete,
+            "total": round(sum(float(e["fee"]) for e in skus.values()), 2),
+            "skus": skus}
+
+
+def cps_day_good(key: str, day: str) -> bool:
+    """该账号这一天的 CPS 日缓存是否可用（完整抓到过，且当天已经结束）。
+
+    当天还在结算，抓到的「完成订单」只会越来越多；把当天当完整缓存会把
+    半天的数据冻住。所以只承认 < 今天的日期。
+    """
+    if str(day) >= settings.today().isoformat():
+        return False
+    p = cps_day_path(key, day)
+    if not p.exists():
+        return False
+    d = _read(p, {}) or {}
+    return bool(d.get("complete")) and str(d.get("date") or "") == day
+
+
+def cps_payload(key: str, start: str, end: str) -> dict | None:
+    """用按天缓存拼出任意区间的 CPS 花费；缺任意一天都返回 None（不拿估算顶替）。"""
+    days = list(_days(start, end))
+    if not days:
+        return None
+    today = settings.today().isoformat()
+    skus: dict = {}
+    daily: list = []
+    latest = 0.0
+    for day in days:
+        p = cps_day_path(key, day)
+        d = _read(p, None)
+        if (day >= today or not d or not d.get("complete")
+                or str(d.get("date") or "") != day):
+            return None
+        try:
+            latest = max(latest, p.stat().st_mtime)
+        except OSError:
+            pass
+        daily.append({"date": day,
+                      "payCommAmount": round(float(d.get("total") or 0), 2),
+                      "fiOrderCnt": int(d.get("orders") or 0),
+                      "orderCnt": int(d.get("orders") or 0)})
+        for sid, s in (d.get("skus") or {}).items():
+            sid = str(sid)
+            e = skus.setdefault(sid, {
+                "skuId": int(sid) if sid.isdigit() else sid, "itemName": "",
+                "fee": 0.0, "orders": 0})
+            e["fee"] += float(s.get("fee") or 0)
+            e["orders"] += int(s.get("orders") or 0)
+            if not e["itemName"] and s.get("name"):
+                e["itemName"] = str(s.get("name"))
+    rows = []
+    for e in skus.values():
+        name = e["itemName"]
+        rows.append({"skuId": e["skuId"], "itemName": name,
+                     "category": catalog.category_of(name),
+                     "payCommAmount": round(e["fee"], 2),
+                     "payCommRate": None, "preCommAmount": None, "preCommRate": None,
+                     "clicks": None, "uv": None, "orderCnt": None, "orderCvr": None,
+                     "orderGmv": None, "payOrderCnt": None,
+                     "fiOrderCnt": e["orders"], "fiOrderGmv": None,
+                     "orderUserCnt": None, "roi": None})
+    rows.sort(key=lambda r: -(r.get("payCommAmount") or 0))
+    total = round(sum(float(r["payCommAmount"]) for r in rows), 2)
+    return {"jobId": f"cpsdays-{key}-{start}_{end}", "mode": "cps", "account": key,
+            "accountLabel": settings.get_account(key).get("label") or key,
+            "start": start, "end": end, "rows": rows, "daily": daily,
+            "source": "activity_orders",
+            "sourceLabel": "团长活动 · 订单明细（完成日口径）",
+            "days": len(days), "target": f"cps:{key}:{start}_{end}",
+            "noSpend": total == 0, "total": total,
+            "finishedAt": settings.now_iso(),
+            "savedAt": (time.strftime("%Y-%m-%d %H:%M", time.localtime(latest))
+                        if latest else None)}
+
+
+def fetch_cps_into_cache(page, key: str, start: str, end: str,
+                         on_progress=None) -> dict | None:
+    """借一个已打开的京准通页面，把区间内缺失的 CPS 按天缓存补齐。
+
+    只补缺的天；已经完整抓过的日期直接跳过。全部齐了才返回区间结果，
+    否则返回 None（已抓到的天仍然落盘，下次只补剩下的）。
+    """
+    if not settings.CPS_DAYS_ENABLED:
+        return None
+    today = settings.today().isoformat()
+    need = [d for d in _days(start, end) if d < today and not cps_day_good(key, d)]
+    if not need:
+        return cps_payload(key, start, end)
+    try:
+        if "order-detail" not in (page.url or ""):
+            page.goto(ORDER_PAGE, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(12000)
+    except Exception:  # noqa: BLE001
+        return None
+
+    # 连续翻十几天的订单，中途常被限流（某天开始一直返回空页）。先整段跑一遍，
+    # 失败的日期收集起来，重载页面后再补一轮；还不行的留到下次，不阻塞其它天。
+    pending = list(need)
+    for _pass in range(2):
+        if not pending:
+            break
+        still: list = []
+        for day in pending:
+            got = None
+            for _attempt in range(2):
+                try:
+                    got = fetch_cps_day(page, day)
+                except Exception as exc:  # noqa: BLE001
+                    got = None
+                    if on_progress:
+                        on_progress(f"{day} 取数失败（{type(exc).__name__}），重试…")
+                if got and got.get("complete"):
+                    break
+                try:
+                    page.reload()
+                    page.wait_for_timeout(9000)
+                except Exception:  # noqa: BLE001
+                    pass
+            if got and got.get("complete"):
+                _write(cps_day_path(key, day), got)
+                if on_progress:
+                    on_progress(f"{day} 完成 {got['total']:,.2f} 元（{got['orders']} 单）")
+            else:
+                still.append(day)
+            time.sleep(2)
+        pending = still
+        if pending:
+            try:
+                page.reload()
+                page.wait_for_timeout(9000)
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(3)
+    return cps_payload(key, start, end) if not pending else None
 
 
 # ---------------------------------------------------------------- 合并落盘
@@ -404,8 +646,23 @@ def _merge_activities(key: str, applied: list, unions: dict) -> dict:
     return {"items": items, "unions": uu}
 
 
-def _save_perf(key: str, perf: dict) -> None:
-    _write(acct_dir(key) / "perf" / f"{perf['date']}.json", perf)
+def _perf_empty(perf: dict) -> bool:
+    """summary 全是 null 且团长/商品都为空，视为「这天没抓到」。"""
+    s = perf.get("summary") or {}
+    if any(isinstance(v, (int, float)) for v in s.values()):
+        return False
+    return not (perf.get("cp") or perf.get("sku"))
+
+
+def _save_perf(key: str, perf: dict) -> bool:
+    """空结果不覆盖已有数据；返回是否真正写入。"""
+    path = acct_dir(key) / "perf" / f"{perf['date']}.json"
+    if _perf_empty(perf):
+        old = _read(path, None)
+        if old and not _perf_empty(old):
+            return False
+    _write(path, perf)
+    return True
 
 
 def _save_state(key: str, info: dict) -> None:
@@ -425,13 +682,18 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
     """抓取报名日志 [start,end] + 最近 perf_days 天效果。"""
     from .browser import launch_profile, has_login, session_ok
 
-    accs = accounts or settings.ACCOUNTS
+    accs = accounts or settings.ad_accounts()
     today = settings.today()
     end = end or today.isoformat()
     start = start or (today - dt.timedelta(days=30)).isoformat()
     perf_days = int(perf_days or settings.REFRESH_DAYS or 15)
-    perf_end = min(dt.date.fromisoformat(end), today - dt.timedelta(days=1)).isoformat()
+    # 团长诊断（actReport）D-1 的数据要到次日早上才更新，凌晨抓只能拿到空包；
+    # 所以窗口包含今天，由白天的补抓把 D-1 / 今天补上（见 refresh_recent_perf）。
+    perf_end = min(dt.date.fromisoformat(end), today).isoformat()
     perf_start = (dt.date.fromisoformat(perf_end) - dt.timedelta(days=perf_days - 1)).isoformat()
+    # 订单明细 / CPS 仍只抓到昨天：当天订单还没跑完，抓了也是半截
+    data_end = min(dt.date.fromisoformat(end), today - dt.timedelta(days=1)).isoformat()
+    data_start = (dt.date.fromisoformat(data_end) - dt.timedelta(days=perf_days - 1)).isoformat()
 
     from . import scrape_day
     if acquire_lock and not scrape_day.acquire(timeout=3600, name="activity"):
@@ -446,7 +708,7 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
             key = acc["key"]
             label = acc.get("label") or key
             rec = {"label": label, "signups": 0, "activities": 0, "perfDays": 0,
-                   "errors": []}
+                   "cpsDays": 0, "errors": []}
             summary["accounts"][key] = rec
             _RUNNING["progress"] = f"[{label}] 团长活动抓取中…"
             log(f"[{label}] 团长活动抓取：报名日志 {start}~{end}，效果 {perf_start}~{perf_end}")
@@ -489,7 +751,7 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                         page.goto("https://jzt.jd.com/jtk/#/order-detail",
                                   wait_until="domcontentloaded", timeout=90000)
                         page.wait_for_timeout(12000)
-                        for day in _days(perf_start, perf_end):
+                        for day in _days(data_start, data_end):
                             path = acct_dir(key) / "orders" / f"{day}.json"
                             try:
                                 od = fetch_order_day(page, day)
@@ -504,19 +766,29 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                                     time.sleep(5)
                                     continue
                             old = _read(path, {}) or {}
-                            if (od.get("complete")
-                                    or int(od.get("total") or 0) >= int(old.get("total") or 0)):
+                            new_total = int(od.get("total") or 0)
+                            old_total = int(old.get("total") or 0)
+                            # 0 行且不完整基本是限流空包，绝不能覆盖缓存（否则活动页会显示 0 单）
+                            if od.get("complete") or new_total > old_total:
                                 _write(path, od)
                                 rec["orderDays"] = rec.get("orderDays", 0) + 1
                             else:
                                 rec["errors"].append(
-                                    f"orders {day}: 本次不完整 {od.get('total')}/{od.get('expected')}，保留旧数据")
+                                    f"orders {day}: 本次不完整 {new_total}/{od.get('expected')}，保留旧数据")
                             time.sleep(2)
                         log(f"[{label}] 订单明细 {rec.get('orderDays', 0)} 天")
                         # 补漏：被限流/会话断开时可能连续多天没写成，整段跑完再重载页面补一遍
                         _odir = acct_dir(key) / "orders"
-                        _missing = [d for d in _days(perf_start, perf_end)
-                                    if not (_odir / f"{d}.json").exists()]
+
+                        def _stale(d: str) -> bool:
+                            p = _odir / f"{d}.json"
+                            if not p.exists():
+                                return True
+                            cached = _read(p, {}) or {}
+                            # 只补「抓了一半」的天；0 行天可能是真的没单，不用每晚重试
+                            return not cached.get("complete") and int(cached.get("total") or 0) > 0
+
+                        _missing = [d for d in _days(data_start, data_end) if _stale(d)]
                         if _missing:
                             log(f"[{label}] 补漏 {len(_missing)} 天：{_missing[0]} ~ {_missing[-1]}")
                             try:
@@ -533,6 +805,33 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                                 except Exception as exc:  # noqa: BLE001
                                     rec["errors"].append(f"orders repair {day}: {exc}")
                                 time.sleep(2)
+                        # CPS 按天：同一页面按「订单完成日」再查一遍，逐单 totalCosFee
+                        # 与数据看板付款佣金同口径。抓过就跳过，月度利润任意子区间可直接复用。
+                        if settings.CPS_DAYS_ENABLED:
+                            for day in _days(data_start, data_end):
+                                if cps_day_good(key, day):
+                                    continue
+                                got = None
+                                for _try in range(2):
+                                    try:
+                                        got = fetch_cps_day(page, day)
+                                    except Exception as exc:  # noqa: BLE001
+                                        got = None
+                                        rec["errors"].append(f"cps {day}: {exc}")
+                                    if got and got.get("complete"):
+                                        break
+                                    try:
+                                        page.reload()
+                                        page.wait_for_timeout(9000)
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                if got and got.get("complete"):
+                                    _write(cps_day_path(key, day), got)
+                                    rec["cpsDays"] = rec.get("cpsDays", 0) + 1
+                                else:
+                                    rec["errors"].append(f"cps {day}: 本次不完整，保留旧数据")
+                                time.sleep(1.5)
+                            log(f"[{label}] CPS 按天缓存 +{rec.get('cpsDays', 0)} 天")
                     except Exception as exc:  # noqa: BLE001
                         rec["errors"].append(f"orders page: {exc}")
                         log(f"[{label}] 订单明细页打开失败：{exc}")
@@ -570,7 +869,8 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                 rec["errors"].extend(errors[:3])
                 _save_state(key, {"lastRun": settings.now_iso(), "start": start, "end": end,
                                   "perfStart": perf_start, "perfEnd": perf_end,
-                                  "signupRows": len(res["rows"]), "added": res["added"]})
+                                  "signupRows": len(res["rows"]), "added": res["added"],
+                                  "cpsDays": rec.get("cpsDays", 0)})
                 log(f"[{label}] 报名记录 {len(fresh)} 条（库存 {len(res['rows'])} 条，新增 {res['added']}）")
             except Exception as exc:  # noqa: BLE001
                 rec["errors"].append(f"{type(exc).__name__}: {exc}")
@@ -595,6 +895,78 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
         if acquire_lock:
             scrape_day.release()
     return summary
+
+
+def refresh_recent_perf(days: int = 2, accounts=None, log=lambda m: None) -> dict:
+    """只补抓最近 N 天的团长诊断（出单概览 / 出单团长 / 商品效果）。
+
+    京东「团长诊断」的 D-1 数据要次日早上才更新，凌晨 01:00 主抓取拿到的是空包，
+    所以白天再补一次，避免页面「出单团长」表一直缺最新 1~2 天。
+    """
+    from . import scrape_day
+    from .browser import launch_profile, has_login, session_ok
+
+    accs = accounts or settings.ad_accounts()
+    today = settings.today()
+    start = today - dt.timedelta(days=max(int(days), 1) - 1)
+    out = {"start": start.isoformat(), "end": today.isoformat(), "accounts": {}}
+    if not scrape_day.acquire(timeout=1800, name="activity-perf"):
+        raise RuntimeError("抓取锁被占用，稍后再试")
+    try:
+        for acc in accs:
+            key = acc["key"]
+            label = acc.get("label") or key
+            rec = {"label": label, "filled": 0, "empty": [], "errors": []}
+            out["accounts"][key] = rec
+            log(f"[{label}] 团长诊断补抓：{start}~{today}")
+            pw = ctx = None
+            try:
+                pw, ctx = launch_profile(headless=settings.HEADLESS, account=key)
+                page = ctx.new_page()
+                page.goto(JZT_HOME, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(5000)
+                if not (has_login(ctx) and session_ok(page)):
+                    rec["errors"].append("登录态失效")
+                    log(f"[{label}] 登录态失效，跳过")
+                    continue
+                page.goto(JTK_URL, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(6000)
+                if not _jtk_ok(page):
+                    rec["errors"].append("团长招商页不可访问")
+                    continue
+                unions = (_read(acct_dir(key) / "activities.json", {}) or {}).get("unions") or {}
+                for day in _days(start.isoformat(), today.isoformat()):
+                    try:
+                        perf = fetch_perf_day(page, day)
+                        for row in perf.get("cp") or []:
+                            u = unions.get(str(row.get("cpUnionId"))) or {}
+                            row["cpUnionName"] = row.get("cpUnionName") or u.get("name")
+                        if _perf_empty(perf):
+                            rec["empty"].append(day)
+                        if _save_perf(key, perf):
+                            rec["filled"] += 1
+                    except Exception as exc:  # noqa: BLE001
+                        rec["errors"].append(f"perf {day}: {exc}")
+                    time.sleep(1)
+                log(f"[{label}] 团长诊断补抓完成：写入 {rec['filled']} 天"
+                    + (f"，仍为空 {','.join(rec['empty'])}" if rec["empty"] else ""))
+            except Exception as exc:  # noqa: BLE001
+                rec["errors"].append(f"{type(exc).__name__}: {exc}")
+                log(f"[{label}] 团长诊断补抓失败：{type(exc).__name__}: {exc}")
+            finally:
+                try:
+                    if ctx:
+                        ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    if pw:
+                        pw.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+    finally:
+        scrape_day.release()
+    return out
 
 
 def run_background(accounts=None, start: str | None = None, end: str | None = None,
@@ -668,7 +1040,8 @@ def load_orders(keys: list, start: str, end: str) -> dict:
             p = acct_dir(key) / "orders" / f"{day}.json"
             if p.exists():
                 d = _read(p, None)
-                if d:
+                # 0 行且不完整的文件是限流时的坏缓存，当作没抓到，别让页面显示成「没出单」
+                if d and (d.get("complete") or int(d.get("total") or 0) > 0):
                     d["account"] = key
                     days.append(d)
     return {"days": days}

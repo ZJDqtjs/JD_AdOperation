@@ -325,7 +325,7 @@ def _merge_account(key: str, begin: str, end: str) -> dict | None:
 def load_spliced(begin: str, end: str) -> list[dict]:
     """读任意区间：各账号各自的缓存分片按天拼起来（没有缓存的账号跳过）。"""
     items = []
-    for a in settings.ACCOUNTS:
+    for a in settings.ad_accounts():
         merged = _merge_account(a["key"], begin, end)
         if merged:
             items.append(merged)
@@ -355,7 +355,7 @@ def missing_spans(key: str, begin: str, end: str) -> list[tuple[str, str]]:
 
 def gap_plan(begin: str, end: str) -> dict[str, list[tuple[str, str]]]:
     """要补抓的计划：{账号key: 缺的连续日期段}，没缺的账号不在里面。"""
-    return {a["key"]: sp for a in settings.ACCOUNTS
+    return {a["key"]: sp for a in settings.ad_accounts()
             if (sp := missing_spans(a["key"], begin, end))}
 
 
@@ -653,7 +653,7 @@ def snapshot(begin: str = "", end: str = "") -> dict:
         "empty": False, "accounts": accs, "daily": daily,
         "fetched_at": max((a["fetched_at"] for a in accs), default=""),
         "labels": [a["label"] for a in accs],
-        "missing": [a["label"] for a in settings.ACCOUNTS
+        "missing": [a["label"] for a in settings.ad_accounts()
                     if a["key"] not in {x["account"] for x in accs}],
         "totals": {
             "cash": round(sum(a["cash_balance"] for a in accs), 2),

@@ -731,7 +731,9 @@ def scrape(accounts=None, start: str | None = None, end: str | None = None,
     after: 可选后置回调 after(summary)，仅在**成功**完成时调用（用于触发 AI 解读等）。
     """
     settings.ensure_dirs()
-    accounts = accounts or settings.ACCOUNTS
+    # 「只看订单」的店铺（POP 店）没有广告账户，不能进广告抓取：
+    # 否则每晚都会用它的 Profile 去访问京准通，既报登录失败又白占浏览器。
+    accounts = settings.ad_accounts(accounts or settings.ACCOUNTS)
     end = ds.norm_day(end or (ds.today() - dt.timedelta(days=1)))
     start = ds.norm_day(start or end)
     days = ds.day_span(start, end)
