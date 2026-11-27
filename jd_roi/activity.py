@@ -799,8 +799,11 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                             for day in _missing:
                                 try:
                                     od = fetch_order_day(page, day)
-                                    if od.get("total") or od.get("complete"):
-                                        _write(_odir / f"{day}.json", od)
+                                    p = _odir / f"{day}.json"
+                                    old = _read(p, {}) or {}
+                                    # 补漏也可能再次被限流，别用更少的数据覆盖已有的完整数据
+                                    if od.get("complete") or int(od.get("total") or 0) > int(old.get("total") or 0):
+                                        _write(p, od)
                                         rec["orderDays"] = rec.get("orderDays", 0) + 1
                                 except Exception as exc:  # noqa: BLE001
                                     rec["errors"].append(f"orders repair {day}: {exc}")
