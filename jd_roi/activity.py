@@ -299,9 +299,11 @@ def fetch_order_day(page, day: str, max_pages: int = 30) -> dict:
         if t:
             total = int(t)
         if not batch:
+            # 空包多半是「刚拉完一个几百单的大日子，被限流了」，2 秒重试救不回来；
+            # 按 3/8/18 秒退避，等限流窗口过去再试同一页。
             if retry < 3:
+                time.sleep((3, 8, 18)[retry])
                 retry += 1
-                time.sleep(2)
                 continue
             break
         retry = 0
@@ -764,19 +766,29 @@ def run(accounts=None, start: str | None = None, end: str | None = None,
                                     time.sleep(5)
                                     continue
                             old = _read(path, {}) or {}
-                            if (od.get("complete")
-                                    or int(od.get("total") or 0) >= int(old.get("total") or 0)):
+                            new_total = int(od.get("total") or 0)
+                            old_total = int(old.get("total") or 0)
+                            # 0 行且不完整基本是限流空包，绝不能覆盖缓存（否则活动页会显示 0 单）
+                            if od.get("complete") or new_total > old_total:
                                 _write(path, od)
                                 rec["orderDays"] = rec.get("orderDays", 0) + 1
                             else:
                                 rec["errors"].append(
-                                    f"orders {day}: 本次不完整 {od.get('total')}/{od.get('expected')}，保留旧数据")
+                                    f"orders {day}: 本次不完整 {new_total}/{od.get('expected')}，保留旧数据")
                             time.sleep(2)
                         log(f"[{label}] 订单明细 {rec.get('orderDays', 0)} 天")
                         # 补漏：被限流/会话断开时可能连续多天没写成，整段跑完再重载页面补一遍
                         _odir = acct_dir(key) / "orders"
-                        _missing = [d for d in _days(data_start, data_end)
-                                    if not (_odir / f"{d}.json").exists()]
+
+                        def _stale(d: str) -> bool:
+                            p = _odir / f"{d}.json"
+                            if not p.exists():
+                                return True
+                            cached = _read(p, {}) or {}
+                            # 只补「抓了一半」的天；0 行天可能是真的没单，不用每晚重试
+                            return not cached.get("complete") and int(cached.get("total") or 0) > 0
+
+                        _missing = [d for d in _days(data_start, data_end) if _stale(d)]
                         if _missing:
                             log(f"[{label}] 补漏 {len(_missing)} 天：{_missing[0]} ~ {_missing[-1]}")
                             try:
@@ -1028,7 +1040,8 @@ def load_orders(keys: list, start: str, end: str) -> dict:
             p = acct_dir(key) / "orders" / f"{day}.json"
             if p.exists():
                 d = _read(p, None)
-                if d:
+                # 0 行且不完整的文件是限流时的坏缓存，当作没抓到，别让页面显示成「没出单」
+                if d and (d.get("complete") or int(d.get("total") or 0) > 0):
                     d["account"] = key
                     days.append(d)
     return {"days": days}
